@@ -7,7 +7,7 @@
 
 - **阶段**:✅ **MVP 完成**(SA1–SA6 全部交付,端到端验证通过)
 - **最后更新**:2026-06-18
-- **验证**:`cargo build` / `cargo test`(59 passed, +1 ignored)/ `cargo build --release` 全绿、0 warning;TUI 冒烟通过。
+- **验证**:`cargo build` / `cargo test`(59 passed, +1 ignored)/ `cargo build --release` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过。
 
 ## 使用方法
 
@@ -83,3 +83,7 @@ src/
 - **2026-06-18** SA4(应用状态机)。
 - **2026-06-18** SA5(UI 层,ratatui-sci-fi Cyberpunk 主题)。
 - **2026-06-18** SA6(main.rs 集成)+ 端到端验证通过。**MVP 完成。**
+- **2026-06-18** PTY e2e 套件(`tests/e2e_pty.py`,`just e2e`):stdlib `pty` 驱动真实 `zkv` 二进制(80×24),6 用例覆盖 CLI/启动屏/解锁(对错口令)/建库+建条目+落盘重开;断言渲染文本 + exit 0。
+- **2026-06-18** 截图脚本(`tests/screenshot.py`,`just shots`):改用**真终端渲染**——PTY 采集 zkv 原始 ANSI 流 → 在 Xvfb 里 `cat` 进真 `xterm`(Source Code Pro、深底)→ `xdotool`+`import` 按窗口截 PNG。取代之前的 pyte+Pillow 近似(字体/行高/抗锯齿/背景都对不上真终端)。依赖 `Xvfb`/`xterm`/`xdotool`/`ImageMagick`。**顺带暴露并修复**口令模态在 80×24 下高度不足(`centered_rect` 20%→40%→50%)导致口令输入框被布局压扁挤没的 bug([src/ui/mod.rs](../src/ui/mod.rs))。
+- **2026-06-18** UI 重排(纯 View 层):浏览态改为 **header(品牌·消息·`N items · unlocked`)+ 两栏(list/detail,留缝)+ footer 键位栏**;列表项两行(配色类型标签 `[PW]`青/`[NO]`绿/`[CD]`品红 + 标题 + 弱化次要信息);Detail 动态标题、定宽标签列、密码掩码圆点、空值 `—` 占位、`[y] copy` 提示;移除常驻侧边栏(分类/标签计数折进 header,管理仍走 `c`/`t` 模态)。状态机/键位/加密零改动;`cargo test` 59 passed、`just e2e` 6/6。
+- **2026-06-18** UI 科幻化:启用自家的 `ratatui-sci-fi` `Panel` 组件——list/detail/编辑器/口令模态全部换成**圆角霓虹面板**(主题级边框 + 1 内边距 + 级联标题),口令框内嵌圆角输入盒,小模态与输入框统一圆角;header 加 `●` 状态点。边框形态集中在 [theme.rs](../src/ui/theme.rs) 的 `PANEL_SHAPE` 常量(改一处可切 Rounded/Double/Thick)。`cargo test` 59、`just e2e` 6/6、`just shots` 7 张更新。

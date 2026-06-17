@@ -21,22 +21,22 @@
 - 🔎 **全文搜索** — 基于 SQLite FTS5,按标题与内容检索。
 - 🏷️ **分类与标签** — 树状分类 + 多对多标签 + 收藏,任意组合过滤。
 - 🖼️ **附件内嵌** — 图片 / 电子档直接存入数据库,随库加密。
-- 🎨 **科幻风 TUI** — 三栏布局,霓虹配色,键盘驱动。
+- 🎨 **科幻风 TUI** — header 状态栏 + 列表/详情两栏 + 底部键位栏,圆角霓虹面板,键盘驱动。
 - ⏱️ **安全细节** — 复制密码后剪贴板 20 秒自动清空;原子写盘防损坏;文件权限 0600。
 
 ## 🖥️ 预览
 
-```
-┌ Categories / Tags ─┬─ Items ─────────────┬─ Detail ─────────────┐
-│ ▸ Work             │ ★ [PW] GitHub Login  │ Title:    GitHub Login│
-│   • Servers        │   [PW] GitLab Token  │ Type:     Password    │
-│ ▸ Personal         │ ★ [NO] Secret Diary  │ Username: alice       │
-│                    │   [CD] Visa ****     │ Password: •••••••••   │
-│ Tags               │                      │ URL:      github.com │
-│ work  vip  personal│                      │                       │
-└────────────────────┴──────────────────────┴───────────────────────┘
-[NORMAL]  n:new  e:edit  x:del  /:search  y:copy  l:lock  q:quit
-```
+**浏览态** — 列表 + 详情两栏,密码字段掩码,顶部状态栏显示条目数与锁定态:
+
+![浏览态](screenshot/04-list.png)
+
+创建库口令屏、新建条目编辑器、删除确认模态:
+
+| 创建库 | 新建条目编辑器 | 删除确认 |
+| :---: | :---: | :---: |
+| ![创建库](screenshot/01-create-vault.png) | ![编辑器](screenshot/05-new-item-editor.png) | ![删除确认](screenshot/07-confirm-delete.png) |
+
+> 截图由 [`tests/screenshot.py`](tests/screenshot.py) 驱动真实 `zkv` 二进制、在 Xvfb 里用真 `xterm` 渲染生成(`just shots`)。
 
 ## 🚀 快速开始
 

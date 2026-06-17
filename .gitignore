@@ -1,3 +1,7 @@
 /target
 
 /docs/prd
+
+# Python (e2e PTY test script bytecode cache)
+__pycache__/
+*.pyc

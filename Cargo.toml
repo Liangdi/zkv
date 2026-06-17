@@ -12,7 +12,7 @@ documentation = "https://docs.rs/zkv"
 readme = "README.md"
 keywords = ["vault", "encryption", "password-manager", "tui", "security"]
 categories = ["cryptography", "command-line-utilities", "authentication"]
-exclude = ["docs/", ".github/", "cliff.toml", "justfile"]
+exclude = ["docs/", ".github/", "cliff.toml", "justfile", "tests/e2e_pty.py", "tests/screenshot.py", "tests/__pycache__", "screenshot"]
 
 [dependencies]
 # TUI

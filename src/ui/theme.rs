@@ -8,8 +8,15 @@
 //! 选用默认的 **Cyberpunk** 主题(荧光粉 / 霓虹青 / 亮绿),契合“保险箱/终端”科技感:
 //! 深底 + 霓虹青描边,品红/绿高亮。
 
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::Frame;
 use ratatui_sci_fi::themes::{Palette, Theme};
+use ratatui_sci_fi::widgets::{Panel, PanelShape};
+
+/// 面板边框形态(全局可调):Rounded=现代 AI 感,Double=复古终端,Thick=厚重。
+/// 改这一处即可整体换肤。
+pub const PANEL_SHAPE: PanelShape = PanelShape::Rounded;
 
 /// 当前生效的调色板(编译期固定为 Cyberpunk)。
 const PALETTE: Palette = Theme::Cyberpunk.palette();
@@ -102,13 +109,33 @@ pub fn selected_bar() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// 带边框 + 标题的区块构造辅助。
+/// header/footer 状态栏底色:panel 底 + 前景文字。
+pub fn bar() -> Style {
+    Style::default()
+        .bg(PALETTE.panel.color())
+        .fg(PALETTE.fg.color())
+}
+
+/// 带边框 + 标题的区块构造辅助(圆角,用于输入框等紧凑小盒)。
 pub fn block(t: &str) -> ratatui::widgets::Block<'_> {
-    use ratatui::widgets::{Block, Borders};
+    use ratatui::widgets::{Block, BorderType, Borders};
     Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border())
         .title(t)
         .title_style(title_style())
         .style(Style::default().fg(PALETTE.fg.color()))
+}
+
+/// 渲染一个 sci-fi 面板(ratatui-sci-fi `Panel`:主题级霓虹边框 + 1 内边距 + 标题),
+/// 返回内容区 Rect。取代手搓 `Block`,边框颜色/内边距来自 Cyberpunk 的 Frame 级联。
+pub fn panel_frame(frame: &mut Frame, area: Rect, title: Option<&str>) -> Rect {
+    let mut panel = Panel::new().theme(Theme::Cyberpunk).shape(PANEL_SHAPE);
+    if let Some(t) = title {
+        panel = panel.title(format!(" {t} "));
+    }
+    let inner = panel.inner(area);
+    frame.render_widget(panel, area);
+    inner
 }

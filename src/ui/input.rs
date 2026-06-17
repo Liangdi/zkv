@@ -1,7 +1,7 @@
 //! 输入组件:文本输入框、口令模态、通用确认模态。对应 PRD §8。
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::theme;
@@ -71,6 +71,7 @@ pub fn render_modal(frame: &mut Frame, area: Rect, title: &str, body_lines: &[&s
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(theme::accent2())
         .title(format!(" {title} "))
         .title_style(theme::title_style())

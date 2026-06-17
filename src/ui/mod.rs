@@ -97,33 +97,38 @@ fn draw(frame: &mut Frame, app: &App) {
         _ => {}
     }
 
-    // 三栏 + 顶部 message。
+    // 纵向三段:header / body / footer。
     let whole = frame.area();
     let vert = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(whole);
-    let msg_area = vert[0];
+    let header_area = vert[0];
     let body_area = vert[1];
+    let footer_area = vert[2];
 
-    // 顶部 message / 模式提示
-    let msg_text = top_message(app);
-    let msg_line = ratatui::widgets::Paragraph::new(msg_text)
-        .style(theme::accent2());
-    frame.render_widget(msg_line, msg_area);
+    render_header(frame, header_area, app);
 
-    // 三栏:sidebar / list / detail
+    // 先给 body 填底,保证列间 spacing 缝隙干净(无 diff 残影)。
+    frame.render_widget(
+        ratatui::widgets::Block::default().style(theme::bg()),
+        body_area,
+    );
+
+    // 两栏:list / detail,中间留 1 列缝。
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(24),
-            Constraint::Percentage(40),
-            Constraint::Min(20),
-        ])
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .spacing(1)
         .split(body_area);
-    list::render_sidebar(frame, cols[0], app);
-    list::render_list(frame, cols[1], app);
-    detail::render_detail(frame, cols[2], app);
+    list::render_list(frame, cols[0], app);
+    detail::render_detail(frame, cols[1], app);
+
+    render_footer(frame, footer_area, app);
 
     // 叠加模态
     match app.mode {
@@ -136,12 +141,14 @@ fn draw(frame: &mut Frame, app: &App) {
 
 /// 口令输入:全屏模态(mask)。
 fn draw_passphrase(frame: &mut Frame, app: &App, kind: PassKind) {
-    let area = centered_rect(60, 20, frame.area());
+    // sci-fi Panel 自带 1 内边距 + 1 边框,故上下各占 2 行;内容需 7 行 → 至少 11 行。
+    // 50% 在 80×24 下得 12 行,内层 8 行,info(3)+input(3)+msg(1) 宽裕。
+    let area = centered_rect(60, 50, frame.area());
     frame.render_widget(Clear, area);
 
     let title = match kind {
-        PassKind::Open => " Unlock Vault ",
-        PassKind::Create => " Create New Vault ",
+        PassKind::Open => "Unlock Vault",
+        PassKind::Create => "Create New Vault",
     };
     let path = app
         .path
@@ -149,9 +156,7 @@ fn draw_passphrase(frame: &mut Frame, app: &App, kind: PassKind) {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(no path)".into());
 
-    let block = theme::block(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = theme::panel_frame(frame, area, Some(title));
 
     let field = input::InputField {
         value: app.input.clone(),
@@ -191,24 +196,88 @@ fn draw_simple_modal(frame: &mut Frame, title: &str, body: &str) {
     input::render_modal(frame, area, title, &[body]);
 }
 
-/// 顶部消息行。
-fn top_message(app: &App) -> String {
-    let mode_tag = match &app.mode {
-        Mode::Normal => "NORMAL",
-        Mode::Search => "SEARCH",
-        Mode::NewItem(t) => match t {
-            crate::model::ItemType::Password => "NEW·PASSWORD",
-            crate::model::ItemType::Note => "NEW·NOTE",
-            crate::model::ItemType::Card => "NEW·CARD",
-        },
-        Mode::EditItem => "EDIT",
-        Mode::ConfirmDelete => "CONFIRM-DELETE",
-        Mode::CategoryMgr => "CATEGORY-MGR",
-        Mode::TagMgr => "TAG-MGR",
-        Mode::PromptPassphrase(_) => "LOCKED",
+/// 顶部状态栏:品牌 · 消息(或库路径) · 条目/锁定状态。
+fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(1),
+            Constraint::Length(34),
+        ])
+        .split(area);
+
+    // 左:品牌。
+    let brand = ratatui::widgets::Paragraph::new(
+        ratatui::text::Line::from(" zkv ").style(theme::title_style()),
+    )
+    .style(theme::bar());
+    frame.render_widget(brand, chunks[0]);
+
+    // 中:瞬态消息(强调),否则库路径(弱化)。
+    let (center_text, center_style) = match app.message.as_deref() {
+        Some(m) if !m.is_empty() => (m.to_string(), theme::accent2()),
+        _ => (
+            app.path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            theme::muted(),
+        ),
     };
-    let msg = app.message.as_deref().unwrap_or("");
-    format!(" [{mode_tag}]  {msg}  ·  n:new e:edit x:del /:search y:copy l:lock q:quit")
+    let center = ratatui::widgets::Paragraph::new(
+        ratatui::text::Line::from(center_text).style(center_style),
+    )
+    .style(theme::bar());
+    frame.render_widget(center, chunks[1]);
+
+    // 右:计数 + 锁定态。
+    let unlocked = app.db.is_some();
+    let state_label = if unlocked { "unlocked" } else { "locked" };
+    let state_style = if unlocked { theme::accent() } else { theme::error() };
+    let right = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(vec![
+        ratatui::text::Span::styled(
+            format!(
+                " {} items · {}c · {}t · ",
+                app.items.len(),
+                app.categories.len(),
+                app.tags.len()
+            ),
+            theme::muted(),
+        ),
+        ratatui::text::Span::styled("● ", state_style),
+        ratatui::text::Span::styled(state_label.to_string(), state_style),
+    ]))
+    .style(theme::bar())
+    .alignment(ratatui::layout::Alignment::Right);
+    frame.render_widget(right, chunks[2]);
+}
+
+/// 底部键位栏:键名(青) + 说明(弱化)。
+fn render_footer(frame: &mut Frame, area: Rect, _app: &App) {
+    let hints: &[(&str, &str)] = &[
+        ("n", "new"),
+        ("e", "edit"),
+        ("x", "del"),
+        ("/", "search"),
+        ("y", "copy"),
+        ("l", "lock"),
+        ("c", "cat"),
+        ("t", "tag"),
+        ("q", "quit"),
+    ];
+    let mut spans: Vec<ratatui::text::Span<'_>> = vec![ratatui::text::Span::raw(" ")];
+    for (i, (k, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(ratatui::text::Span::raw("   "));
+        }
+        spans.push(ratatui::text::Span::styled(*k, theme::accent2()));
+        spans.push(ratatui::text::Span::styled(format!(":{label}"), theme::muted()));
+    }
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(ratatui::text::Line::from(spans)).style(theme::bar()),
+        area,
+    );
 }
 
 // ---- helpers ----
