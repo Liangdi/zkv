@@ -1,0 +1,1155 @@
+//! 应用状态机:连接 UI 与数据层(MVC 中的 Model+Controller)。对应 PRD §8。
+//!
+//! ## MVC 边界
+//! - **App = Model + Controller**:持有全部状态与业务逻辑。
+//! - **UI = View**(SA5):只读 App 的 `pub` 字段来渲染,并把原始按键
+//!   `crossterm::event::KeyEvent` 转发给 [`App::handle_key`]。UI 不做业务判断。
+//!
+//! 对外接口:
+//! - [`App`] / [`Mode`] / [`PassKind`] / [`EditorState`] / [`Field`] / [`DataField`] / [`Action`]
+//! - [`App::for_open`] / [`App::for_create`] / [`App::from_unlocked`]
+//! - [`App::handle_key`] / [`App::reload`] / [`App::save`] / [`App::lock`] / [`App::selected_item`]
+//!
+//! 分层(L4):可依赖 `error`/`crypto`/`model`/`db`/`vault`/`store`/`search`/`clipboard`
+//! 与外部 crate,**不得** `use crate::ui`。
+
+use std::path::PathBuf;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use zeroize::Zeroizing;
+
+use crate::clipboard;
+use crate::db::Database;
+use crate::error::{Error, Result};
+use crate::model::{Item, ItemData, ItemType};
+use crate::search::{self, Filter};
+use crate::store;
+use crate::vault;
+
+// ---------------------------------------------------------------------------
+// 类型定义
+// ---------------------------------------------------------------------------
+
+/// `handle_key` 的返回值:主循环据此决定重绘或退出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// 继续运行(状态可能已变,需要重绘)。
+    Continue,
+    /// 退出主循环。
+    Quit,
+}
+
+/// 口令输入场景。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassKind {
+    /// 打开已有库。
+    Open,
+    /// 创建新库。
+    Create,
+}
+
+/// 应用当前所在模式(对应 PRD §8 的各交互态)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// 浏览列表。
+    Normal,
+    /// 搜索输入框。
+    Search,
+    /// 口令输入(打开/创建)。
+    PromptPassphrase(PassKind),
+    /// 新建条目(编辑器)。
+    NewItem(ItemType),
+    /// 编辑现有条目(编辑器)。
+    EditItem,
+    /// 确认删除。
+    ConfirmDelete,
+    /// 分类管理(最小实现)。
+    CategoryMgr,
+    /// 标签管理(最小实现)。
+    TagMgr,
+}
+
+/// 编辑器中当前正在编辑的字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Field {
+    /// 标题(三类通用)。
+    Title,
+    /// 数据子字段(随 `ItemType` 变化)。
+    Data(DataField),
+}
+
+/// 三类条目各自可编辑的子字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataField {
+    // password
+    Username,
+    Password,
+    Url,
+    TotpSecret,
+    Notes,
+    // note
+    Format,
+    Content,
+    // card
+    Holder,
+    Number,
+    Expiry,
+    Cvv,
+    Bank,
+    // CardNotes 复用 Notes 变体,通过 draft.item_type 区分语义。
+}
+
+/// 编辑器状态:当前草稿 + 正在编辑的字段。
+#[derive(Debug, Clone)]
+pub struct EditorState {
+    pub draft: Item,
+    pub field: Field,
+}
+
+/// 应用状态机。
+pub struct App {
+    /// 已解锁的数据库句柄;`None` 表示已锁定/未解锁。
+    pub db: Option<Database>,
+    /// 库文件路径。
+    pub path: Option<PathBuf>,
+    /// 解锁后持有的口令(用于 `save`);`lock` 时清零。
+    pub passphrase: Option<Zeroizing<String>>,
+    /// 当前模式。
+    pub mode: Mode,
+    /// 当前搜索/过滤条件。
+    pub filter: Filter,
+    /// 过滤后的条目列表(`reload` 后刷新)。
+    pub items: Vec<Item>,
+    /// 列表选中索引。
+    pub selected: usize,
+    /// 全部分类(`reload` 后刷新)。
+    pub categories: Vec<crate::model::Category>,
+    /// 全部标签名(`reload` 后刷新)。
+    pub tags: Vec<String>,
+    /// 给用户的瞬态提示信息。
+    pub message: Option<String>,
+    /// 编辑器状态(NewItem/EditItem 模式)。
+    pub editor: Option<EditorState>,
+    /// 文本输入缓冲(搜索/口令/编辑器字段共用)。
+    pub input: String,
+    /// 是否掩码输入(口令=true,搜索/编辑器字段=false)。
+    pub input_mask: bool,
+    /// 是否请求退出。
+    pub quit: bool,
+}
+
+impl App {
+    // -----------------------------------------------------------------------
+    // 构造
+    // -----------------------------------------------------------------------
+
+    /// 打开已有库:进入口令输入态(`PromptPassphrase(Open)`)。
+    pub fn for_open(path: PathBuf) -> App {
+        App {
+            db: None,
+            path: Some(path),
+            passphrase: None,
+            mode: Mode::PromptPassphrase(PassKind::Open),
+            filter: Filter::default(),
+            items: Vec::new(),
+            selected: 0,
+            categories: Vec::new(),
+            tags: Vec::new(),
+            message: None,
+            editor: None,
+            input: String::new(),
+            input_mask: true,
+            quit: false,
+        }
+    }
+
+    /// 创建新库:进入口令输入态(`PromptPassphrase(Create)`)。
+    pub fn for_create(path: PathBuf) -> App {
+        App {
+            db: None,
+            path: Some(path),
+            passphrase: None,
+            mode: Mode::PromptPassphrase(PassKind::Create),
+            filter: Filter::default(),
+            items: Vec::new(),
+            selected: 0,
+            categories: Vec::new(),
+            tags: Vec::new(),
+            message: None,
+            editor: None,
+            input: String::new(),
+            input_mask: true,
+            quit: false,
+        }
+    }
+
+    /// 已解锁构造(测试用):载入 db + 口令,执行首次 `reload`,进入 Normal。
+    pub fn from_unlocked(db: Database, path: PathBuf, passphrase: String) -> Result<App> {
+        let mut app = App {
+            db: Some(db),
+            path: Some(path),
+            passphrase: Some(Zeroizing::new(passphrase)),
+            mode: Mode::Normal,
+            filter: Filter::default(),
+            items: Vec::new(),
+            selected: 0,
+            categories: Vec::new(),
+            tags: Vec::new(),
+            message: None,
+            editor: None,
+            input: String::new(),
+            input_mask: false,
+            quit: false,
+        };
+        app.reload()?;
+        Ok(app)
+    }
+
+    // -----------------------------------------------------------------------
+    // 业务方法
+    // -----------------------------------------------------------------------
+
+    /// 刷新过滤结果、分类、标签;`selected` 越界则回退到末位。
+    pub fn reload(&mut self) -> Result<()> {
+        let Some(ref db) = self.db else {
+            self.items.clear();
+            self.categories.clear();
+            self.tags.clear();
+            return Ok(());
+        };
+        let conn = db.conn();
+        self.items = search::search(conn, &self.filter)?;
+        self.categories = store::list_categories(conn)?;
+        // list_tags 返回 Vec<Tag>,这里取 name。
+        self.tags = store::list_tags(conn)?
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        if self.selected >= self.items.len() {
+            self.selected = self.items.len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    /// 保存(落盘)。passphrase 取自 `self.passphrase`,缺则 `Error::Other`。
+    pub fn save(&self) -> Result<()> {
+        let path = self.path.as_ref().ok_or_else(|| {
+            Error::Other("save: no vault path".into())
+        })?;
+        let passphrase = self
+            .passphrase
+            .as_ref()
+            .map(|p| p.as_str())
+            .ok_or_else(|| Error::Other("save: no passphrase (locked?)".into()))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| Error::Other("save: no database".into()))?;
+        vault::save(path, passphrase, db)
+    }
+
+    /// 锁定:清空 db/passphrase,切回 Normal,清空 items/categories/tags。
+    pub fn lock(&mut self) {
+        self.db = None;
+        self.passphrase = None;
+        self.mode = Mode::Normal;
+        self.items.clear();
+        self.categories.clear();
+        self.tags.clear();
+        self.selected = 0;
+        self.filter = Filter::default();
+        self.input.clear();
+        self.input_mask = false;
+        self.editor = None;
+        self.message = Some("locked".into());
+    }
+
+    /// 当前选中的 item(不可变引用)。
+    pub fn selected_item(&self) -> Option<&Item> {
+        self.items.get(self.selected)
+    }
+
+    /// 复制选中条目的密码字段到剪贴板,20s 后清空。
+    /// 剪贴板后端不可用时仅设 message,不传播错误。
+    fn copy_password_of_selected(&mut self) {
+        let Some(item) = self.items.get(self.selected).cloned() else {
+            self.message = Some("no item selected".into());
+            return;
+        };
+        let pw = match &item.data {
+            ItemData::Password { password, .. } => password.clone(),
+            _ => {
+                self.message = Some("selected item has no password".into());
+                return;
+            }
+        };
+        match clipboard::copy_and_clear_after(&pw, 20) {
+            Ok(()) => self.message = Some("password copied (clears in 20s)".into()),
+            Err(e) => self.message = Some(format!("clipboard unavailable: {e}")),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_key 分发
+    // -----------------------------------------------------------------------
+
+    /// 按当前 `mode` 分发按键。返回 [`Action::Quit`] 表示主循环应退出。
+    pub fn handle_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match self.mode.clone() {
+            Mode::PromptPassphrase(kind) => self.handle_passphrase(key, kind),
+            Mode::Normal => self.handle_normal(key),
+            Mode::Search => self.handle_search(key),
+            Mode::NewItem(ty) => self.handle_editor(key, true, ty),
+            Mode::EditItem => self.handle_editor(key, false, ItemType::Password),
+            Mode::ConfirmDelete => self.handle_confirm_delete(key),
+            Mode::CategoryMgr => self.handle_category_mgr(key),
+            Mode::TagMgr => self.handle_tag_mgr(key),
+        }
+    }
+
+    // ---- PromptPassphrase ----
+    fn handle_passphrase(&mut self, key: KeyEvent, kind: PassKind) -> Result<Action> {
+        match key.code {
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.input_mask = true;
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => {
+                let pass = std::mem::take(&mut self.input);
+                self.input_mask = false;
+                let path = match self.path.as_ref() {
+                    Some(p) => p.clone(),
+                    None => {
+                        self.message = Some("no vault path".into());
+                        return Ok(Action::Continue);
+                    }
+                };
+                match kind {
+                    PassKind::Create => {
+                        match vault::create(&path, &pass) {
+                            Ok(()) => {
+                                match vault::unlock(&path, &pass) {
+                                    Ok(db) => {
+                                        self.passphrase = Some(Zeroizing::new(pass));
+                                        self.db = Some(db);
+                                        self.mode = Mode::Normal;
+                                        self.reload()?;
+                                        self.message = Some("vault created".into());
+                                    }
+                                    Err(e) => {
+                                        self.message =
+                                            Some(format!("unlock after create failed: {e}"));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.message =
+                                    Some(format!("create failed: {e}"));
+                            }
+                        }
+                    }
+                    PassKind::Open => match vault::unlock(&path, &pass) {
+                        Ok(db) => {
+                            self.passphrase = Some(Zeroizing::new(pass));
+                            self.db = Some(db);
+                            self.mode = Mode::Normal;
+                            self.reload()?;
+                            self.message = Some("unlocked".into());
+                        }
+                        Err(e) => {
+                            // 错误口令 / 损坏:停留口令态,清空 input(已 take)。
+                            self.message = Some(format!("unlock failed: {e}"));
+                        }
+                    },
+                }
+            }
+            KeyCode::Esc => {
+                self.quit = true;
+                return Ok(Action::Quit);
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    // ---- Normal ----
+    fn handle_normal(&mut self, key: KeyEvent) -> Result<Action> {
+        // 未解锁状态下,Normal 仅响应 q。
+        if self.db.is_none() {
+            if matches!(key.code, KeyCode::Char('q')) {
+                self.quit = true;
+                return Ok(Action::Quit);
+            }
+            return Ok(Action::Continue);
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.items.is_empty() && self.selected + 1 < self.items.len() {
+                    self.selected += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                }
+            }
+            KeyCode::Char('/') => {
+                self.mode = Mode::Search;
+                self.input.clear();
+                self.input_mask = false;
+            }
+            KeyCode::Char('n') => {
+                self.start_editor_new(ItemType::Password);
+            }
+            KeyCode::Char('e') => {
+                self.start_editor_edit();
+            }
+            KeyCode::Char('x') => {
+                if self.selected_item().is_some() {
+                    self.mode = Mode::ConfirmDelete;
+                } else {
+                    self.message = Some("no item selected".into());
+                }
+            }
+            KeyCode::Char('y') => {
+                self.copy_password_of_selected();
+            }
+            KeyCode::Char('l') => {
+                self.lock();
+            }
+            KeyCode::Char('c') => {
+                self.mode = Mode::CategoryMgr;
+                self.message = Some("category manager (Esc to return)".into());
+            }
+            KeyCode::Char('t') => {
+                self.mode = Mode::TagMgr;
+                self.message = Some("tag manager (Esc to return)".into());
+            }
+            KeyCode::Char('q') => {
+                self.quit = true;
+                return Ok(Action::Quit);
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    // ---- Search ----
+    fn handle_search(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Char(c) => {
+                self.input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => {
+                self.filter.query = Some(self.input.clone());
+                self.reload()?;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Esc => {
+                // 不 apply,直接返回 Normal。
+                self.mode = Mode::Normal;
+                self.input.clear();
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    // ---- Editor (NewItem / EditItem) ----
+    fn handle_editor(
+        &mut self,
+        key: KeyEvent,
+        is_new: bool,
+        _ty: ItemType,
+    ) -> Result<Action> {
+        let Some(ref mut ed) = self.editor else {
+            self.mode = Mode::Normal;
+            return Ok(Action::Continue);
+        };
+        match key.code {
+            KeyCode::Char(c) => {
+                // Ctrl+按键不作为普通字符输入。
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(Action::Continue);
+                }
+                Self::write_field(&mut ed.draft, &ed.field, c);
+            }
+            KeyCode::Backspace => {
+                Self::backspace_field(&mut ed.draft, &ed.field);
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                ed.field = Self::next_field(&ed.draft.item_type, &ed.field);
+            }
+            KeyCode::Up => {
+                ed.field = Self::prev_field(&ed.draft.item_type, &ed.field);
+            }
+            KeyCode::Enter => {
+                // 保存。
+                let draft = ed.draft.clone();
+                let saved = if is_new {
+                    self.save_new_item(draft)
+                } else {
+                    self.save_edit_item(draft)
+                };
+                match saved {
+                    Ok(()) => {
+                        self.editor = None;
+                        self.mode = Mode::Normal;
+                    }
+                    Err(e) => {
+                        self.message = Some(format!("save failed: {e}"));
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.editor = None;
+                self.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    // ---- ConfirmDelete ----
+    fn handle_confirm_delete(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Char('y') => {
+                if let Some(id) = self
+                    .items
+                    .get(self.selected)
+                    .and_then(|i| i.id)
+                {
+                    let res = (|| -> Result<()> {
+                        let db = self.db.as_ref().ok_or_else(|| {
+                            Error::Other("delete: no database".into())
+                        })?;
+                        store::delete_item(db.conn(), id)?;
+                        self.save()?;
+                        self.reload()?;
+                        Ok(())
+                    })();
+                    match res {
+                        Ok(()) => self.message = Some("deleted".into()),
+                        Err(e) => self.message = Some(format!("delete failed: {e}")),
+                    }
+                }
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    // ---- CategoryMgr (最小实现) ----
+    fn handle_category_mgr(&mut self, key: KeyEvent) -> Result<Action> {
+        // TODO(SA5+):实现增删改分类。当前仅支持 Esc 返回。
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    // ---- TagMgr (最小实现) ----
+    fn handle_tag_mgr(&mut self, key: KeyEvent) -> Result<Action> {
+        // TODO(SA5+):实现增删改标签。当前仅支持 Esc 返回。
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    // -----------------------------------------------------------------------
+    // 编辑器辅助
+    // -----------------------------------------------------------------------
+
+    /// 进入 NewItem 编辑器:给定类型,草稿为空标题 + 该类型默认 data。
+    fn start_editor_new(&mut self, ty: ItemType) {
+        let draft = Item {
+            id: None,
+            item_type: ty,
+            title: String::new(),
+            category_id: None,
+            data: default_data(ty),
+            favorite: false,
+            tags: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        self.editor = Some(EditorState {
+            draft,
+            field: Field::Title,
+        });
+        self.mode = Mode::NewItem(ty);
+    }
+
+    /// 进入 EditItem 编辑器:复制选中 item 为草稿。
+    fn start_editor_edit(&mut self) {
+        let Some(item) = self.items.get(self.selected).cloned() else {
+            self.message = Some("no item selected".into());
+            return;
+        };
+        self.editor = Some(EditorState {
+            draft: item,
+            field: Field::Title,
+        });
+        self.mode = Mode::EditItem;
+    }
+
+    /// 保存新建条目:insert_item + save + reload。
+    fn save_new_item(&mut self, mut draft: Item) -> Result<()> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| Error::Other("save_new: no database".into()))?;
+        store::insert_item(db.conn(), &mut draft)?;
+        self.save()?;
+        self.reload()?;
+        Ok(())
+    }
+
+    /// 保存编辑条目:update_item + save + reload。
+    fn save_edit_item(&mut self, draft: Item) -> Result<()> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| Error::Other("save_edit: no database".into()))?;
+        store::update_item(db.conn(), &draft)?;
+        self.save()?;
+        self.reload()?;
+        Ok(())
+    }
+
+    /// 写入一个字符到当前字段。
+    fn write_field(draft: &mut Item, field: &Field, c: char) {
+        match field {
+            Field::Title => draft.title.push(c),
+            Field::Data(d) => match (&mut draft.data, d) {
+                (ItemData::Password { username, .. }, DataField::Username) => username.push(c),
+                (ItemData::Password { password, .. }, DataField::Password) => password.push(c),
+                (ItemData::Password { url, .. }, DataField::Url) => url.push(c),
+                (ItemData::Password { totp_secret, .. }, DataField::TotpSecret) => {
+                    totp_secret.push(c)
+                }
+                (ItemData::Password { notes, .. }, DataField::Notes) => notes.push(c),
+                (ItemData::Note { format, .. }, DataField::Format) => format.push(c),
+                (ItemData::Note { content, .. }, DataField::Content) => content.push(c),
+                (ItemData::Card { holder, .. }, DataField::Holder) => holder.push(c),
+                (ItemData::Card { number, .. }, DataField::Number) => number.push(c),
+                (ItemData::Card { expiry, .. }, DataField::Expiry) => expiry.push(c),
+                (ItemData::Card { cvv, .. }, DataField::Cvv) => cvv.push(c),
+                (ItemData::Card { bank, .. }, DataField::Bank) => bank.push(c),
+                (ItemData::Card { notes, .. }, DataField::Notes) => notes.push(c),
+                _ => {}
+            },
+        }
+    }
+
+    /// 退格删除当前字段末尾字符。
+    fn backspace_field(draft: &mut Item, field: &Field) {
+        match field {
+            Field::Title => {
+                draft.title.pop();
+            }
+            Field::Data(d) => match (&mut draft.data, d) {
+                (ItemData::Password { username, .. }, DataField::Username) => {
+                    username.pop();
+                }
+                (ItemData::Password { password, .. }, DataField::Password) => {
+                    password.pop();
+                }
+                (ItemData::Password { url, .. }, DataField::Url) => {
+                    url.pop();
+                }
+                (ItemData::Password { totp_secret, .. }, DataField::TotpSecret) => {
+                    totp_secret.pop();
+                }
+                (ItemData::Password { notes, .. }, DataField::Notes) => {
+                    notes.pop();
+                }
+                (ItemData::Note { format, .. }, DataField::Format) => {
+                    format.pop();
+                }
+                (ItemData::Note { content, .. }, DataField::Content) => {
+                    content.pop();
+                }
+                (ItemData::Card { holder, .. }, DataField::Holder) => {
+                    holder.pop();
+                }
+                (ItemData::Card { number, .. }, DataField::Number) => {
+                    number.pop();
+                }
+                (ItemData::Card { expiry, .. }, DataField::Expiry) => {
+                    expiry.pop();
+                }
+                (ItemData::Card { cvv, .. }, DataField::Cvv) => {
+                    cvv.pop();
+                }
+                (ItemData::Card { bank, .. }, DataField::Bank) => {
+                    bank.pop();
+                }
+                (ItemData::Card { notes, .. }, DataField::Notes) => {
+                    notes.pop();
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// 当前类型的可循环字段序列(Title 在前)。
+    fn fields_for(ty: ItemType) -> Vec<Field> {
+        let mut v = vec![Field::Title];
+        match ty {
+            ItemType::Password => {
+                v.extend([
+                    Field::Data(DataField::Username),
+                    Field::Data(DataField::Password),
+                    Field::Data(DataField::Url),
+                    Field::Data(DataField::TotpSecret),
+                    Field::Data(DataField::Notes),
+                ]);
+            }
+            ItemType::Note => {
+                v.extend([
+                    Field::Data(DataField::Format),
+                    Field::Data(DataField::Content),
+                ]);
+            }
+            ItemType::Card => {
+                v.extend([
+                    Field::Data(DataField::Holder),
+                    Field::Data(DataField::Number),
+                    Field::Data(DataField::Expiry),
+                    Field::Data(DataField::Cvv),
+                    Field::Data(DataField::Bank),
+                    Field::Data(DataField::Notes),
+                ]);
+            }
+        }
+        v
+    }
+
+    /// 下一个字段(循环)。
+    fn next_field(ty: &ItemType, cur: &Field) -> Field {
+        let seq = Self::fields_for(*ty);
+        let idx = seq.iter().position(|f| f == cur).unwrap_or(0);
+        let next = (idx + 1) % seq.len();
+        seq[next].clone()
+    }
+
+    /// 上一个字段(循环)。
+    fn prev_field(ty: &ItemType, cur: &Field) -> Field {
+        let seq = Self::fields_for(*ty);
+        let idx = seq.iter().position(|f| f == cur).unwrap_or(0);
+        let prev = if idx == 0 {
+            seq.len().saturating_sub(1)
+        } else {
+            idx - 1
+        };
+        seq[prev].clone()
+    }
+}
+
+/// 给定类型生成默认(空)的 ItemData。
+fn default_data(ty: ItemType) -> ItemData {
+    match ty {
+        ItemType::Password => ItemData::Password {
+            username: String::new(),
+            password: String::new(),
+            url: String::new(),
+            totp_secret: String::new(),
+            notes: String::new(),
+        },
+        ItemType::Note => ItemData::Note {
+            format: "text".into(),
+            content: String::new(),
+        },
+        ItemType::Card => ItemData::Card {
+            holder: String::new(),
+            number: String::new(),
+            expiry: String::new(),
+            cvv: String::new(),
+            bank: String::new(),
+            notes: String::new(),
+        },
+    }
+}
+
+/// 把一个 `&str` 喂给 `KeyCode::Char` 序列的辅助(测试用)。
+#[allow(dead_code)]
+fn str_to_keys(s: &str) -> Vec<KeyEvent> {
+    s.chars()
+        .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+        .collect()
+}
+
+// Helper to make a KeyDown KeyEvent in tests.
+#[cfg(test)]
+fn key(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+}
+
+#[cfg(test)]
+fn key_code(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+// ---------------------------------------------------------------------------
+// 单元测试(纯逻辑,避开慢 KDF)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::KdfParams;
+    use crate::db::Database;
+    use crate::model::{ItemData, ItemType};
+    use crate::store;
+
+    /// 构造一个内存库 + 插入若干 password item 的 App(从 from_unlocked 入口)。
+    fn app_with_items(n: usize) -> App {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        for i in 0..n {
+            let mut it = Item {
+                id: None,
+                item_type: ItemType::Password,
+                title: format!("item-{i}"),
+                category_id: None,
+                data: ItemData::Password {
+                    username: format!("user-{i}"),
+                    password: format!("pw-{i}"),
+                    url: String::new(),
+                    totp_secret: String::new(),
+                    notes: String::new(),
+                },
+                favorite: false,
+                tags: Vec::new(),
+                created_at: 0,
+                updated_at: 0,
+            };
+            store::insert_item(conn, &mut it).unwrap();
+        }
+        let tmp = std::env::temp_dir().join(format!(
+            "zkv_app_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // from_unlocked 用 save() 落盘,需要 path 存在;先用 vault::create_with_params 建一个空壳,
+        // 再把内存 db 的内容保存过去。这里简化:用 fast KDF create 一份,然后直接 from_unlocked(内存 db)。
+        // 但 save() 会用 KdfParams::default()(慢)。为避免慢 KDF,这些单测**不触发 save**:
+        // 只要不调用会 save 的路径(insert/update/delete + 保存)即可。
+        let _ = tmp;
+        App::from_unlocked(db, std::path::PathBuf::from("/tmp/zkv_unused.zkv"), "dummy".into())
+            .unwrap()
+    }
+
+    #[test]
+    fn from_unlocked_loads_items() {
+        let app = app_with_items(3);
+        assert_eq!(app.items.len(), 3);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.db.is_some());
+    }
+
+    #[test]
+    fn normal_n_enters_new_item_mode() {
+        let mut app = app_with_items(1);
+        let act = app.handle_key(key('n')).unwrap();
+        assert_eq!(act, Action::Continue);
+        assert!(matches!(app.mode, Mode::NewItem(ItemType::Password)));
+        assert!(app.editor.is_some());
+    }
+
+    #[test]
+    fn create_item_increments_count() {
+        // 注意:保存路径会调用 save() -> vault::save -> 慢 KDF。
+        // 为保持测试快速,这里用临时文件 + 直接 vault::create_with_params 预建,
+        // 然后 from_unlocked 一个真实可保存的 path。
+        let path = tmp_path("create_item");
+        cleanup(&path);
+        let kdf = KdfParams { m_kib: 4096, t_cost: 1, p_cost: 1 };
+        crate::vault::create_with_params(&path, "pw", &kdf).unwrap();
+
+        let db = crate::vault::unlock(&path, "pw").unwrap();
+        // 插一条种子
+        {
+            let conn = db.conn();
+            let mut seed = Item {
+                id: None,
+                item_type: ItemType::Password,
+                title: "seed".into(),
+                category_id: None,
+                data: ItemData::Password {
+                    username: "u".into(),
+                    password: "p".into(),
+                    url: String::new(),
+                    totp_secret: String::new(),
+                    notes: String::new(),
+                },
+                favorite: false,
+                tags: Vec::new(),
+                created_at: 0,
+                updated_at: 0,
+            };
+            store::insert_item(conn, &mut seed).unwrap();
+        }
+        let mut app = App::from_unlocked(db, path.clone(), "pw".into()).unwrap();
+        let before = app.items.len();
+
+        // n -> NewItem
+        app.handle_key(key('n')).unwrap();
+        assert!(matches!(app.mode, Mode::NewItem(_)));
+        // 输入标题 "new"
+        for c in "new".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        // Tab 到 username,输入 "bob"
+        app.handle_key(key_code(KeyCode::Tab)).unwrap();
+        for c in "bob".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        // Enter 保存
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.items.len(), before + 1);
+        // 验证落盘后再解锁仍能看到
+        let db2 = crate::vault::unlock(&path, "pw").unwrap();
+        let cnt = db2
+            .conn()
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(cnt as usize, before + 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn normal_q_returns_quit() {
+        let mut app = app_with_items(1);
+        let act = app.handle_key(key('q')).unwrap();
+        assert_eq!(act, Action::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn normal_l_locks_clears_db() {
+        let mut app = app_with_items(2);
+        app.handle_key(key('l')).unwrap();
+        assert!(app.db.is_none());
+        assert!(app.passphrase.is_none());
+        assert!(app.items.is_empty());
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn normal_y_does_not_panic_without_clipboard() {
+        let mut app = app_with_items(1);
+        // 选中第一条(password 类型)
+        app.selected = 0;
+        app.handle_key(key('y')).unwrap();
+        // 剪贴板可能无后端,message 被设置即可。
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn normal_jk_moves_selection() {
+        let mut app = app_with_items(3);
+        app.selected = 0;
+        app.handle_key(key('j')).unwrap();
+        assert_eq!(app.selected, 1);
+        app.handle_key(key('j')).unwrap();
+        assert_eq!(app.selected, 2);
+        // 末位不再下移
+        app.handle_key(key('j')).unwrap();
+        assert_eq!(app.selected, 2);
+        app.handle_key(key('k')).unwrap();
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn search_filters_items() {
+        let db = Database::open_in_memory().unwrap();
+        {
+            let conn = db.conn();
+            let mut a = Item {
+                id: None,
+                item_type: ItemType::Password,
+                title: "GitHub".into(),
+                category_id: None,
+                data: ItemData::Password {
+                    username: "u".into(),
+                    password: "p".into(),
+                    url: String::new(),
+                    totp_secret: String::new(),
+                    notes: String::new(),
+                },
+                favorite: false,
+                tags: Vec::new(),
+                created_at: 0,
+                updated_at: 0,
+            };
+            let mut b = a.clone();
+            b.title = "GitLab".into();
+            store::insert_item(conn, &mut a).unwrap();
+            store::insert_item(conn, &mut b).unwrap();
+        }
+        let mut app =
+            App::from_unlocked(db, std::path::PathBuf::from("/tmp/zkv_unused.zkv"), "x".into())
+                .unwrap();
+        assert_eq!(app.items.len(), 2);
+
+        // / 进入搜索,输入 "github",Enter
+        app.handle_key(key('/')).unwrap();
+        assert!(matches!(app.mode, Mode::Search));
+        for c in "github".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.items.len(), 1, "应只命中 GitHub");
+        assert_eq!(app.filter.query.as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn search_esc_does_not_apply() {
+        let mut app = app_with_items(3);
+        app.handle_key(key('/')).unwrap();
+        for c in "zzz".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+        // filter 未变(仍为 None),items 仍为 3
+        assert!(app.filter.query.is_none());
+        assert_eq!(app.items.len(), 3);
+    }
+
+    #[test]
+    fn confirm_delete_y_removes_item() {
+        let path = tmp_path("del_item");
+        cleanup(&path);
+        let kdf = KdfParams { m_kib: 4096, t_cost: 1, p_cost: 1 };
+        crate::vault::create_with_params(&path, "pw", &kdf).unwrap();
+        let db = crate::vault::unlock(&path, "pw").unwrap();
+        {
+            let conn = db.conn();
+            let mut it = Item {
+                id: None,
+                item_type: ItemType::Password,
+                title: "to-delete".into(),
+                category_id: None,
+                data: ItemData::Password {
+                    username: "u".into(),
+                    password: "p".into(),
+                    url: String::new(),
+                    totp_secret: String::new(),
+                    notes: String::new(),
+                },
+                favorite: false,
+                tags: Vec::new(),
+                created_at: 0,
+                updated_at: 0,
+            };
+            store::insert_item(conn, &mut it).unwrap();
+        }
+        let mut app = App::from_unlocked(db, path.clone(), "pw".into()).unwrap();
+        assert_eq!(app.items.len(), 1);
+
+        // x -> ConfirmDelete
+        app.handle_key(key('x')).unwrap();
+        assert!(matches!(app.mode, Mode::ConfirmDelete));
+        // y -> 删除
+        app.handle_key(key('y')).unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.items.len(), 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn editor_tab_cycles_password_fields() {
+        let mut app = app_with_items(0);
+        app.start_editor_new(ItemType::Password);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.field, Field::Title);
+        // Tab -> Username
+        let next = App::next_field(&ItemType::Password, &Field::Title);
+        assert_eq!(next, Field::Data(DataField::Username));
+        // 循环到末位 Notes 再 Tab 回 Title
+        let last = Field::Data(DataField::Notes);
+        let wrap = App::next_field(&ItemType::Password, &last);
+        assert_eq!(wrap, Field::Title);
+    }
+
+    #[test]
+    fn passphrase_wrong_stays_in_prompt() {
+        let path = tmp_path("wrong_pass");
+        cleanup(&path);
+        let kdf = KdfParams { m_kib: 4096, t_cost: 1, p_cost: 1 };
+        crate::vault::create_with_params(&path, "correct", &kdf).unwrap();
+
+        let mut app = App::for_open(path.clone());
+        // 输入错误口令 "wrong"
+        for c in "wrong".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        let act = app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert_eq!(act, Action::Continue);
+        // 失败:停留口令态,db 仍 None
+        assert!(matches!(app.mode, Mode::PromptPassphrase(PassKind::Open)));
+        assert!(app.db.is_none());
+        assert!(app.message.is_some());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn passphrase_correct_opens() {
+        let path = tmp_path("right_pass");
+        cleanup(&path);
+        let kdf = KdfParams { m_kib: 4096, t_cost: 1, p_cost: 1 };
+        crate::vault::create_with_params(&path, "correct", &kdf).unwrap();
+
+        let mut app = App::for_open(path.clone());
+        for c in "correct".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        // 成功:进入 Normal,db=Some
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.db.is_some());
+        cleanup(&path);
+    }
+
+    // ---- 测试辅助:临时文件 ----
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!("zkv_app_{tag}_{}_{}", std::process::id(), n));
+        p
+    }
+
+    fn cleanup(p: &std::path::Path) {
+        let _ = std::fs::remove_file(p);
+        let mut t = p.as_os_str().to_owned();
+        t.push(".tmp");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(t));
+    }
+}
