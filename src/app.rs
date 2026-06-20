@@ -67,6 +67,8 @@ pub enum Mode {
     CategoryMgr,
     /// 标签管理。
     TagMgr,
+    /// 附件管理(锁定进入时选中的 item)。
+    Attachments,
 }
 
 /// 管理模式(CategoryMgr/TagMgr)中,当前是否处于文本输入态及语义。
@@ -76,6 +78,22 @@ pub enum MgrEdit {
     Add,
     /// 改名。
     Rename,
+}
+
+/// 附件元数据(不含 blob),用于 Attachments 模式列表渲染。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttMeta {
+    pub id: i64,
+    pub filename: String,
+    pub mime_type: Option<String>,
+    pub size: i64,
+}
+
+/// Attachments 模式的输入态语义:add 输入文件路径,export 输入输出路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttEdit {
+    Add,
+    Export,
 }
 
 /// 管理模式所操作的实体种类(供 `mgr_handle` 复用分发)。
@@ -158,6 +176,14 @@ pub struct App {
     pub mgr_selected: usize,
     /// 管理模式当前是否在文本输入(新增/改名),及语义。
     pub mgr_edit: Option<MgrEdit>,
+    /// Attachments 模式锁定的目标 item id。
+    pub att_item_id: Option<i64>,
+    /// Attachments 模式的附件元数据列表(不含 blob)。
+    pub att_list: Vec<AttMeta>,
+    /// Attachments 模式选中索引。
+    pub att_selected: usize,
+    /// Attachments 模式输入态:add(文件路径) / export(输出路径)。
+    pub att_edit: Option<AttEdit>,
     /// 是否请求退出。
     pub quit: bool,
 }
@@ -187,6 +213,10 @@ impl App {
             input_mask: true,
             mgr_selected: 0,
             mgr_edit: None,
+            att_item_id: None,
+            att_list: Vec::new(),
+            att_selected: 0,
+            att_edit: None,
             quit: false,
         }
     }
@@ -211,6 +241,10 @@ impl App {
             input_mask: true,
             mgr_selected: 0,
             mgr_edit: None,
+            att_item_id: None,
+            att_list: Vec::new(),
+            att_selected: 0,
+            att_edit: None,
             quit: false,
         }
     }
@@ -249,6 +283,10 @@ impl App {
             input_mask: false,
             mgr_selected: 0,
             mgr_edit: None,
+            att_item_id: None,
+            att_list: Vec::new(),
+            att_selected: 0,
+            att_edit: None,
             quit: false,
         };
         app.reload()?;
@@ -388,6 +426,7 @@ impl App {
             Mode::ConfirmDelete => self.handle_confirm_delete(key),
             Mode::CategoryMgr => self.handle_category_mgr(key),
             Mode::TagMgr => self.handle_tag_mgr(key),
+            Mode::Attachments => self.handle_attachments(key),
         }
     }
 
@@ -516,6 +555,9 @@ impl App {
             }
             KeyCode::Char('t') => {
                 self.enter_mgr(MgrEntity::Tag);
+            }
+            KeyCode::Char('a') => {
+                self.enter_attachments();
             }
             KeyCode::Char('q') => {
                 self.quit = true;
@@ -896,6 +938,268 @@ impl App {
             .find(|t| &t.name == name)
             .map(|t| t.id)
             .ok_or_else(|| Error::Other("tag: not found".into()))
+    }
+
+    // -----------------------------------------------------------------------
+    // 附件管理(Attachments)
+    // -----------------------------------------------------------------------
+
+    /// 进入附件管理:锁定当前选中 item,刷新附件元数据列表。
+    fn enter_attachments(&mut self) {
+        let Some(item) = self.selected_item() else {
+            self.message = Some("no item selected".into());
+            return;
+        };
+        let id = match item.id {
+            Some(id) => id,
+            None => {
+                self.message = Some("no item id".into());
+                return;
+            }
+        };
+        self.att_item_id = Some(id);
+        self.att_selected = 0;
+        self.att_edit = None;
+        self.input.clear();
+        self.mode = Mode::Attachments;
+        if let Err(e) = self.reload_att() {
+            self.message = Some(format!("load attachments failed: {e}"));
+            return;
+        }
+        self.message = Some("a:add  e:export  x:del  Esc:back".into());
+    }
+
+    /// 刷新 `att_list`(不含 blob);夹紧 `att_selected`。
+    fn reload_att(&mut self) -> Result<()> {
+        let item_id = match self.att_item_id {
+            Some(id) => id,
+            None => {
+                self.att_list.clear();
+                self.att_selected = 0;
+                return Ok(());
+            }
+        };
+        let Some(ref db) = self.db else {
+            self.att_list.clear();
+            return Ok(());
+        };
+        let conn = db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, filename, mime_type, size FROM attachments
+             WHERE item_id = ?1 ORDER BY id ASC",
+        )?;
+        let list: Vec<AttMeta> = stmt
+            .query_map(rusqlite::params![item_id], |r| {
+                Ok(AttMeta {
+                    id: r.get::<_, i64>(0)?,
+                    filename: r.get::<_, String>(1)?,
+                    mime_type: r.get::<_, Option<String>>(2)?,
+                    size: r.get::<_, i64>(3)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        self.att_list = list;
+        if self.att_selected >= self.att_list.len() {
+            self.att_selected = self.att_list.len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    /// Attachments 模式键分发:编辑态 / 浏览态。
+    fn handle_attachments(&mut self, key: KeyEvent) -> Result<Action> {
+        match self.att_edit {
+            Some(_) => self.handle_att_edit(key),
+            None => self.handle_att_browse(key),
+        }
+    }
+
+    /// 浏览态:移动 / add / export / delete / 返回。
+    fn handle_att_browse(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.att_list.is_empty() && self.att_selected + 1 < self.att_list.len() {
+                    self.att_selected += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.att_selected > 0 {
+                    self.att_selected -= 1;
+                }
+            }
+            KeyCode::Char('a') => {
+                self.att_edit = Some(AttEdit::Add);
+                self.input.clear();
+                self.message = Some("add: type file path, Enter to confirm".into());
+            }
+            KeyCode::Char('e') => {
+                if self.att_list.is_empty() {
+                    self.message = Some("nothing to export".into());
+                } else {
+                    self.att_edit = Some(AttEdit::Export);
+                    self.input.clear();
+                    self.message = Some("export: type output path, Enter to confirm".into());
+                }
+            }
+            KeyCode::Char('x') => {
+                self.att_delete()?;
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.input.clear();
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    /// 编辑态(add/export):字符 / 退格 / 提交 / 取消。
+    fn handle_att_edit(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(Action::Continue);
+                }
+                self.input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => {
+                let edit = self.att_edit;
+                match edit {
+                    Some(AttEdit::Add) => self.att_add()?,
+                    Some(AttEdit::Export) => self.att_export()?,
+                    None => {}
+                }
+            }
+            KeyCode::Esc => {
+                self.att_edit = None;
+                self.input.clear();
+                self.message = Some("a:add  e:export  x:del  Esc:back".into());
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    /// 新增附件:读文件 → insert → save → reload。
+    fn att_add(&mut self) -> Result<()> {
+        let path = self.input.clone();
+        let item_id = self
+            .att_item_id
+            .ok_or_else(|| Error::Other("attachments: no item id".into()))?;
+        let res = (|| -> Result<(String, i64)> {
+            let p = std::path::Path::new(&path);
+            let blob = std::fs::read(p).map_err(|e| {
+                Error::Other(format!("read {path:?} failed: {e}"))
+            })?;
+            let filename = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| path.clone());
+            let mime_type = crate::cli::guess_mime(p);
+            let size = blob.len() as i64;
+            let db = self
+                .db
+                .as_ref()
+                .ok_or_else(|| Error::Other("attachments: no database".into()))?;
+            let conn = db.conn();
+            let mut att = crate::model::Attachment {
+                id: None,
+                item_id,
+                filename: filename.clone(),
+                mime_type,
+                size: 0,
+                blob,
+            };
+            store::insert_attachment(conn, &mut att)?;
+            Ok((filename, size))
+        })();
+        match res {
+            Ok((name, size)) => {
+                self.save()?;
+                self.reload_att()?;
+                self.att_edit = None;
+                self.input.clear();
+                self.message = Some(format!("attached {name} ({size})"));
+            }
+            Err(e) => {
+                // 不退出编辑态,允许修正路径。
+                self.message = Some(format!("add failed: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 导出附件:get(校验归属) → 写文件。
+    fn att_export(&mut self) -> Result<()> {
+        let out_path = self.input.clone();
+        let item_id = self
+            .att_item_id
+            .ok_or_else(|| Error::Other("attachments: no item id".into()))?;
+        let Some(att) = self.att_list.get(self.att_selected).cloned() else {
+            self.message = Some("no attachment selected".into());
+            self.att_edit = None;
+            self.input.clear();
+            return Ok(());
+        };
+        let res = (|| -> Result<(String, i64)> {
+            let db = self
+                .db
+                .as_ref()
+                .ok_or_else(|| Error::Other("attachments: no database".into()))?;
+            let conn = db.conn();
+            let got = store::get_attachment(conn, att.id)?
+                .ok_or_else(|| Error::Other("export: attachment not found".into()))?;
+            if got.item_id != item_id {
+                return Err(Error::Other("export: attachment belongs to another item".into()));
+            }
+            std::fs::write(&out_path, &got.blob).map_err(|e| {
+                Error::Other(format!("write {out_path:?} failed: {e}"))
+            })?;
+            Ok((got.filename, got.size))
+        })();
+        match res {
+            Ok((name, size)) => {
+                self.message = Some(format!("wrote {name} ({size})"));
+                self.att_edit = None;
+                self.input.clear();
+            }
+            Err(e) => {
+                self.message = Some(format!("export failed: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 删除当前选中附件。
+    fn att_delete(&mut self) -> Result<()> {
+        let Some(att) = self.att_list.get(self.att_selected).cloned() else {
+            self.message = Some("no attachment selected".into());
+            return Ok(());
+        };
+        let name = att.filename.clone();
+        let res = (|| -> Result<()> {
+            let db = self
+                .db
+                .as_ref()
+                .ok_or_else(|| Error::Other("delete: no database".into()))?;
+            store::delete_attachment(db.conn(), att.id)?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                self.save()?;
+                self.reload_att()?;
+                self.message = Some(format!("deleted {name}"));
+            }
+            Err(e) => {
+                self.message = Some(format!("delete failed: {e}"));
+            }
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1695,6 +1999,245 @@ mod tests {
         assert_eq!(app.mgr_selected, 2);
         app.handle_key(key('k')).unwrap();
         assert_eq!(app.mgr_selected, 1);
+    }
+
+    // ---- 附件管理(Attachments)测试 ----
+
+    /// 构造一个含单个 item 的可保存 App,并返回 item id。
+    fn app_with_one_item(tag: &str) -> (App, std::path::PathBuf, i64) {
+        let (mut app, path) = app_with_path(tag);
+        let mut it = Item {
+            id: None,
+            item_type: ItemType::Password,
+            title: "att-host".into(),
+            category_id: None,
+            data: ItemData::Password {
+                username: "u".into(),
+                password: "p".into(),
+                url: String::new(),
+                totp_secret: String::new(),
+                notes: String::new(),
+            },
+            favorite: false,
+            tags: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let conn = app.db.as_ref().unwrap().conn();
+        store::insert_item(conn, &mut it).unwrap();
+        let id = it.id.unwrap();
+        app.reload().unwrap();
+        app.selected = 0;
+        (app, path, id)
+    }
+
+    #[test]
+    fn attachments_a_enters_mode_and_targets_selected() {
+        let (mut app, _p, id) = app_with_one_item("att_enter");
+        app.handle_key(key('a')).unwrap();
+        assert!(matches!(app.mode, Mode::Attachments));
+        assert_eq!(app.att_item_id, Some(id));
+        assert_eq!(app.att_selected, 0);
+        assert!(app.att_edit.is_none());
+        assert!(app.att_list.is_empty());
+    }
+
+    #[test]
+    fn attachments_a_without_item_errors() {
+        let (mut app, path, _id) = app_with_one_item("att_noitem");
+        // 删除 item 使 selected_item() 为 None。
+        {
+            let conn = app.db.as_ref().unwrap().conn();
+            store::delete_item(conn, app.items[0].id.unwrap()).unwrap();
+        }
+        app.reload().unwrap();
+        app.handle_key(key('a')).unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.message.as_deref().unwrap_or("").contains("no item"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn attachments_add_inserts_and_lists() {
+        let (mut app, path, _id) = app_with_one_item("att_add");
+
+        // 准备一个临时源文件。
+        let src = std::env::temp_dir().join(format!(
+            "zkv_att_src_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&src, b"hello-bytes").unwrap();
+
+        // a 进模式 -> a 进 add 输入 -> 输入路径 -> Enter。
+        app.handle_key(key('a')).unwrap();
+        app.handle_key(key('a')).unwrap();
+        assert_eq!(app.att_edit, Some(AttEdit::Add));
+        for c in src.to_string_lossy().chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.att_edit, None);
+        assert!(app.input.is_empty());
+        assert_eq!(app.att_list.len(), 1);
+        let fname = src.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(app.att_list[0].filename, fname);
+        assert_eq!(app.att_list[0].size, 11);
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("attached"),
+            "got {:?}",
+            app.message
+        );
+
+        // 落盘后仍可查到。
+        let db2 = crate::vault::unlock(&path, "pw").unwrap();
+        let cnt: i64 = db2
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM attachments",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1);
+
+        let _ = std::fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn attachments_export_roundtrips_blob() {
+        let (mut app, path, _id) = app_with_one_item("att_export");
+
+        let blob = b"binary-payload-123".to_vec();
+        let src = std::env::temp_dir().join(format!(
+            "zkv_att_src2_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&src, &blob).unwrap();
+
+        // add
+        app.handle_key(key('a')).unwrap();
+        app.handle_key(key('a')).unwrap();
+        for c in src.to_string_lossy().chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert_eq!(app.att_list.len(), 1);
+
+        // export
+        let out = std::env::temp_dir().join(format!(
+            "zkv_att_out_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        app.handle_key(key('e')).unwrap();
+        assert_eq!(app.att_edit, Some(AttEdit::Export));
+        for c in out.to_string_lossy().chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.att_edit, None);
+        assert!(app.message.as_deref().unwrap_or("").contains("wrote"));
+        let read_back = std::fs::read(&out).unwrap();
+        assert_eq!(read_back, blob);
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&out);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn attachments_delete_empties_list() {
+        let (mut app, path, _id) = app_with_one_item("att_del");
+        let src = std::env::temp_dir().join(format!(
+            "zkv_att_del_{}_{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&src, b"x").unwrap();
+
+        app.handle_key(key('a')).unwrap();
+        app.handle_key(key('a')).unwrap();
+        for c in src.to_string_lossy().chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert_eq!(app.att_list.len(), 1);
+
+        // x 删除当前选中。
+        app.handle_key(key('x')).unwrap();
+        assert!(app.att_list.is_empty());
+        assert!(app.message.as_deref().unwrap_or("").contains("deleted"));
+
+        let _ = std::fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn attachments_add_esc_cancels() {
+        let (mut app, path, _id) = app_with_one_item("att_esc");
+        app.handle_key(key('a')).unwrap();
+        app.handle_key(key('a')).unwrap();
+        for c in "nope.txt".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Esc)).unwrap();
+        assert_eq!(app.att_edit, None);
+        assert!(app.input.is_empty());
+        assert!(app.att_list.is_empty(), "取消不应提交");
+        assert!(matches!(app.mode, Mode::Attachments));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn attachments_jk_moves_selection() {
+        let (mut app, path, _id) = app_with_one_item("att_jk");
+        // 直接插两条附件。
+        {
+            let conn = app.db.as_ref().unwrap().conn();
+            for i in 0..2 {
+                let mut a = crate::model::Attachment {
+                    id: None,
+                    item_id: app.att_item_id.unwrap_or_else(|| {
+                        app.items[0].id.unwrap()
+                    }),
+                    filename: format!("f{i}.bin"),
+                    mime_type: None,
+                    size: 0,
+                    blob: vec![i],
+                };
+                store::insert_attachment(conn, &mut a).unwrap();
+            }
+        }
+        app.handle_key(key('a')).unwrap();
+        assert_eq!(app.att_list.len(), 2);
+        assert_eq!(app.att_selected, 0);
+        app.handle_key(key('j')).unwrap();
+        assert_eq!(app.att_selected, 1);
+        app.handle_key(key('j')).unwrap();
+        assert_eq!(app.att_selected, 1);
+        app.handle_key(key('k')).unwrap();
+        assert_eq!(app.att_selected, 0);
+        cleanup(&path);
     }
 
     // ---- 测试辅助:临时文件 ----

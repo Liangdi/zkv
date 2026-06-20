@@ -132,6 +132,7 @@ fn draw(frame: &mut Frame, app: &App) {
         Mode::ConfirmDelete => draw_confirm_delete(frame, app),
         Mode::CategoryMgr => draw_category_mgr(frame, app),
         Mode::TagMgr => draw_tag_mgr(frame, app),
+        Mode::Attachments => draw_attachments(frame, app),
         _ => {}
     }
 }
@@ -230,6 +231,86 @@ fn draw_tag_mgr(frame: &mut Frame, app: &App) {
         "a:add  r:rename  x:del  Esc:back",
         "(none, press a to add)",
     );
+}
+
+/// 附件管理面板:列出元数据(不含 blob),编辑态显示路径输入框。
+fn draw_attachments(frame: &mut Frame, app: &App) {
+    // 标题:Attachments · <item title>(尽量取锁定的 item 标题,否则 id)。
+    let title = app
+        .items
+        .iter()
+        .find(|i| i.id == app.att_item_id)
+        .map(|i| i.title.clone())
+        .or_else(|| app.att_item_id.map(|id| format!("#{}", id)))
+        .unwrap_or_default();
+    let panel_title = format!("Attachments · {}", title);
+
+    let area = centered_rect(64, 60, frame.area());
+    frame.render_widget(Clear, area);
+    let editing = app.att_edit.is_some();
+    let inner = theme::panel_frame(frame, area, Some(&panel_title));
+
+    let constraints = if editing {
+        vec![
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![Constraint::Min(1), Constraint::Length(1)]
+    };
+    let chunks = Layout::vertical(constraints).split(inner);
+    let list_area = chunks[0];
+
+    if editing {
+        let field = input::InputField {
+            value: app.input.clone(),
+            mask: false,
+        };
+        let label = match app.att_edit {
+            Some(crate::app::AttEdit::Add) => " path: ",
+            Some(crate::app::AttEdit::Export) => " out: ",
+            None => " ",
+        };
+        input::render_input(frame, chunks[1], &field, label);
+    }
+
+    if app.att_list.is_empty() {
+        let empty = ratatui::widgets::Paragraph::new("(no attachments, press a to add)")
+            .style(theme::muted());
+        frame.render_widget(empty, list_area);
+    } else {
+        let items: Vec<ratatui::widgets::ListItem> = app
+            .att_list
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let style = if i == app.att_selected {
+                    theme::selected_bar()
+                } else {
+                    theme::fg()
+                };
+                let mark = if i == app.att_selected { "▸ " } else { "  " };
+                let mime = a.mime_type.clone().unwrap_or_else(|| "-".into());
+                let text = format!("{:<5} {:<24} {:<22} {}", a.id, a.filename, mime, a.size);
+                ratatui::widgets::ListItem::new(ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw(mark),
+                    ratatui::text::Span::styled(text, style),
+                ]))
+            })
+            .collect();
+        let list = ratatui::widgets::List::new(items);
+        frame.render_widget(list, list_area);
+    }
+
+    let hint = if editing {
+        "Enter:confirm  Esc:cancel"
+    } else {
+        "a:add  e:export  x:del  Esc:back"
+    };
+    let hint_idx = if editing { 2 } else { 1 };
+    let hint_p = ratatui::widgets::Paragraph::new(hint).style(theme::muted());
+    frame.render_widget(hint_p, chunks[hint_idx]);
 }
 
 /// 管理面板通用渲染:列表 + (编辑态)输入框 + 提示行。

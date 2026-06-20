@@ -901,7 +901,7 @@ pub fn run_tag_mv(u: &Unlocked, from: &str, to: &str) -> Result<()> {
 /// 按扩展名做轻量 MIME 推断。未知扩展名返回 `None`,由调用方决定是否给默认值。
 ///
 /// 覆盖常见办公/图片/文本格式;不引入 mime_guess crate,保持依赖最小。
-fn guess_mime(path: &Path) -> Option<String> {
+pub fn guess_mime(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     let mime = match ext.as_str() {
         "pdf" => "application/pdf",

@@ -34,9 +34,69 @@ pub fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let lines = view_lines(item);
+    let mut lines = view_lines(item);
+
+    // 附件区:在字段末尾追加(只读视图)。仅渲染元数据,不读 blob。
+    let item_id = item.id;
+    if let Some(id) = item_id {
+        let mut att_lines = attachment_lines(app, id, matches!(app.mode, crate::app::Mode::Normal));
+        lines.append(&mut att_lines);
+    }
+
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(p, inner);
+}
+
+/// 渲染附件清单行(不含 blob)。
+///
+/// 有附件:逐行 `📎 <filename> (<size>)`;无附件:`📎 (none)`。
+/// `in_normal` 为真时末尾追加弱化提示 `press a to manage`。
+fn attachment_lines(app: &App, item_id: i64, in_normal: bool) -> Vec<ratatui::text::Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(blank());
+    let metas = attachment_summary(app, item_id);
+    if metas.is_empty() {
+        lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled("📎 ", theme::accent2()),
+            ratatui::text::Span::styled("(none)", theme::muted()),
+        ]));
+    } else {
+        for (name, size) in metas {
+            lines.push(ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled("📎 ", theme::accent2()),
+                ratatui::text::Span::styled(name, theme::fg()),
+                ratatui::text::Span::styled(format!(" ({})", size), theme::muted()),
+            ]));
+        }
+    }
+    if in_normal {
+        lines.push(
+            ratatui::text::Line::from("press a to manage").style(theme::muted()),
+        );
+    }
+    lines
+}
+
+/// 查某 item 的附件元数据(不含 blob),返回 (filename, size) 列表。
+fn attachment_summary(app: &App, item_id: i64) -> Vec<(String, i64)> {
+    let Some(db) = app.db.as_ref() else {
+        return Vec::new();
+    };
+    let conn = db.conn();
+    let mut stmt = match conn.prepare(
+        "SELECT filename, size FROM attachments WHERE item_id = ?1 ORDER BY id ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt
+        .query_map([item_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        });
+    match rows {
+        Ok(it) => it.filter_map(|r| r.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// 只读视图的字段行。
