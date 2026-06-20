@@ -171,7 +171,7 @@ cargo build --release  # release build
 - [x] TOTP codes + headless CLI + idle auto-lock
 - [ ] Custom field templates
 - [ ] KeePass import / export
-- [ ] Per-page encryption for very large vaults
+- [ ] Per-page encryption for very large vaults (on demand: ~50–200ms per save under 100MB today; see [PROGRESS.md](docs/PROGRESS.md) 2026-06-21 decision)
 - [ ] Windows clipboard backend
 
 ## 📜 License
