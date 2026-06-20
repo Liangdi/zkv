@@ -114,6 +114,15 @@ impl Database {
                 blob       BLOB NOT NULL,
                 created_at INTEGER NOT NULL
             );
+
+            -- 字段模板(A1):承载内置/自定义模板。fields 为 FieldSpec 数组的 JSON。
+            CREATE TABLE IF NOT EXISTS templates (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                fields     TEXT NOT NULL,
+                built_in  INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
             "#,
         )?;
 
@@ -146,6 +155,92 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    /// 把历史形状(`items.data` 为 `ItemData` tagged JSON)迁移为新形状
+    /// (`items.data` 为 `Vec<Field>` JSON 数组),并重算 `search_text`。
+    ///
+    /// **A1 阶段:此方法不在 live 打开路径(`open_in_memory`/`from_bytes`)中调用**,
+    /// 仅由单测驱动。B 阶段才会接入。这样保证 A1 零行为变更、零回归。
+    ///
+    /// 幂等性:用 `PRAGMA user_version` 作迁移水位。`>= 1` 视为已迁移,立即返回。
+    ///
+    /// 实现要点:
+    /// - `Database.conn` 是 `Connection`(非 `&mut`),无法直接调用 `conn.transaction()`
+    ///   (需 `&mut`)。因此用 `BEGIN IMMEDIATE; ... UPDATE ...; COMMIT;` 的 `execute_batch`
+    ///   语义在同一连接上模拟事务:逐条 `execute` 在 `BEGIN`/`COMMIT` 之间执行,任一语句出错
+    ///   时整体回滚(错误向上传播,不执行 `COMMIT`/不升 user_version)。
+    /// - `PRAGMA user_version = 1` 必须在事务 `COMMIT` **之后**执行:pragma 不随事务回滚,
+    ///   若中途出错则版本不升,可重试。
+    /// - 对每行 `data`:先试新形状(`Vec<Field>`),再试 legacy(`LegacyItemData`),
+    ///   两者都失败的「损坏」行跳过更新(不中断整体迁移)。
+    pub fn migrate_data(&self) -> Result<()> {
+        let c = &self.conn;
+
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v >= 1 {
+            return Ok(());
+        }
+
+        // 收集所有 items 的 (id, type, data)——在开启事务前读取,避免长事务持有读锁。
+        let mut stmt = c.prepare("SELECT id, type, data FROM items")?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        // 开启事务。BEGIN IMMEDIATE 立即获取保留锁,语义同 transaction()。
+        c.execute_batch("BEGIN IMMEDIATE")?;
+
+        // 任一 UPDATE 出错时:回滚并把错误向上传播,不执行 COMMIT、不升 user_version。
+        let tx_result: Result<()> = (|| {
+            for (id, ty, data) in &rows {
+                // 先试新形状。
+                if let Ok(fields) = serde_json::from_str::<Vec<crate::model::Field>>(data) {
+                    let new_json = serde_json::to_string(&fields)?;
+                    let st = crate::model::fields_search_text(&fields);
+                    c.execute(
+                        "UPDATE items SET type=?1, data=?2, search_text=?3 WHERE id=?4",
+                        rusqlite::params![ty, new_json, st, id],
+                    )?;
+                    continue;
+                }
+                // 再试 legacy。
+                if let Ok(legacy) = serde_json::from_str::<crate::model::LegacyItemData>(data) {
+                    let (tpl, fields) = crate::model::legacy_to_fields(legacy);
+                    let new_json = serde_json::to_string(&fields)?;
+                    let st = crate::model::fields_search_text(&fields);
+                    c.execute(
+                        "UPDATE items SET type=?1, data=?2, search_text=?3 WHERE id=?4",
+                        rusqlite::params![tpl, new_json, st, id],
+                    )?;
+                    continue;
+                }
+                // 损坏:跳过(不更新该行,不中断)。
+            }
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => {
+                c.execute_batch("COMMIT")?;
+                // 升水位:必须在 COMMIT 之后(pragma 不随事务回滚)。
+                c.execute_batch("PRAGMA user_version = 1")?;
+                Ok(())
+            }
+            Err(e) => {
+                // 尽力回滚;回滚失败不掩盖原错误。
+                let _ = c.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// 把整个数据库导出为字节(`VACUUM INTO` 到临时文件 → 读回 → 删临时文件)。
@@ -382,5 +477,202 @@ mod tests {
             .next()
             .is_some();
         assert!(fts_hit, "round-trip 后 FTS5 仍应命中");
+    }
+
+    // -----------------------------------------------------------------------
+    // 字段模板迁移(A1)
+    // -----------------------------------------------------------------------
+
+    /// 辅助:读某行的 (type, data, search_text)。
+    fn read_item_row(conn: &Connection, id: i64) -> (String, String, String) {
+        conn.query_row(
+            "SELECT type, data, search_text FROM items WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn migrate_data_converts_three_variants_and_corrupt() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        // 起始 user_version == 0(建表未设版本)。
+        assert_eq!(user_version(conn), 0);
+
+        // 直接 SQL 插入旧形状行(绕过 store,模拟历史数据)。
+        conn.execute(
+            "INSERT INTO items(type,title,data,search_text,created_at,updated_at)
+             VALUES ('password','t','{\"type\":\"password\",\"username\":\"u\",\"password\":\"s3cret\",\"url\":\"x\",\"totp_secret\":\"T\",\"notes\":\"n\"}','old',1,1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO items(type,title,data,search_text,created_at,updated_at)
+             VALUES ('note','n','{\"type\":\"note\",\"format\":\"text\",\"content\":\"body\"}','old',1,1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO items(type,title,data,search_text,created_at,updated_at)
+             VALUES ('card','c','{\"type\":\"card\",\"holder\":\"h\",\"number\":\"4111\",\"expiry\":\"01/30\",\"cvv\":\"9\",\"bank\":\"b\",\"notes\":\"cn\"}','old',1,1)",
+            [],
+        ).unwrap();
+        // 损坏行
+        conn.execute(
+            "INSERT INTO items(type,title,data,search_text,created_at,updated_at)
+             VALUES ('password','broken','not json','old',1,1)",
+            [],
+        ).unwrap();
+
+        // 迁移
+        db.migrate_data().unwrap();
+
+        // 水位升至 1
+        assert_eq!(user_version(conn), 1);
+
+        let pw_id: i64 = conn
+            .query_row("SELECT id FROM items WHERE title='t'", [], |r| r.get(0))
+            .unwrap();
+        let (ty, data, st) = read_item_row(conn, pw_id);
+        assert_eq!(ty, "password");
+        // data 现在是 Vec<Field> JSON 数组
+        let fields: Vec<crate::model::Field> = serde_json::from_str(&data).unwrap();
+        assert_eq!(fields.len(), 5);
+        // search_text 含 username/url/notes,不含 password(Secret)/totp(Totp)
+        assert!(st.contains("u"));
+        assert!(st.contains("x"));
+        assert!(st.contains("n"));
+        assert!(!st.contains("s3cret"), "Secret 不应进入 search_text");
+
+        let note_id: i64 = conn
+            .query_row("SELECT id FROM items WHERE title='n'", [], |r| r.get(0))
+            .unwrap();
+        let (_, nd, nst) = read_item_row(conn, note_id);
+        let nf: Vec<crate::model::Field> = serde_json::from_str(&nd).unwrap();
+        assert_eq!(nf.len(), 2);
+        assert!(nst.contains("body"));
+
+        let card_id: i64 = conn
+            .query_row("SELECT id FROM items WHERE title='c'", [], |r| r.get(0))
+            .unwrap();
+        let (_, cd, cst) = read_item_row(conn, card_id);
+        let cf: Vec<crate::model::Field> = serde_json::from_str(&cd).unwrap();
+        assert_eq!(cf.len(), 6);
+        // number 是 Secret,不入 search_text
+        assert!(cst.contains("h"));
+        assert!(!cst.contains("4111"));
+
+        // 损坏行:迁移完成(version 1),其 data 未被改写(仍为 'not json')。
+        let broken_id: i64 = conn
+            .query_row("SELECT id FROM items WHERE title='broken'", [], |r| r.get(0))
+            .unwrap();
+        let (bt, bd, bst) = read_item_row(conn, broken_id);
+        assert_eq!(bt, "password");
+        assert_eq!(bd, "not json", "损坏行 data 应保持不变");
+        assert_eq!(bst, "old", "损坏行 search_text 应保持不变");
+    }
+
+    #[test]
+    fn migrate_data_is_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        conn.execute(
+            "INSERT INTO items(type,title,data,search_text,created_at,updated_at)
+             VALUES ('password','t','{\"type\":\"password\",\"username\":\"u\",\"password\":\"s\",\"url\":\"\",\"totp_secret\":\"\",\"notes\":\"n\"}','old',1,1)",
+            [],
+        ).unwrap();
+
+        db.migrate_data().unwrap();
+        assert_eq!(user_version(conn), 1);
+
+        // 捕获迁移后状态
+        let pw_id: i64 = conn
+            .query_row("SELECT id FROM items WHERE title='t'", [], |r| r.get(0))
+            .unwrap();
+        let (_, data_before, st_before) = read_item_row(conn, pw_id);
+
+        // 再次调用:user_version >= 1 → 立即返回 Ok,数据不变。
+        db.migrate_data().unwrap();
+        assert_eq!(user_version(conn), 1);
+        let (_, data_after, st_after) = read_item_row(conn, pw_id);
+        assert_eq!(data_before, data_after);
+        assert_eq!(st_before, st_after);
+    }
+
+    #[test]
+    fn migrate_data_handles_mixed_new_and_legacy_shapes() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        // 已是新形状(Vec<Field>)的行:migrate_data 应识别并保留(可重新规范化 search_text)。
+        let new_shape = serde_json::to_string(&vec![
+            crate::model::Field {
+                name: "ssid".into(),
+                value: "HomeNet".into(),
+                kind: crate::model::FieldKind::Text,
+                protected: false,
+            },
+            crate::model::Field {
+                name: "password".into(),
+                value: "wifipass".into(),
+                kind: crate::model::FieldKind::Secret,
+                protected: true,
+            },
+        ])
+        .unwrap();
+        conn.execute(
+            "INSERT INTO items(type,title,data,search_text,created_at,updated_at)
+             VALUES ('wifi','w',?1,'old',1,1)",
+            rusqlite::params![new_shape],
+        )
+        .unwrap();
+
+        db.migrate_data().unwrap();
+        assert_eq!(user_version(conn), 1);
+
+        let w_id: i64 = conn
+            .query_row("SELECT id FROM items WHERE title='w'", [], |r| r.get(0))
+            .unwrap();
+        let (ty, data, st) = read_item_row(conn, w_id);
+        assert_eq!(ty, "wifi");
+        let fields: Vec<crate::model::Field> = serde_json::from_str(&data).unwrap();
+        assert_eq!(fields.len(), 2);
+        // search_text 含 ssid(Text),不含 Secret
+        assert!(st.contains("HomeNet"));
+        assert!(!st.contains("wifipass"));
+    }
+
+    #[test]
+    fn migrate_data_noop_on_fresh_empty_db() {
+        let db = Database::open_in_memory().unwrap();
+        // 空库也能迁移:user_version 0 → 1,无 items 不报错。
+        db.migrate_data().unwrap();
+        assert_eq!(user_version(db.conn()), 1);
+    }
+
+    #[test]
+    fn templates_table_exists_after_migrate() {
+        let db = Database::open_in_memory().unwrap();
+        let names: Vec<String> = db
+            .conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='templates'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(names, vec!["templates".to_string()]);
     }
 }
