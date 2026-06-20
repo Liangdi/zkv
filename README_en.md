@@ -172,7 +172,7 @@ cargo build --release  # release build
 - [ ] Custom field templates
 - [ ] KeePass import / export
 - [ ] Per-page encryption for very large vaults (on demand: ~50–200ms per save under 100MB today; see [PROGRESS.md](docs/PROGRESS.md) 2026-06-21 decision)
-- [ ] Windows clipboard backend
+- [x] Windows clipboard backend (PowerShell `Set-Clipboard`, via stdin, UTF-8)
 
 ## 📜 License
 

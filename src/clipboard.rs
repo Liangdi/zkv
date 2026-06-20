@@ -9,6 +9,7 @@
 //! - macOS:`pbcopy`
 //! - Wayland:`wl-copy`
 //! - X11:`xclip -selection clipboard` 或 `xsel -bi`
+//! - Windows:`powershell.exe -NoProfile -Command "...|Set-Clipboard"`(经 stdin 读入,秘密不进 argv;空串即清空)
 //!
 //! 复制 = 把文本经 stdin 喂给命令;清空 = 把空串喂给同一通道。失败返回 [`Error::Other`]。
 //!
@@ -70,7 +71,18 @@ fn detect_backend_impl() -> Backend {
 
     #[cfg(target_os = "windows")]
     {
-        // Windows 无标准剪贴板 CLI,系统命令方案不可靠。返回 None,调用方得到 Err。
+        // Windows:用 PowerShell。文本经 stdin 喂入(秘密不进 argv/进程命令行),
+        // 先把输入编码设为 UTF-8 再 ReadToEnd,Set-Clipboard 精确写入(无 clip.exe 的 CRLF 尾巴);
+        // 空串 → 清空。PS_CMD 为 const,闭包内引用不构成捕获,仍可提升为 'static。
+        const PS_CMD: &[&str] = &[
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            "[Console]::InputEncoding=[Text.Encoding]::UTF8;Set-Clipboard([Console]::In.ReadToEnd())",
+        ];
+        if probe(|t| run_pipe(PS_CMD, t)).is_ok() {
+            return Some(&|t: &str| run_pipe(PS_CMD, t));
+        }
     }
 
     None

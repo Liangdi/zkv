@@ -109,7 +109,7 @@ src/
 - 分类/标签管理:无头 CLI(`cat`/`tag` 增删改查)与 **TUI**(`c`/`t` 管理面板,增删改)均已全功能。
 - 自定义数据结构(字段模板)未做;`data` 已是 JSON,扩展天然兼容。
 - 大库 per-page 加密(**暂不实现**,见 2026-06-21 决策):当前整库模型在个人库规模(<100MB)每次保存约 50–200ms,收益微小;真·增量保存需放弃 `:memory:`+dump 改 file-backed 加密 VFS(SQLite `:memory:` 不暴露 dirty-page API),保 XChaCha20+Argon2id 须自建 VFS(数周、丢数据风险高),易行方案(SQLCipher)会换 AES+PBKDF2 与 PRD 冲突。**触发条件**(满足任一):库达数百 MB/GB、保存被实测感知卡顿、或出现能保留现有 crypto 的成熟低成本方案。
-- 跨平台:主开发 Linux;剪贴板后端已含 macOS/Wayland/X11 探测,Windows 暂无 CLI 后端。
+- 跨平台:主开发 Linux;剪贴板后端已含 macOS/Wayland/X11/Windows(Windows 走 PowerShell `Set-Clipboard`,经 stdin、UTF-8)探测。
 - 导入/导出:无头 CLI 已支持(JSON 无损 / CSV 仅 password);**无同步**(纯本地,符合当前定位)。
 
 ## 变更日志
@@ -154,3 +154,4 @@ src/
   - 已知边界:`ZKV_LOCK_SECS` 设得比解锁 Argon2 耗时(默认 KDF ~0.8s)还短时,解锁刚完成可能立即再锁(病态配置, sane 值不受影响)。
   - 验证:`cargo build` / `cargo clippy --all-targets` 0 warning;`cargo test` 176 passed;`just e2e` 6/6;PTY 驱动确认 `ZKV_LOCK_SECS=3` 闲置自动锁 + 原地重解锁成功。
 - **2026-06-21** 决策:**大库 per-page 加密暂不实现**(无代码改动)。代码梳理 + 生态调研结论:① 真·增量保存不可建于现有 `:memory:`+dump 模型(SQLite `:memory:` 不暴露 dirty-page API),须改 file-backed 加密 VFS、重写 vault/db 核心、改变「明文只在 `:memory:`」不变量;② 保 XChaCha20-Poly1305+Argon2id 须自建 VFS(FFI/WAL/nonce,数周、丢数据风险);③ 易行方案 SQLCipher 会换 AES-256-CBC+PBKDF2,与 PRD 冲突、增 OpenSSL 依赖;④ 收益与规模不匹配(个人库 <100MB 整库 dump+加密约 50–200ms,per-page 仅 >1GB 才显著)。**触发条件**(满足任一再考虑):库达数百 MB/GB、保存被实测感知卡顿、或出现能保留现有 crypto 的成熟低成本方案。`docs/PROGRESS.md` 已知限制与 `README` 路线图条目已同步为「按需/大库触发」。
+- **2026-06-21** Windows 剪贴板后端([clipboard.rs](../src/clipboard.rs)):`#[cfg(target_os="windows")]` 分支用 PowerShell —— `powershell.exe -NoProfile -Command "[Console]::InputEncoding=[Text.Encoding]::UTF8;Set-Clipboard([Console]::In.ReadToEnd())"`,文本经 **stdin** 喂入(秘密不进 argv/进程命令行),UTF-8 解码,精确写入(无 `clip.exe` 的 CRLF 尾巴),空串即清空。复用既有 `run_pipe`/`probe`,**零新依赖**,契合「系统命令后端」约定。验证:Linux `cargo build`/`clippy --all-targets` 0 warning、`cargo test` 176 passed;`cargo check --target x86_64-pc-windows-gnu` 通过(双平台编译级验证)。运行时行为待真机 Windows 验证(本机为 Linux)。

@@ -171,7 +171,7 @@ cargo build --release  # 发布构建
 - [ ] 自定义字段模板
 - [ ] KeePass 导入 / 导出
 - [ ] 大库 per-page 加密优化(按需:当前整库模型 <100MB 每次保存约 50–200ms,收益微小;详见 [PROGRESS.md](docs/PROGRESS.md) 2026-06-21 决策)
-- [ ] Windows 剪贴板后端
+- [x] Windows 剪贴板后端(PowerShell `Set-Clipboard`,经 stdin、UTF-8)
 
 ## 📜 许可证
 
