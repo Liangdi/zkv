@@ -320,6 +320,33 @@ impl App {
         }
     }
 
+    /// 复制选中条目的 TOTP 验证码到剪贴板,20s 后清空。
+    /// 非 password 类型 / 空 secret / totp 计算失败仅设 message,不传播错误。
+    fn copy_totp_of_selected(&mut self) {
+        let Some(item) = self.items.get(self.selected).cloned() else {
+            self.message = Some("no item selected".into());
+            return;
+        };
+        let secret = match &item.data {
+            ItemData::Password { totp_secret, .. } => totp_secret.clone(),
+            _ => {
+                self.message = Some("no totp secret".into());
+                return;
+            }
+        };
+        if secret.is_empty() {
+            self.message = Some("no totp secret".into());
+            return;
+        }
+        match crate::totp::current_totp(&secret) {
+            Ok(code) => match clipboard::copy_and_clear_after(&code, 20) {
+                Ok(()) => self.message = Some("totp copied (clears in 20s)".into()),
+                Err(e) => self.message = Some(format!("clipboard unavailable: {e}")),
+            },
+            Err(e) => self.message = Some(format!("totp failed: {e}")),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // handle_key 分发
     // -----------------------------------------------------------------------
@@ -451,6 +478,9 @@ impl App {
             }
             KeyCode::Char('y') => {
                 self.copy_password_of_selected();
+            }
+            KeyCode::Char('o') => {
+                self.copy_totp_of_selected();
             }
             KeyCode::Char('l') => {
                 self.lock();
@@ -996,6 +1026,22 @@ mod tests {
         app.handle_key(key('y')).unwrap();
         // 剪贴板可能无后端,message 被设置即可。
         assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn normal_o_handles_no_totp() {
+        // app_with_items 生成的 password 条目 totp_secret 为空 → 按 o 应
+        // 不 panic 且设置 message。
+        let mut app = app_with_items(1);
+        app.selected = 0;
+        app.handle_key(key('o')).unwrap();
+        assert!(app.message.is_some());
+        // 空 secret 应提示无 secret。
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("no totp secret"),
+            "expected no-totp hint, got {:?}",
+            app.message
+        );
     }
 
     #[test]

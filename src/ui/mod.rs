@@ -258,6 +258,7 @@ fn render_footer(frame: &mut Frame, area: Rect, _app: &App) {
         ("x", "del"),
         ("/", "search"),
         ("y", "copy"),
+        ("o", "otp"),
         ("l", "lock"),
         ("c", "cat"),
         ("t", "tag"),

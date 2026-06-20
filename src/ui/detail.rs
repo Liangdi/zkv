@@ -55,7 +55,7 @@ fn view_lines(item: &Item) -> Vec<ratatui::text::Line<'static>> {
             lines.push(field_view("Username", username));
             lines.push(password_view(password));
             lines.push(field_view("URL", url));
-            lines.push(secret_view("TOTP", totp_secret));
+            lines.push(totp_code_line(totp_secret));
             lines.push(blank());
             lines.push(field_view("Notes", notes));
         }
@@ -268,6 +268,51 @@ fn password_view(password: &str) -> ratatui::text::Line<'static> {
     ratatui::text::Line::from(spans)
 }
 
+/// 给定 totp_secret(可能为空/非法),返回详情页 TOTP 行的渲染文本与样式。
+///
+/// - 空 secret → `TOTP      : —`(弱化)。
+/// - 合法 secret → `TOTP      : <code>  (~Ns)`,code 用强调色,剩余秒用弱化色。
+/// - 非法 secret → `TOTP      : (invalid)`,错误色。
+///
+/// label `TOTP` 用次强调(accent2),与其它字段保持定宽 10 + `: ` 拼接风格。
+fn totp_code_line(totp_secret: &str) -> ratatui::text::Line<'static> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let label = ratatui::text::Span::styled(format!("{:<10}", "TOTP"), theme::accent2());
+    let sep = ratatui::text::Span::raw(": ");
+
+    // 空 secret:弱化破折号。
+    if totp_secret.is_empty() {
+        return ratatui::text::Line::from(vec![
+            label,
+            sep,
+            ratatui::text::Span::styled("—", theme::muted()),
+        ]);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match crate::totp::totp_at(totp_secret, now) {
+        Ok(code) => {
+            let remaining = 30 - (now % 30);
+            ratatui::text::Line::from(vec![
+                label,
+                sep,
+                ratatui::text::Span::styled(code, theme::accent()),
+                ratatui::text::Span::styled(format!("  (~{remaining}s)"), theme::muted()),
+            ])
+        }
+        Err(_) => ratatui::text::Line::from(vec![
+            label,
+            sep,
+            ratatui::text::Span::styled("(invalid)", theme::error()),
+        ]),
+    }
+}
+
 // ---- 小工具 ----
 
 fn mask(s: &str) -> String {
@@ -278,10 +323,59 @@ fn mask(s: &str) -> String {
     }
 }
 
+
 fn type_str(t: ItemType) -> &'static str {
     match t {
         ItemType::Password => "Password",
         ItemType::Note => "Note",
         ItemType::Card => "Card",
+    }
+}
+
+// ===========================================================================
+// 测试
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把一行的 spans 文本拼接成纯字符串,便于断言。
+    fn line_text(line: &ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn totp_code_line_valid_secret_has_six_digits() {
+        let line = totp_code_line("JBSWY3DPEHPK3PXP");
+        let text = line_text(&line);
+        assert!(text.contains("TOTP"), "line should contain TOTP label: {text}");
+        // 抽取 6 位数字码:在 ": " 之后、空格之前。
+        let code_part = text.split(": ").nth(1).unwrap_or("");
+        let code = code_part.split_whitespace().next().unwrap_or("");
+        assert_eq!(code.len(), 6, "code should be 6 digits: {text}");
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
+        // 剩余秒数提示存在。
+        assert!(text.contains("(~") && text.contains("s)"), "missing countdown: {text}");
+    }
+
+    #[test]
+    fn totp_code_line_empty_secret_shows_dash() {
+        let line = totp_code_line("");
+        let text = line_text(&line);
+        assert!(text.contains("—"), "empty secret should show dash: {text}");
+        // 不应出现数字码或 invalid。
+        assert!(!text.contains("invalid"));
+    }
+
+    #[test]
+    fn totp_code_line_invalid_secret_shows_invalid() {
+        let line = totp_code_line("!!!");
+        let text = line_text(&line);
+        assert!(text.contains("invalid"), "illegal secret should show invalid: {text}");
     }
 }
