@@ -373,6 +373,24 @@ pub fn ensure_tag(conn: &Connection, name: &str) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+/// 删除标签(id)。`item_tags` 由外键 `ON DELETE CASCADE` 自动清理。
+pub fn delete_tag(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM tags WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// 改标签名。标签不存在(affected == 0)时返回 [`Error::Other`]。
+pub fn update_tag(conn: &Connection, id: i64, new_name: &str) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE tags SET name = ?1 WHERE id = ?2",
+        params![new_name, id],
+    )?;
+    if affected == 0 {
+        return Err(Error::Other(format!("update_tag: tag {id} not found")));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 附件 CRUD
 // ---------------------------------------------------------------------------
@@ -666,6 +684,36 @@ mod tests {
 
         let tags = list_tags(conn).unwrap();
         assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn tag_delete_removes_row() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        let id = ensure_tag(conn, "vip").unwrap();
+        assert!(list_tags(conn).unwrap().iter().any(|t| t.id == id));
+
+        delete_tag(conn, id).unwrap();
+        let tags = list_tags(conn).unwrap();
+        assert!(tags.is_empty(), "tag should be removed");
+    }
+
+    #[test]
+    fn tag_update_renames() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        let id = ensure_tag(conn, "old").unwrap();
+        update_tag(conn, id, "new").unwrap();
+
+        let tags = list_tags(conn).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].id, id);
+        assert_eq!(tags[0].name, "new");
+
+        // 改不存在的 tag → 报错。
+        assert!(update_tag(conn, 99999, "x").is_err());
     }
 
     #[test]

@@ -60,6 +60,9 @@ enum Command {
         /// 全文检索串(命中标题与正文)。
         #[arg(short, long, value_name = "QUERY")]
         query: Option<String>,
+        /// 仅列出收藏项。
+        #[arg(short = 'F', long)]
+        favorite: bool,
         /// 以 JSON 输出。
         #[arg(long)]
         json: bool,
@@ -163,6 +166,9 @@ enum Command {
         /// 取消收藏。
         #[arg(long = "no-favorite")]
         no_favorite: bool,
+        /// 设置分类(按名称;不存在则报错)。
+        #[arg(long, value_name = "CATEGORY")]
+        cat: Option<String>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -176,6 +182,87 @@ enum Command {
         /// 跳过确认提示。
         #[arg(short = 'y', long)]
         yes: bool,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+    /// 分类管理。
+    Cat {
+        #[command(subcommand)]
+        action: CatCmd,
+    },
+    /// 标签管理。
+    Tag {
+        #[command(subcommand)]
+        action: TagCmd,
+    },
+}
+
+/// `cat` 子命令组(分类管理)。
+#[derive(Subcommand, Debug)]
+enum CatCmd {
+    /// 新增分类(`--parent` 指定父分类名,可选)。
+    Add {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 分类名。
+        name: String,
+        /// 父分类名(可选)。
+        #[arg(long, value_name = "PARENT")]
+        parent: Option<String>,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+    /// 删除分类(by id 或名)。子条目 category_id 置空。
+    Rm {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 分类 id(数字)或名称。
+        target: String,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+    /// 列出全部分类。
+    Ls {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+}
+
+/// `tag` 子命令组(标签管理)。
+#[derive(Subcommand, Debug)]
+enum TagCmd {
+    /// 列出全部标签。
+    Ls {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+    /// 删除标签(by 名)。
+    Rm {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 标签名。
+        name: String,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+    /// 改标签名。
+    Mv {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 原标签名。
+        from: String,
+        /// 新标签名。
+        to: String,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -236,6 +323,7 @@ fn run() -> color_eyre::Result<()> {
             tags,
             category,
             query,
+            favorite,
             json,
             passfile,
         } => {
@@ -245,8 +333,9 @@ fn run() -> color_eyre::Result<()> {
                 tags,
                 category,
                 query,
+                favorite_only: false,
             };
-            zkv::cli::run_ls(&u, &f, json)?;
+            zkv::cli::run_ls(&u, &f, favorite, json)?;
         }
         Command::Get {
             path,
@@ -304,6 +393,7 @@ fn run() -> color_eyre::Result<()> {
             tags,
             favorite,
             no_favorite,
+            cat,
             passfile,
         } => {
             // 两个独立 bool flag 合成 Option<bool>:--favorite → Some(true),
@@ -323,6 +413,7 @@ fn run() -> color_eyre::Result<()> {
                 data.as_deref(),
                 tags,
                 fav,
+                cat.as_deref(),
             )?;
         }
         Command::Rm {
@@ -333,6 +424,82 @@ fn run() -> color_eyre::Result<()> {
         } => {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             zkv::cli::run_rm(&u, id, yes)?;
+        }
+        // 嵌套子命令:先从 action 中取出 path + passfile → unlock → 交给 cli 层的
+        // run_cat/run_tag(已解锁的 &Unlocked + action 引用)。
+        Command::Cat { action } => {
+            let (path, passfile) = cat_path_passfile(&action);
+            let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            run_cat(&u, &action)?;
+        }
+        Command::Tag { action } => {
+            let (path, passfile) = tag_path_passfile(&action);
+            let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            run_tag(&u, &action)?;
+        }
+    }
+    Ok(())
+}
+
+/// 从 `CatCmd` 提取 (path, passfile)。
+fn cat_path_passfile(action: &CatCmd) -> (PathBuf, Option<PathBuf>) {
+    match action {
+        CatCmd::Add {
+            path, passfile, ..
+        }
+        | CatCmd::Rm {
+            path, passfile, ..
+        }
+        | CatCmd::Ls {
+            path, passfile, ..
+        } => (path.clone(), passfile.clone()),
+    }
+}
+
+/// 分发 `cat` 子命令(已解锁)。
+fn run_cat(u: &zkv::cli::Unlocked, action: &CatCmd) -> color_eyre::Result<()> {
+    match action {
+        CatCmd::Add {
+            name, parent, ..
+        } => {
+            zkv::cli::run_cat_add(u, name, parent.as_deref())?;
+        }
+        CatCmd::Rm { target, .. } => {
+            zkv::cli::run_cat_rm(u, target)?;
+        }
+        CatCmd::Ls { .. } => {
+            zkv::cli::run_cat_ls(u)?;
+        }
+    }
+    Ok(())
+}
+
+/// 从 `TagCmd` 提取 (path, passfile)。
+fn tag_path_passfile(action: &TagCmd) -> (PathBuf, Option<PathBuf>) {
+    match action {
+        TagCmd::Ls {
+            path, passfile, ..
+        }
+        | TagCmd::Rm {
+            path, passfile, ..
+        }
+        | TagCmd::Mv {
+            path, passfile, ..
+        } => (path.clone(), passfile.clone()),
+    }
+}
+
+/// 分发 `tag` 子命令(已解锁)。
+fn run_tag(u: &zkv::cli::Unlocked, action: &TagCmd) -> color_eyre::Result<()> {
+    match action {
+        TagCmd::Ls { .. } => {
+            zkv::cli::run_tag_ls(u)?;
+        }
+        TagCmd::Rm { name, .. } => {
+            zkv::cli::run_tag_rm(u, name)?;
+        }
+        TagCmd::Mv { from, to, .. } => {
+            zkv::cli::run_tag_mv(u, from, to)?;
         }
     }
     Ok(())

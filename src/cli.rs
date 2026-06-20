@@ -27,7 +27,7 @@ use crate::clipboard;
 use crate::crypto::{KdfParams, MasterKey};
 use crate::db::Database;
 use crate::error::{Error, Result};
-use crate::model::{Item, ItemData, ItemType};
+use crate::model::{Category, Item, ItemData, ItemType};
 use crate::search::{self, Filter};
 use crate::store;
 use crate::vault;
@@ -131,6 +131,8 @@ pub struct ListFilter {
     pub category: Option<String>,
     /// FTS5 全文检索串(`None` 表示不限)。
     pub query: Option<String>,
+    /// 仅列出收藏(`true` 时透传给 [`search::Filter::favorite_only`])。
+    pub favorite_only: bool,
 }
 
 /// 把 `ListFilter` + 已解析的 `category_id` 转成 [`search::Filter`]。
@@ -140,7 +142,7 @@ fn to_search_filter(list: &ListFilter, category_id: Option<i64>) -> Filter {
         category: category_id,
         tags: list.tags.clone(),
         item_type: list.item_type,
-        favorite_only: false,
+        favorite_only: list.favorite_only,
     }
 }
 
@@ -148,6 +150,12 @@ fn to_search_filter(list: &ListFilter, category_id: Option<i64>) -> Filter {
 fn category_id_by_name(conn: &rusqlite::Connection, name: &str) -> Result<Option<i64>> {
     let cats = store::list_categories(conn)?;
     Ok(cats.into_iter().find(|c| c.name == name).and_then(|c| c.id))
+}
+
+/// 根据标签名解析其 id;找不到返回 `None`(调用方可决定报错或空结果)。
+fn tag_id_by_name(conn: &rusqlite::Connection, name: &str) -> Result<Option<i64>> {
+    let tags = store::list_tags(conn)?;
+    Ok(tags.into_iter().find(|t| t.name == name).map(|t| t.id))
 }
 
 /// `ls`/`search` 公用:把条目列表格式化后写到 `out`。
@@ -272,7 +280,9 @@ pub fn run_add(
 
 /// `edit`:修改已存在条目的若干字段。每个参数为 `None` 表示「不改」。
 ///
-/// 至少要改一处(title/data/tags/favorite 之一);全 `None` 报错。
+/// 至少要改一处(title/data/tags/favorite/category 之一);全 `None` 报错。
+/// `category = Some("name")` 按分类名解析成 id 并设置(找不到报错);
+/// `category = None` 表示「不动」(本期不支持清除,清除需后续 `--clear-cat`)。
 /// 替换 data 时同步 `item_type`,保持与 data tag 一致。成功打印 `updated item <id>`。
 pub fn run_edit(
     u: &Unlocked,
@@ -281,8 +291,10 @@ pub fn run_edit(
     data_json: Option<&str>,
     tags: Option<Vec<String>>,
     favorite: Option<bool>,
+    category: Option<&str>,
 ) -> Result<()> {
-    let mut item = store::get_item(u.db.conn(), id)?
+    let conn = u.db.conn();
+    let mut item = store::get_item(conn, id)?
         .ok_or_else(|| Error::Other(format!("item {id} not found")))?;
 
     let mut changed = false;
@@ -304,11 +316,17 @@ pub fn run_edit(
         item.favorite = f;
         changed = true;
     }
+    if let Some(cat) = category {
+        let cid = category_id_by_name(conn, cat)?
+            .ok_or_else(|| Error::Other(format!("category '{cat}' not found")))?;
+        item.category_id = Some(cid);
+        changed = true;
+    }
     if !changed {
         return Err(Error::Other("edit: nothing to change".into()));
     }
 
-    store::update_item(u.db.conn(), &item)?;
+    store::update_item(conn, &item)?;
     u.save()?;
     println!("updated item {id}");
     Ok(())
@@ -350,11 +368,128 @@ pub fn run_rm(u: &Unlocked, id: i64, yes: bool) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// 分类/标签管理命令(cat/tag)
+// ---------------------------------------------------------------------------
+
+/// `cat add`:新增分类。`parent` 为父分类名(可选,找不到报错);成功打印
+/// `added category <id>: <name>`。
+pub fn run_cat_add(u: &Unlocked, name: &str, parent: Option<&str>) -> Result<i64> {
+    let conn = u.db.conn();
+    let parent_id = match parent {
+        Some(pn) => Some(
+            category_id_by_name(conn, pn)?
+                .ok_or_else(|| Error::Other(format!("parent category '{pn}' not found")))?,
+        ),
+        None => None,
+    };
+    let mut cat = Category {
+        id: None,
+        name: name.into(),
+        parent_id,
+        sort_order: 0,
+    };
+    let id = store::insert_category(conn, &mut cat)?;
+    u.save()?;
+    println!("added category {id}: {name}");
+    Ok(id)
+}
+
+/// `cat rm`:删除分类(by id 或名)。子条目 `category_id` 由外键 `ON DELETE SET NULL` 置空。
+/// 成功打印 `deleted category <id>`。
+pub fn run_cat_rm(u: &Unlocked, target: &str) -> Result<()> {
+    let conn = u.db.conn();
+    let id = resolve_category(conn, target)?;
+    store::delete_category(conn, id)?;
+    u.save()?;
+    println!("deleted category {id}");
+    Ok(())
+}
+
+/// `cat ls`:列出全部分类。每行 `id\tname\tparent\tparent`(`—` 表示无父)。
+pub fn run_cat_ls(u: &Unlocked) -> Result<()> {
+    let conn = u.db.conn();
+    let cats = store::list_categories(conn)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if cats.is_empty() {
+        writeln!(out, "(no categories)")?;
+        return Ok(());
+    }
+    // 构一个 id→name 映射,便于把 parent_id 渲染成父分类名。
+    let id_to_name: std::collections::HashMap<i64, String> = cats
+        .iter()
+        .filter_map(|c| c.id.map(|i| (i, c.name.clone())))
+        .collect();
+    for c in &cats {
+        let id = c.id.unwrap_or(-1);
+        let parent = c
+            .parent_id
+            .and_then(|pid| id_to_name.get(&pid).cloned())
+            .unwrap_or_else(|| "-".into());
+        writeln!(out, "{id}\t{}\t{parent}\t{}", c.name, c.sort_order)?;
+    }
+    Ok(())
+}
+
+/// 把 target(数字 id 或分类名)解析成分类 id。两者都失败报错。
+fn resolve_category(conn: &rusqlite::Connection, target: &str) -> Result<i64> {
+    // 优先按数字 id 解析。
+    if let Ok(n) = target.parse::<i64>() {
+        return Ok(n);
+    }
+    // 否则按名匹配。
+    category_id_by_name(conn, target)?
+        .ok_or_else(|| Error::Other(format!("category '{target}' not found")))
+}
+
+/// `tag ls`:列出全部标签。每行 `id\tname`。
+pub fn run_tag_ls(u: &Unlocked) -> Result<()> {
+    let conn = u.db.conn();
+    let tags = store::list_tags(conn)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if tags.is_empty() {
+        writeln!(out, "(no tags)")?;
+        return Ok(());
+    }
+    for t in tags {
+        writeln!(out, "{}\t{}", t.id, t.name)?;
+    }
+    Ok(())
+}
+
+/// `tag rm`:删除标签(by 名)。成功打印 `deleted tag <name>`。
+pub fn run_tag_rm(u: &Unlocked, name: &str) -> Result<()> {
+    let conn = u.db.conn();
+    let id = tag_id_by_name(conn, name)?
+        .ok_or_else(|| Error::Other(format!("tag '{name}' not found")))?;
+    store::delete_tag(conn, id)?;
+    u.save()?;
+    println!("deleted tag {name}");
+    Ok(())
+}
+
+/// `tag mv`:改标签名。成功打印 `renamed tag <from> -> <to>`。
+pub fn run_tag_mv(u: &Unlocked, from: &str, to: &str) -> Result<()> {
+    let conn = u.db.conn();
+    let id = tag_id_by_name(conn, from)?
+        .ok_or_else(|| Error::Other(format!("tag '{from}' not found")))?;
+    store::update_tag(conn, id, to)?;
+    u.save()?;
+    println!("renamed tag {from} -> {to}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 只读命令
 // ---------------------------------------------------------------------------
 
-/// `ls`:按过滤条件列出条目。
-pub fn run_ls(u: &Unlocked, f: &ListFilter, json: bool) -> Result<()> {
+/// `ls`:按过滤条件列出条目。`favorite = true` 时仅返回收藏项(透传到 `ListFilter`)。
+pub fn run_ls(u: &Unlocked, f: &ListFilter, favorite: bool, json: bool) -> Result<()> {
+    let mut f = f.clone();
+    if favorite {
+        f.favorite_only = true;
+    }
     let conn = u.db.conn();
     let category_id = match &f.category {
         Some(name) => Some(
@@ -363,7 +498,7 @@ pub fn run_ls(u: &Unlocked, f: &ListFilter, json: bool) -> Result<()> {
         ),
         None => None,
     };
-    let sf = to_search_filter(f, category_id);
+    let sf = to_search_filter(&f, category_id);
     let items = search::search(conn, &sf)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -745,13 +880,14 @@ mod tests {
             tags: vec!["a".into()],
             category: Some("Personal".into()),
             query: Some("q".into()),
+            favorite_only: true,
         };
         let sf = to_search_filter(&lf, Some(7));
         assert_eq!(sf.item_type, Some(ItemType::Password));
         assert_eq!(sf.tags, vec!["a".to_string()]);
         assert_eq!(sf.category, Some(7));
         assert_eq!(sf.query.as_deref(), Some("q"));
-        assert!(!sf.favorite_only);
+        assert!(sf.favorite_only);
     }
 
     // --- 端到端(只读命令返回 Ok/Err 路径) ---
@@ -762,8 +898,8 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         let f = ListFilter::default();
-        assert!(run_ls(&u, &f, false).is_ok());
-        assert!(run_ls(&u, &f, true).is_ok());
+        assert!(run_ls(&u, &f, false, false).is_ok());
+        assert!(run_ls(&u, &f, false, true).is_ok());
         cleanup(&p);
     }
 
@@ -800,7 +936,7 @@ mod tests {
             category: Some("Nonexistent".into()),
             ..Default::default()
         };
-        let err = run_ls(&u, &f, false);
+        let err = run_ls(&u, &f, false, false);
         assert!(matches!(err, Err(Error::Other(_))));
         cleanup(&p);
     }
@@ -1097,6 +1233,7 @@ mod tests {
             Some(new_data),
             Some(vec!["archive".into()]),
             Some(false),
+            None,
         )
         .unwrap();
 
@@ -1122,7 +1259,7 @@ mod tests {
         let p = make_vault("edit2");
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
-        run_edit(&u, 1, Some("JustTitle"), None, None, None).unwrap();
+        run_edit(&u, 1, Some("JustTitle"), None, None, None, None).unwrap();
         let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
         assert_eq!(got.title, "JustTitle");
         // data 未动,仍是 password。
@@ -1135,7 +1272,7 @@ mod tests {
         let p = make_vault("editnone");
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
-        let err = run_edit(&u, 1, None, None, None, None);
+        let err = run_edit(&u, 1, None, None, None, None, None);
         assert!(matches!(err, Err(Error::Other(_))));
     }
 
@@ -1144,7 +1281,7 @@ mod tests {
         let p = make_vault("editmissing");
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
-        let err = run_edit(&u, 9999, Some("x"), None, None, None);
+        let err = run_edit(&u, 9999, Some("x"), None, None, None, None);
         assert!(matches!(err, Err(Error::Other(_))));
     }
 
@@ -1175,6 +1312,138 @@ mod tests {
         // yes=true 仍要先确认 item 存在 → 报错。
         let err = run_rm(&u, 9999, true);
         assert!(matches!(err, Err(Error::Other(_))));
+        cleanup(&p);
+    }
+
+    // --- 分类/标签管理(cat/tag)+ edit --cat + ls -F ---
+
+    #[test]
+    fn run_cat_add_ls_rm_roundtrip() {
+        let p = make_vault("cat");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+
+        // add 一个顶层分类。
+        let cid = run_cat_add(&u, "Personal", None).unwrap();
+        assert!(cid > 0);
+        // add 一个带父分类的子分类。
+        let sub = run_cat_add(&u, "Banking", Some("Personal")).unwrap();
+        assert!(sub > 0);
+
+        // ls 不报错且能看到两个分类(直接查 store 验证,避免依赖 stdout 捕获)。
+        assert!(run_cat_ls(&u).is_ok());
+        let cats = store::list_categories(u.db.conn()).unwrap();
+        assert_eq!(cats.len(), 2);
+        assert!(cats.iter().any(|c| c.name == "Personal"));
+        assert!(cats.iter().any(|c| c.name == "Banking" && c.parent_id == Some(cid)));
+
+        // rm by 名。
+        run_cat_rm(&u, "Banking").unwrap();
+        assert_eq!(store::list_categories(u.db.conn()).unwrap().len(), 1);
+        // rm by id。
+        run_cat_rm(&u, &cid.to_string()).unwrap();
+        assert!(store::list_categories(u.db.conn()).unwrap().is_empty());
+
+        // rm 不存在的分类 → 报错。
+        assert!(run_cat_rm(&u, "Nope").is_err());
+
+        // 落盘读回:分类确实删除持久化。
+        drop(u);
+        let pf2 = write_passfile("u2");
+        let u2 = Unlocked::unlock(&p, Some(&pf2)).unwrap();
+        assert!(store::list_categories(u2.db.conn()).unwrap().is_empty());
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_cat_add_bad_parent_errors() {
+        let p = make_vault("catbad");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // 父分类不存在 → 报错。
+        assert!(run_cat_add(&u, "X", Some("Nope")).is_err());
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_tag_ls_rm_mv_roundtrip() {
+        let p = make_vault("tag");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+
+        // 初始库已含 work / vip 标签(make_vault 注入)。
+        assert!(run_tag_ls(&u).is_ok());
+        let tags = store::list_tags(u.db.conn()).unwrap();
+        assert!(tags.iter().any(|t| t.name == "work"));
+        assert!(tags.iter().any(|t| t.name == "vip"));
+
+        // mv:work → work2。
+        run_tag_mv(&u, "work", "work2").unwrap();
+        let tags = store::list_tags(u.db.conn()).unwrap();
+        assert!(tags.iter().any(|t| t.name == "work2"));
+        assert!(!tags.iter().any(|t| t.name == "work"));
+
+        // rm:删除 work2。
+        run_tag_rm(&u, "work2").unwrap();
+        let tags = store::list_tags(u.db.conn()).unwrap();
+        assert!(!tags.iter().any(|t| t.name == "work2"));
+
+        // rm 不存在的标签 → 报错。
+        assert!(run_tag_rm(&u, "ghost").is_err());
+        // mv 不存在的标签 → 报错。
+        assert!(run_tag_mv(&u, "ghost", "x").is_err());
+
+        // 落盘读回:改名持久化。
+        drop(u);
+        let pf2 = write_passfile("u2");
+        let u2 = Unlocked::unlock(&p, Some(&pf2)).unwrap();
+        let tags2 = store::list_tags(u2.db.conn()).unwrap();
+        assert!(tags2.iter().any(|t| t.name == "vip"));
+        assert!(!tags2.iter().any(|t| t.name == "work2"));
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_edit_sets_category() {
+        let p = make_vault("editcat");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+
+        // 先建一个分类,再把 id=1 的 item 设到该分类下。
+        let cid = run_cat_add(&u, "Work", None).unwrap();
+        run_edit(&u, 1, None, None, None, None, Some("Work")).unwrap();
+
+        let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
+        assert_eq!(got.category_id, Some(cid));
+
+        // 未知分类名 → 报错。
+        assert!(run_edit(&u, 1, None, None, None, None, Some("Ghost")).is_err());
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_ls_favorite_only_returns_favorites() {
+        let p = make_vault("lsfav");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // make_vault 的两条 item 都不是收藏;add 一条收藏项。
+        let data = r#"{"type":"password","username":"bob","password":"pw","url":"","totp_secret":"","notes":""}"#;
+        let _fav_id = run_add(&u, "Fav", data, vec![], true).unwrap();
+
+        let f = ListFilter::default();
+        // favorite=false:返回全部 3 条。
+        let sf_all = to_search_filter(&f, None);
+        let all = search::search(u.db.conn(), &sf_all).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // favorite=true:只返回 1 条(收藏项)。
+        assert!(run_ls(&u, &f, true, false).is_ok());
+        let mut f2 = f.clone();
+        f2.favorite_only = true;
+        let sf_fav = to_search_filter(&f2, None);
+        let favs = search::search(u.db.conn(), &sf_fav).unwrap();
+        assert_eq!(favs.len(), 1);
+        assert!(favs.iter().all(|i| i.favorite));
         cleanup(&p);
     }
 }
