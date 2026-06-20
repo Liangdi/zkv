@@ -50,6 +50,9 @@ impl Database {
     }
 
     /// 创建一个空的 `:memory:` 数据库并执行 schema 迁移。
+    ///
+    /// 随后执行 [`Database::migrate_data`]:空库瞬时完成(`user_version` 0 → 1),
+    /// 保证打开后即为新形状(老库经 [`Database::from_bytes`] 接入迁移)。
     pub fn open_in_memory() -> Result<Database> {
         let conn = Connection::open_in_memory()?;
         let db = Database {
@@ -57,6 +60,7 @@ impl Database {
             backing_tmp: None,
         };
         db.migrate()?;
+        db.migrate_data()?;
         Ok(db)
     }
 
@@ -160,8 +164,9 @@ impl Database {
     /// 把历史形状(`items.data` 为 `ItemData` tagged JSON)迁移为新形状
     /// (`items.data` 为 `Vec<Field>` JSON 数组),并重算 `search_text`。
     ///
-    /// **A1 阶段:此方法不在 live 打开路径(`open_in_memory`/`from_bytes`)中调用**,
-    /// 仅由单测驱动。B 阶段才会接入。这样保证 A1 零行为变更、零回归。
+    /// 已接入 live 打开路径:[`open_in_memory`](Self::open_in_memory) 在 `migrate` 后调用
+    /// (空库瞬时,`user_version` 0→1);[`from_bytes`](Self::from_bytes) 在 backup 灌入后调用
+    /// (老库就地迁移)。这样老库打开自动转新形状,新库直接落新形状。
     ///
     /// 幂等性:用 `PRAGMA user_version` 作迁移水位。`>= 1` 视为已迁移,立即返回。
     ///
@@ -282,10 +287,15 @@ impl Database {
                 b.run_to_completion(100, Duration::from_millis(250), None)?;
             }
             drop(src);
-            Ok(Database {
+            let db = Database {
                 conn: dst,
                 backing_tmp: None,
-            })
+            };
+            // 老库就地在内存副本上迁移:补 schema(幂等,如 templates 表)+
+            // 数据形状(legacy → Vec<Field>),search_text 重算。user_version 门控,可重入。
+            db.migrate()?;
+            db.migrate_data()?;
+            Ok(db)
         })();
         let _ = fs::remove_file(&tmp);
         res
@@ -436,12 +446,22 @@ mod tests {
     #[test]
     fn dump_from_bytes_roundtrip_preserves_data() {
         let db = Database::open_in_memory().unwrap();
+        // open_in_memory 已升 user_version=1;重置回 0 模拟真实老库,from_bytes 才会就地迁移。
+        db.conn().execute_batch("PRAGMA user_version = 0").unwrap();
         let now = 1_700_000_000i64;
+        // 直接插一条 legacy note 形状(from_bytes 会就地迁移为新 Vec<Field>)。
         db.conn()
             .execute(
                 "INSERT INTO items(type,title,data,search_text,created_at,updated_at)
                  VALUES (?1,?2,?3,?4,?5,?6)",
-                rusqlite::params!["note", "My Note", "{\"content\":\"hi\"}", "hi body", now, now],
+                rusqlite::params![
+                    "note",
+                    "My Note",
+                    "{\"type\":\"note\",\"format\":\"text\",\"content\":\"hi\"}",
+                    "hi body",
+                    now,
+                    now
+                ],
             )
             .unwrap();
         db.conn()
@@ -466,7 +486,19 @@ mod tests {
             .unwrap();
         assert_eq!(tag_cnt, 1);
 
-        // round-trip 后 FTS5 仍可查(SQLite 文件里 FTS5 索引随库一起 dump)。
+        // 迁移后 data 应为 Vec<Field> JSON,内容字段值 "hi" 保留。
+        let data: String = db2
+            .conn()
+            .query_row(
+                "SELECT data FROM items WHERE title='My Note'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(data.contains("\"name\":\"content\""));
+        assert!(data.contains("\"value\":\"hi\""));
+
+        // round-trip 后 FTS5 仍可查(标题 "My Note" 由 FTS 索引;迁移重算 search_text 含 "hi")。
         let fts_hit: bool = db2
             .conn()
             .prepare("SELECT 1 FROM items_fts WHERE items_fts MATCH ?1 LIMIT 1")
@@ -509,7 +541,8 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let conn = db.conn();
 
-        // 起始 user_version == 0(建表未设版本)。
+        // open_in_memory 已把 user_version 升到 1;重置回 0 以模拟老库,插入 legacy 行后再迁移。
+        conn.execute_batch("PRAGMA user_version = 0").unwrap();
         assert_eq!(user_version(conn), 0);
 
         // 直接 SQL 插入旧形状行(绕过 store,模拟历史数据)。
@@ -588,6 +621,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let conn = db.conn();
 
+        conn.execute_batch("PRAGMA user_version = 0").unwrap();
         conn.execute(
             "INSERT INTO items(type,title,data,search_text,created_at,updated_at)
              VALUES ('password','t','{\"type\":\"password\",\"username\":\"u\",\"password\":\"s\",\"url\":\"\",\"totp_secret\":\"\",\"notes\":\"n\"}','old',1,1)",
@@ -615,6 +649,8 @@ mod tests {
     fn migrate_data_handles_mixed_new_and_legacy_shapes() {
         let db = Database::open_in_memory().unwrap();
         let conn = db.conn();
+
+        conn.execute_batch("PRAGMA user_version = 0").unwrap();
 
         // 已是新形状(Vec<Field>)的行:migrate_data 应识别并保留(可重新规范化 search_text)。
         let new_shape = serde_json::to_string(&vec![

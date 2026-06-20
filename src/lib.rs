@@ -11,6 +11,8 @@ pub mod error;
 pub mod model;
 pub mod search;
 pub mod store;
+#[cfg(test)]
+pub mod test_support;
 pub mod totp;
 pub mod ui;
 pub mod vault;

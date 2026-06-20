@@ -3,22 +3,26 @@
 //!
 //! 对外接口(均返回 `Result<...>`):
 //! - 条目:`list_items` / `get_item` / `insert_item` / `update_item` / `delete_item`
-//!   —— insert/update 时同步刷新 `items.search_text`(由 `ItemData::search_text` 生成)与标签挂载。
+//!   —— insert/update 时同步刷新 `items.search_text`(由 [`fields_search_text`] 生成)与标签挂载。
 //! - 分类:`list_categories` / `insert_category` / `update_category` / `delete_category`
 //! - 标签:`list_tags` / `ensure_tag(conn, name) -> id`
 //! - 附件:`list_attachments` / `insert_attachment` / `get_attachment` / `delete_attachment`
 //!
 //! 时间戳:由本模块用 `SystemTime::now()` 填充秒级 Unix。
 //!
+//! `items.type` 列承载 `template_id`;`items.data` 承载 `Vec<Field>` JSON 数组。
+//! 读取层 [`row_to_item`] 始终双解析兜底(先新数组、后 legacy),兼容混合/旧库。
+//!
 //! 分层(L3):依赖 `crate::error`/`crate::model`/`crate::db` 与外部 crate,不引用 vault/app/ui。
 
-use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, Row};
 
 use crate::error::{Error, Result};
-use crate::model::{Attachment, Category, Item, ItemData, ItemType, Tag};
+use crate::model::{
+    fields_search_text, legacy_to_fields, Attachment, Category, Field, Item, LegacyItemData, Tag,
+};
 
 /// 当前秒级 Unix 时间戳。
 fn now_secs() -> i64 {
@@ -26,32 +30,6 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-impl ItemType {
-    /// 小写字符串表示,匹配 `items.type` 列。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ItemType::Password => "password",
-            ItemType::Note => "note",
-            ItemType::Card => "card",
-        }
-    }
-
-}
-
-/// 从小写字符串解析 `ItemType`(实现 [`std::str::FromStr`],支持 `.parse()`)。
-impl std::str::FromStr for ItemType {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "password" => Ok(ItemType::Password),
-            "note" => Ok(ItemType::Note),
-            "card" => Ok(ItemType::Card),
-            other => Err(Error::Other(format!("unknown item type: {other}"))),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -75,27 +53,24 @@ pub(crate) fn row_to_item(row: &Row<'_>) -> rusqlite::Result<Item> {
     let created_at: i64 = row.get(7)?;
     let updated_at: i64 = row.get(8)?;
 
-    let item_type = ItemType::from_str(&type_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            1,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        )
-    })?;
-    let data: ItemData = serde_json::from_str(&data_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            4,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    // 双解析:先试新形状 Vec<Field>(template_id 取 type 列);
+    // 失败再试 legacy LegacyItemData → (tpl, fields)。
+    // 两者都失败 → 损坏行降级:template_id="(corrupt)",fields 空(不 panic)。
+    let (template_id, fields) = if let Ok(fs) = serde_json::from_str::<Vec<Field>>(&data_json) {
+        (type_str, fs)
+    } else if let Ok(legacy) = serde_json::from_str::<LegacyItemData>(&data_json) {
+        let (tpl, fs) = legacy_to_fields(legacy);
+        (tpl, fs)
+    } else {
+        ("(corrupt)".to_string(), Vec::new())
+    };
 
     Ok(Item {
         id: Some(id),
-        item_type,
+        template_id,
         title,
         category_id,
-        data,
+        fields,
         favorite: favorite != 0,
         tags: Vec::new(),
         created_at,
@@ -148,9 +123,9 @@ pub(crate) fn fill_tags(conn: &Connection, item: &mut Item) -> Result<()> {
 /// 插入条目。序列化 `data` 为 JSON,刷新 `search_text`,同步标签挂载;回填 `item.id`。
 pub fn insert_item(conn: &Connection, item: &mut Item) -> Result<i64> {
     let now = now_secs();
-    let data_json = serde_json::to_string(&item.data)?;
-    let search_text = item.data.search_text();
-    let type_str = item.item_type.as_str();
+    let data_json = serde_json::to_string(&item.fields)?;
+    let search_text = fields_search_text(&item.fields);
+    let type_str = item.template_id.as_str();
     let favorite_i = if item.favorite { 1 } else { 0 };
 
     // 若调用方未设时间戳(为 0),用 now 填充;否则保留(便于测试/导入)。
@@ -198,9 +173,9 @@ fn sync_item_tags(conn: &Connection, item_id: i64, tags: &[String]) -> Result<()
 /// 更新条目。刷新 `updated_at`、`search_text`,重建该 item 的标签挂载。
 pub fn update_item(conn: &Connection, item: &Item) -> Result<()> {
     let id = item.id.ok_or_else(|| Error::Other("update_item: item.id is None".into()))?;
-    let data_json = serde_json::to_string(&item.data)?;
-    let search_text = item.data.search_text();
-    let type_str = item.item_type.as_str();
+    let data_json = serde_json::to_string(&item.fields)?;
+    let search_text = fields_search_text(&item.fields);
+    let type_str = item.template_id.as_str();
     let favorite_i = if item.favorite { 1 } else { 0 };
     let now = now_secs();
 
@@ -474,26 +449,14 @@ pub fn delete_attachment(conn: &Connection, id: i64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::db::Database;
-    use crate::model::{ItemData, ItemType};
+    use crate::model::FieldKind;
+    use crate::test_support::{mk_field, mk_password_item};
 
     fn sample_password_item(title: &str, tags: Vec<&str>) -> Item {
-        Item {
-            id: None,
-            item_type: ItemType::Password,
-            title: title.into(),
-            category_id: None,
-            data: ItemData::Password {
-                username: "alice".into(),
-                password: "s3cret".into(),
-                url: "https://example.com".into(),
-                totp_secret: "TOTP".into(),
-                notes: "main account".into(),
-            },
-            favorite: false,
-            tags: tags.into_iter().map(String::from).collect(),
-            created_at: 0,
-            updated_at: 0,
-        }
+        let mut it = mk_password_item("alice", "s3cret");
+        it.title = title.into();
+        it.tags = tags.into_iter().map(String::from).collect();
+        it
     }
 
     #[test]
@@ -510,8 +473,8 @@ mod tests {
         let got = get_item(conn, id).unwrap().expect("item should exist");
         assert_eq!(got.id, Some(id));
         assert_eq!(got.title, "GitHub Login");
-        assert_eq!(got.item_type, ItemType::Password);
-        assert_eq!(got.data, item.data);
+        assert_eq!(got.template_id, "password");
+        assert_eq!(got.fields, item.fields);
         // tags 往返
         assert_eq!(got.tags, vec!["vip".to_string(), "work".to_string()]);
     }
@@ -521,27 +484,22 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let conn = db.conn();
 
-        let mut item = Item {
-            id: None,
-            item_type: ItemType::Note,
-            title: "My Note".into(),
-            category_id: None,
-            data: ItemData::Note {
-                format: "markdown".into(),
-                content: "# Hi\nbody".into(),
-            },
-            favorite: true,
-            tags: vec![],
-            created_at: 0,
-            updated_at: 0,
-        };
+        let mut item = crate::test_support::mk_item(
+            "note",
+            "My Note",
+            &[
+                ("format", "markdown", FieldKind::Text),
+                ("content", "# Hi\nbody", FieldKind::Multiline),
+            ],
+        );
+        item.favorite = true;
         let id = insert_item(conn, &mut item).unwrap();
 
         let got = get_item(conn, id).unwrap().unwrap();
-        assert_eq!(got.data, item.data);
+        assert_eq!(got.fields, item.fields);
         assert!(got.favorite);
 
-        // 验证存入的 data 是带 type tag 的 JSON
+        // 验证存入的 data 是 Vec<Field> JSON 数组
         let raw: String = conn
             .query_row(
                 "SELECT data FROM items WHERE id = ?1",
@@ -549,7 +507,8 @@ mod tests {
                 |r| r.get::<_, String>(0),
             )
             .unwrap();
-        assert!(raw.contains("\"type\":\"note\""));
+        assert!(raw.starts_with('['), "data 应为 JSON 数组: {raw}");
+        assert!(raw.contains("\"name\":\"content\""));
     }
 
     #[test]
@@ -566,22 +525,22 @@ mod tests {
 
         let mut updated = item.clone();
         updated.id = Some(id);
-        updated.data = ItemData::Password {
-            username: "bob".into(),
-            password: "".into(),
-            url: "".into(),
-            totp_secret: "".into(),
-            notes: "changed".into(),
-        };
+        updated.fields = vec![
+            mk_field("username", "bob", FieldKind::Text),
+            mk_field("password", "", FieldKind::Secret),
+            mk_field("url", "", FieldKind::Text),
+            mk_field("totp", "", FieldKind::Totp),
+            mk_field("notes", "changed", FieldKind::Multiline),
+        ];
         updated.tags = vec!["newtag".into()];
         update_item(conn, &updated).unwrap();
 
         let got = get_item(conn, id).unwrap().unwrap();
         assert!(got.updated_at > orig_updated, "updated_at should advance");
-        assert_eq!(got.data, updated.data);
+        assert_eq!(got.fields, updated.fields);
         assert_eq!(got.tags, vec!["newtag".to_string()]);
 
-        // search_text 列刷新
+        // search_text 列刷新(含 username/notes,不含 password Secret)
         let st: String = conn
             .query_row(
                 "SELECT search_text FROM items WHERE id = ?1",
@@ -752,39 +711,12 @@ mod tests {
     }
 
     #[test]
-    fn item_type_str_roundtrip() {
-        assert_eq!(ItemType::Password.as_str(), "password");
-        assert_eq!(ItemType::Note.as_str(), "note");
-        assert_eq!(ItemType::Card.as_str(), "card");
-        assert_eq!(
-            ItemType::from_str("card").unwrap(),
-            ItemType::Card
-        );
-        assert!(ItemType::from_str("unknown").is_err());
-    }
-
-    #[test]
     fn search_text_column_excludes_title() {
         let db = Database::open_in_memory().unwrap();
         let conn = db.conn();
 
-        let mut item = Item {
-            id: None,
-            item_type: ItemType::Password,
-            title: "UniqueTitleWord".into(),
-            category_id: None,
-            data: ItemData::Password {
-                username: "u".into(),
-                password: "p".into(),
-                url: "".into(),
-                totp_secret: "".into(),
-                notes: "".into(),
-            },
-            favorite: false,
-            tags: vec![],
-            created_at: 0,
-            updated_at: 0,
-        };
+        let mut item = crate::test_support::mk_password_item("u", "p");
+        item.title = "UniqueTitleWord".into();
         let id = insert_item(conn, &mut item).unwrap();
 
         // search_text 列不应包含标题

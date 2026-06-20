@@ -339,7 +339,9 @@ class E2E(unittest.TestCase):
             p.send(PASSPHRASE.encode() + b"\r")
             p.expect("vault created", 25)  # create+unlock done (message in header)
 
-            p.send(b"n")  # open NewItem editor (Password)
+            p.send(b"n")  # open template picker
+            p.expect("Password", 5)  # picker lists templates; Password first (default)
+            p.send(b"\r")  # select Password, enter editor
             p.expect("Editor", 5)
             # title
             p.send(b"github")

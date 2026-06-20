@@ -51,9 +51,9 @@ enum Command {
     Ls {
         /// 库文件路径。
         path: PathBuf,
-        /// 仅列出该类型的条目(password|note|card)。
-        #[arg(short, long, value_parser = clap::value_parser!(zkv::model::ItemType), value_name = "TYPE")]
-        r#type: Option<zkv::model::ItemType>,
+        /// 仅列出该模板 id 的条目(如 password/note/card/wifi/...)。
+        #[arg(short, long, value_name = "TEMPLATE")]
+        r#type: Option<String>,
         /// 仅列出挂有该标签的条目(可重复)。
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
@@ -79,7 +79,7 @@ enum Command {
         path: PathBuf,
         /// 条目 id(与 --find 至少给其一)。
         id: Option<i64>,
-        /// 仅打印该字段(title/username/password/url/totp/notes/format/content/holder/number/expiry/cvv/bank)。
+        /// 仅打印该字段(按字段名,如 username/password/url/totp/notes;特殊:title/type)。
         #[arg(short, long, value_name = "FIELD")]
         field: Option<String>,
         /// 以 JSON 输出整条条目(与 -f 互斥语义:--json 时忽略 -f)。
@@ -144,19 +144,25 @@ enum Command {
         /// 条目标题。
         #[arg(long, value_name = "TITLE")]
         title: String,
-        /// 完整 ItemData JSON,含 `"type"` tag(如 `{"type":"password",...}`)。
+        /// 模板 id(默认 password)。与 --data 互斥使用时,data 决定最终模板。
+        #[arg(long, value_name = "TEMPLATE", default_value = "password")]
+        template: String,
+        /// 可选:完整字段 JSON(新形状 Vec<Field>、新 Item JSON,或旧 ItemData 均可)。省略则用模板空字段。
         #[arg(long, value_name = "JSON")]
-        data: String,
+        data: Option<String>,
+        /// 设置字段 `name=value`(可重复;按字段名写入,不存在则新增)。
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        sets: Vec<String>,
         /// 标签(可重复)。
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
         /// 标记为收藏。
         #[arg(long)]
         favorite: bool,
-        /// 自动生成 password 条目的密码字段(可带长度,如 --gen-password 24)。仅 password 类型生效。
+        /// 自动生成密码(作用于 name=="password" 的 Secret 字段;可带长度,如 --gen-password 24)。
         #[arg(long, value_name = "LEN", num_args = 0..=1, default_missing_value = "20")]
         gen_password: Option<usize>,
-        /// otpauth:// URI:解析出 secret,覆盖 password 条目的 totp_secret(仅 password 类型生效)。与 --gen-password 可共存。
+        /// otpauth:// URI:解析出 secret,覆盖首个 kind=Totp 字段。与 --gen-password 可共存。
         #[arg(long, value_name = "URI")]
         otpauth: Option<String>,
         /// 口令文件路径。
@@ -175,7 +181,7 @@ enum Command {
         #[arg(long = "no-ambiguous")]
         no_ambiguous: bool,
     },
-    /// 修改已有条目的字段(无头)。至少提供 --title/--data/--tag/--favorite/--no-favorite/单字段/--add-tag/--rm-tag/--otpauth 之一。
+    /// 修改已有条目的字段(无头)。至少提供 --title/--data/--tag/--favorite/--no-favorite/--set/--add-tag/--rm-tag/--otpauth 之一。
     Edit {
         /// 库文件路径。
         path: PathBuf,
@@ -184,7 +190,7 @@ enum Command {
         /// 新标题。
         #[arg(long, value_name = "TITLE")]
         title: Option<String>,
-        /// 完整 ItemData JSON,含 `"type"` tag(替换整块 data)。与单字段 flag 互斥。
+        /// 完整字段 JSON(新形状 Vec<Field>、新 Item JSON,或旧 ItemData;替换整块 fields)。与 --set 互斥。
         #[arg(long, value_name = "JSON")]
         data: Option<String>,
         /// 标签(可重复;整体覆盖)。与 --add-tag/--rm-tag 互斥。
@@ -199,40 +205,9 @@ enum Command {
         /// 设置分类(按名称;不存在则报错)。
         #[arg(long, value_name = "CATEGORY")]
         cat: Option<String>,
-        // --- 单字段覆盖(仅对相应类型生效;与 --data 互斥)---
-        /// password: 用户名。
-        #[arg(long, value_name = "S")]
-        username: Option<String>,
-        /// password: 密码。
-        #[arg(long, value_name = "S")]
-        password: Option<String>,
-        /// password: URL。
-        #[arg(long, value_name = "S")]
-        url: Option<String>,
-        /// password: TOTP secret(base32)。
-        #[arg(long, value_name = "S")]
-        totp: Option<String>,
-        /// password/card: 备注。
-        #[arg(long, value_name = "S")]
-        notes: Option<String>,
-        /// note: 正文。
-        #[arg(long, value_name = "S")]
-        content: Option<String>,
-        /// card: 持卡人。
-        #[arg(long, value_name = "S")]
-        holder: Option<String>,
-        /// card: 卡号。
-        #[arg(long, value_name = "S")]
-        number: Option<String>,
-        /// card: 有效期。
-        #[arg(long, value_name = "S")]
-        expiry: Option<String>,
-        /// card: CVV。
-        #[arg(long, value_name = "S")]
-        cvv: Option<String>,
-        /// card: 发卡行。
-        #[arg(long, value_name = "S")]
-        bank: Option<String>,
+        /// 设置字段 `name=value`(可重复;按字段名更新,不存在则新增)。与 --data 互斥。
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        sets: Vec<String>,
         // --- 标签增删(与 --tag 整体覆盖互斥)---
         /// 追加标签(可重复;去重)。
         #[arg(long = "add-tag", value_name = "TAG")]
@@ -240,7 +215,7 @@ enum Command {
         /// 移除标签(可重复)。
         #[arg(long = "rm-tag", value_name = "TAG")]
         rm_tags: Vec<String>,
-        /// otpauth:// URI:解析出 secret,覆盖 password 条目的 totp_secret(仅 password 类型生效)。
+        /// otpauth:// URI:解析出 secret,覆盖首个 kind=Totp 字段。
         #[arg(long, value_name = "URI")]
         otpauth: Option<String>,
         /// 按标题定位条目(exact 优先,否则唯一前缀匹配)。
@@ -441,6 +416,19 @@ enum AttachCmd {
     },
 }
 
+/// 解析 `name=value` 字符串列表为 `(name, value)` 有序对。
+///
+/// 无 `=` 的项按「值为空」处理(即设置该字段为空串)。重复 name 保留全部(后者覆盖前者)。
+fn parse_sets(items: &[String]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|s| match s.split_once('=') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (s.clone(), String::new()),
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
     // 先装 color_eyre(注册其默认 panic hook + 启用错误报告)。
     if let Err(e) = color_eyre::install() {
@@ -501,7 +489,7 @@ fn run() -> color_eyre::Result<()> {
         } => {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             let f = zkv::cli::ListFilter {
-                item_type: r#type,
+                template_id: r#type,
                 tags,
                 category,
                 query,
@@ -555,7 +543,9 @@ fn run() -> color_eyre::Result<()> {
         Command::Add {
             path,
             title,
+            template,
             data,
+            sets,
             tags,
             favorite,
             gen_password,
@@ -563,10 +553,15 @@ fn run() -> color_eyre::Result<()> {
             passfile,
         } => {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            let fields = zkv::cli::EditFields {
+                sets: parse_sets(&sets),
+            };
             zkv::cli::run_add(
                 &u,
                 &title,
-                &data,
+                &template,
+                data.as_deref(),
+                &fields,
                 tags,
                 favorite,
                 gen_password,
@@ -590,17 +585,7 @@ fn run() -> color_eyre::Result<()> {
             favorite,
             no_favorite,
             cat,
-            username,
-            password,
-            url,
-            totp,
-            notes,
-            content,
-            holder,
-            number,
-            expiry,
-            cvv,
-            bank,
+            sets,
             add_tags,
             rm_tags,
             otpauth,
@@ -617,19 +602,8 @@ fn run() -> color_eyre::Result<()> {
                 None
             };
             let fields = zkv::cli::EditFields {
-                username,
-                password,
-                url,
-                totp,
-                notes,
-                content,
-                holder,
-                number,
-                expiry,
-                cvv,
-                bank,
+                sets: parse_sets(&sets),
             };
-            // 单字段 flag 集合(收集到 fields 后,main 层不单独校验互斥;run_edit 兜底)。
             let tag_delta = zkv::cli::TagDelta {
                 add: add_tags,
                 remove: rm_tags,

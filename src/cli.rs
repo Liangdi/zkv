@@ -27,7 +27,7 @@ use crate::clipboard;
 use crate::crypto::{KdfParams, MasterKey};
 use crate::db::Database;
 use crate::error::{Error, Result};
-use crate::model::{Attachment, Category, Item, ItemData, ItemType};
+use crate::model::{legacy_to_fields, Attachment, Category, Field, FieldKind, Item, LegacyItemData};
 use crate::search::{self, Filter};
 use crate::store;
 use crate::vault;
@@ -123,8 +123,8 @@ impl Unlocked {
 /// `ls`/`search` 的过滤参数(已类型化)。`category` 按分类**名称**(运行时解析成 id)。
 #[derive(Debug, Clone, Default)]
 pub struct ListFilter {
-    /// 仅列出该类型。
-    pub item_type: Option<ItemType>,
+    /// 仅列出该模板 id 的条目。
+    pub template_id: Option<String>,
     /// 仅列出挂有这些标签中任意一个的条目。
     pub tags: Vec<String>,
     /// 仅列出该分类名称下的条目(`None` 表示不限)。
@@ -141,7 +141,7 @@ fn to_search_filter(list: &ListFilter, category_id: Option<i64>) -> Filter {
         query: list.query.clone(),
         category: category_id,
         tags: list.tags.clone(),
-        item_type: list.item_type,
+        template_id: list.template_id.clone(),
         favorite_only: list.favorite_only,
     }
 }
@@ -226,7 +226,7 @@ fn write_items<W: Write>(out: &mut W, items: &[Item], json: bool) -> Result<()> 
             out,
             "{}\t{}\t{}\t[{}]\t{}",
             id,
-            it.item_type.as_str(),
+            it.template_id,
             it.title,
             tags,
             it.updated_at
@@ -239,43 +239,29 @@ fn write_items<W: Write>(out: &mut W, items: &[Item], json: bool) -> Result<()> 
 // 字段提取(供 get/cp 复用)
 // ---------------------------------------------------------------------------
 
-/// 按 `field` 名提取条目的原始字段值。
+/// 按 `field` 名提取条目的字段值(数据驱动)。
 ///
-/// 字段名映射:
-/// - 通用:`title`
-/// - password:`username`/`password`/`url`/`totp`/`notes`
-/// - note:`format`/`content`
-/// - card:`holder`/`number`/`expiry`/`cvv`/`bank`/`notes`
+/// 特殊名:
+/// - `title` → item.title
+/// - `type` → item.template_id
+/// - `totp` / `otp` → 首个 kind=Totp 字段的值
 ///
-/// 未知字段名或类型不匹配返回 [`Error::Other`]。
+/// 其余按 name 在 `item.fields` 中查首个匹配。未找到返回 [`Error::Other`]。
 pub fn item_field(item: &Item, field: &str) -> Result<String> {
-    use crate::model::ItemData::*;
-    // 通用字段优先。
-    if field == "title" {
-        return Ok(item.title.clone());
-    }
-    let val = match (&item.data, field) {
-        (Password { username, .. }, "username") => username.clone(),
-        (Password { password, .. }, "password") => password.clone(),
-        (Password { url, .. }, "url") => url.clone(),
-        (Password { totp_secret, .. }, "totp") => totp_secret.clone(),
-        (Password { notes, .. }, "notes") => notes.clone(),
-        (Note { format, .. }, "format") => format.clone(),
-        (Note { content, .. }, "content") => content.clone(),
-        (Card { holder, .. }, "holder") => holder.clone(),
-        (Card { number, .. }, "number") => number.clone(),
-        (Card { expiry, .. }, "expiry") => expiry.clone(),
-        (Card { cvv, .. }, "cvv") => cvv.clone(),
-        (Card { bank, .. }, "bank") => bank.clone(),
-        (Card { notes, .. }, "notes") => notes.clone(),
-        _ => {
-            return Err(Error::Other(format!(
-                "field '{field}' not valid for {} item",
-                item.item_type.as_str()
-            )));
+    match field {
+        "title" => return Ok(item.title.clone()),
+        "type" => return Ok(item.template_id.clone()),
+        "totp" | "otp" => {
+            return item
+                .totp_value()
+                .map(|s| s.to_string())
+                .ok_or_else(|| Error::Other(format!("field '{field}' not found")));
         }
-    };
-    Ok(val)
+        _ => {}
+    }
+    item.field_value(field)
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::Other(format!("field '{field}' not found")))
 }
 
 /// 解析 `otpauth://totp/<label>?secret=<BASE32>&...` URI,返回 secret(base32)。
@@ -345,117 +331,42 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-/// `edit` 单字段覆盖集合:仅覆盖对应 data 子字段(免整块 `--data`)。
+/// `edit`/`add` 的单字段覆盖集合:`--set name=value`(可重复)。
 ///
-/// 任一字段为 `Some` → 在 `run_edit` 中按 (变体, 字段) 写入;所有字段 `None` 表示「不改」。
-/// 与 `--data`(整块替换)互斥:二者同传由调用方(run_edit)在进入前报错。
+/// 按 name 写入:存在同名字段则更新值;不存在则**追加一个 Text 字段**(kind/protected
+/// 取决于语义,默认 Text)。与整块 `--data` 互斥。
 #[derive(Debug, Default, Clone)]
 pub struct EditFields {
-    // password
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub url: Option<String>,
-    pub totp: Option<String>,
-    pub notes: Option<String>,
-    // note
-    pub content: Option<String>,
-    // card
-    pub holder: Option<String>,
-    pub number: Option<String>,
-    pub expiry: Option<String>,
-    pub cvv: Option<String>,
-    pub bank: Option<String>,
+    /// (name, value) 有序集合,后者覆盖前者。
+    pub sets: Vec<(String, String)>,
 }
 
 impl EditFields {
-    /// 是否提供了任一单字段。
+    /// 是否提供了任一 `--set`。
     pub fn any(&self) -> bool {
-        self.username.is_some()
-            || self.password.is_some()
-            || self.url.is_some()
-            || self.totp.is_some()
-            || self.notes.is_some()
-            || self.content.is_some()
-            || self.holder.is_some()
-            || self.number.is_some()
-            || self.expiry.is_some()
-            || self.cvv.is_some()
-            || self.bank.is_some()
+        !self.sets.is_empty()
     }
 
-    /// 按 (变体, 字段) 写入。类型不匹配的字段直接忽略(该变体无此字段)。
-    /// 返回是否实际改动了任意字段(至少一个匹配成功)。
-    pub fn apply(&self, data: &mut ItemData) -> bool {
-        use crate::model::ItemData::*;
+    /// 按 name 写入 `item.fields`:存在则更新值(并继承其 kind/protected);
+    /// 不存在则追加一个 Text 字段。返回是否实际改动。
+    pub fn apply(&self, item: &mut Item) -> bool {
+        if self.sets.is_empty() {
+            return false;
+        }
         let mut changed = false;
-        match data {
-            Password {
-                username,
-                password,
-                url,
-                totp_secret,
-                notes,
-            } => {
-                if let Some(v) = &self.username {
-                    *username = v.clone();
-                    changed = true;
-                }
-                if let Some(v) = &self.password {
-                    *password = v.clone();
-                    changed = true;
-                }
-                if let Some(v) = &self.url {
-                    *url = v.clone();
-                    changed = true;
-                }
-                if let Some(v) = &self.totp {
-                    *totp_secret = v.clone();
-                    changed = true;
-                }
-                if let Some(v) = &self.notes {
-                    *notes = v.clone();
-                    changed = true;
-                }
+        for (name, value) in &self.sets {
+            if let Some(f) = item.fields.iter_mut().find(|f| &f.name == name) {
+                f.value = value.clone();
+            } else {
+                let kind = FieldKind::Text;
+                item.fields.push(Field {
+                    name: name.clone(),
+                    value: value.clone(),
+                    kind,
+                    protected: matches!(kind, FieldKind::Secret | FieldKind::Totp),
+                });
             }
-            Note { content, .. } => {
-                if let Some(v) = &self.content {
-                    *content = v.clone();
-                    changed = true;
-                }
-            }
-            Card {
-                holder,
-                number,
-                expiry,
-                cvv,
-                bank,
-                notes,
-            } => {
-                if let Some(v) = &self.holder {
-                    *holder = v.clone();
-                    changed = true;
-                }
-                if let Some(v) = &self.number {
-                    *number = v.clone();
-                    changed = true;
-                }
-                if let Some(v) = &self.expiry {
-                    *expiry = v.clone();
-                    changed = true;
-                }
-                if let Some(v) = &self.cvv {
-                    *cvv = v.clone();
-                    changed = true;
-                }
-                if let Some(v) = &self.bank {
-                    *bank = v.clone();
-                    changed = true;
-                }
-                if let Some(v) = &self.notes {
-                    *notes = v.clone();
-                    changed = true;
-                }
-            }
+            changed = true;
         }
         changed
     }
@@ -497,77 +408,122 @@ impl TagDelta {
 // 写命令(add/edit/rm)
 // ---------------------------------------------------------------------------
 
-/// 由 [`ItemData`] 的变体推导对应的 [`ItemType`],保证 `Item.item_type` 与 data 一致。
-fn item_type_of(data: &ItemData) -> ItemType {
-    use crate::model::ItemData::*;
-    match data {
-        Password { .. } => ItemType::Password,
-        Note { .. } => ItemType::Note,
-        Card { .. } => ItemType::Card,
+/// 解析 `--data` 兼容 JSON 为 `(template_id, Vec<Field>)`。
+///
+/// 兼容顺序:
+/// 1. 新形状 `Vec<Field>`(数组):template_id 取 `default_template`。
+/// 2. 新形状 `Item` JSON(含 `template_id`+`fields`):取其 template_id + fields。
+/// 3. 旧形状 `{"type":...,...}`(legacy ItemData):经 `legacy_to_fields` 转换。
+///
+/// 三者都失败返回原解析错误。
+fn parse_item_data(data_json: &str, default_template: &str) -> Result<(String, Vec<Field>)> {
+    // 1. Vec<Field>。
+    if let Ok(fields) = serde_json::from_str::<Vec<Field>>(data_json) {
+        return Ok((default_template.to_string(), fields));
     }
+    // 2. 新 Item JSON(部分:仅取 template_id + fields)。
+    #[derive(serde::Deserialize)]
+    struct ItemShape {
+        #[serde(default)]
+        template_id: Option<String>,
+        #[serde(default)]
+        fields: Vec<Field>,
+    }
+    if let Ok(shape) = serde_json::from_str::<ItemShape>(data_json) {
+        if !shape.fields.is_empty() || shape.template_id.is_some() {
+            let tpl = shape
+                .template_id
+                .unwrap_or_else(|| default_template.to_string());
+            return Ok((tpl, shape.fields));
+        }
+    }
+    // 3. legacy。
+    let legacy: LegacyItemData = serde_json::from_str(data_json)?;
+    Ok(legacy_to_fields(legacy))
 }
 
-/// `add`:新增一条条目。`data_json` 是**完整** [`ItemData`] JSON(含 `"type"` tag)。
+/// `add`:新增一条条目。
 ///
-/// `gen_password = Some(len)` 时,`data_json` 必须是 `ItemData::Password`,其 `password` 字段
-/// 会被 `generate_password(len, true, true)` 生成的强密码**覆盖**。
+/// `data_json`(可选):兼容新旧形状(见 [`parse_item_data`])。为空时用 `template` 实例化空字段。
+/// `sets`:额外 `--set name=value` 覆盖。
+/// `gen_password = Some(len)`:覆盖 `name=="password"` 的 Secret 字段(任意模板)。
+/// `otpauth = Some(uri)`:覆盖首个 kind=Totp 字段(任意模板)。
 ///
 /// 成功后向 stdout 打印 `added item <id>: <title>` 并返回新 id。
-/// 若用了 `--gen-password`,生成的明文密码打到 **stderr**(`generated password for item <id>: <pw>`),
-/// 不污染 stdout 的 id 行,但用户能拿到。
+/// 若用了 `--gen-password`,生成的明文密码打到 **stderr**,不污染 stdout。
+#[allow(clippy::too_many_arguments)]
 pub fn run_add(
     u: &Unlocked,
     title: &str,
-    data_json: &str,
+    template: &str,
+    data_json: Option<&str>,
+    sets: &EditFields,
     tags: Vec<String>,
     favorite: bool,
     gen_password: Option<usize>,
     otpauth: Option<&str>,
 ) -> Result<i64> {
-    let mut data: ItemData = serde_json::from_str(data_json)?;
-
-    // 若指定 --gen-password:必须是 Password 条目,覆盖其 password 字段。
-    let generated = if let Some(len) = gen_password {
-        match &mut data {
-            ItemData::Password { password, .. } => {
-                let pw = generate_password(len, true, true)?;
-                *password = pw.clone();
-                Some(pw)
-            }
-            _ => return Err(Error::Other("--gen-password only applies to password items".into())),
-        }
-    } else {
-        None
+    // 基础 fields:优先 --data(兼容新旧形状),否则实例化 template 空字段。
+    let (template_id, fields) = match data_json {
+        Some(j) if !j.trim().is_empty() => parse_item_data(j, template)?,
+        _ => (
+            template.to_string(),
+            crate::model::instantiate_template(template).unwrap_or_default(),
+        ),
     };
 
-    // 若指定 --otpauth:必须是 Password 条目,解析 secret 后覆盖 totp_secret。
-    // 与 --gen-password 可共存(分别填 password / totp_secret)。
-    if let Some(uri) = otpauth {
-        match &mut data {
-            ItemData::Password { totp_secret, .. } => {
-                let secret = parse_otpauth(uri)?;
-                *totp_secret = secret;
-            }
-            _ => return Err(Error::Other("--otpauth only applies to password items".into())),
-        }
-    }
-
-    let item_type = item_type_of(&data);
-    let mut item = Item {
+    let mut draft = Item {
         id: None,
-        item_type,
+        template_id,
         title: title.into(),
         category_id: None,
-        data,
+        fields,
         favorite,
         tags,
         created_at: 0,
         updated_at: 0,
     };
-    let id = store::insert_item(u.db.conn(), &mut item)?;
+
+    // --set 覆盖。
+    sets.apply(&mut draft);
+
+    // --gen-password:覆盖 name=="password" 的 Secret 字段。
+    let generated = if let Some(len) = gen_password {
+        let pw = generate_password(len, true, true)?;
+        let target = draft
+            .fields
+            .iter_mut()
+            .find(|f| f.name == "password" && f.kind == FieldKind::Secret);
+        match target {
+            Some(f) => {
+                f.value = pw.clone();
+            }
+            None => {
+                return Err(Error::Other(
+                    "--gen-password needs a 'password' Secret field".into(),
+                ));
+            }
+        }
+        Some(pw)
+    } else {
+        None
+    };
+
+    // --otpauth:覆盖首个 kind=Totp 字段。
+    if let Some(uri) = otpauth {
+        let secret = parse_otpauth(uri)?;
+        let target = draft.fields.iter_mut().find(|f| f.kind == FieldKind::Totp);
+        match target {
+            Some(f) => f.value = secret,
+            None => {
+                return Err(Error::Other("--otpauth needs a Totp field".into()));
+            }
+        }
+    }
+
+    let id = store::insert_item(u.db.conn(), &mut draft)?;
     u.save()?;
     println!("added item {id}: {title}");
-    // 生成密码打到 stderr:用户主动要生成,理应看到;又不污染 stdout 的 id 行。
     if let Some(pw) = generated {
         eprintln!("generated password for item {id}: {pw}");
     }
@@ -694,9 +650,9 @@ pub fn run_edit(
         changed = true;
     }
     if let Some(j) = data_json {
-        let d: ItemData = serde_json::from_str(j)?;
-        item.item_type = item_type_of(&d);
-        item.data = d;
+        let (tpl, fields) = parse_item_data(j, &item.template_id)?;
+        item.template_id = tpl;
+        item.fields = fields;
         changed = true;
     }
     if let Some(tg) = tags {
@@ -717,22 +673,21 @@ pub fn run_edit(
         item.category_id = Some(cid);
         changed = true;
     }
-    // 单字段覆盖(仅对相应变体生效;`fields.apply` 返回是否实际改动)。
-    if fields.any() && fields.apply(&mut item.data) {
+    // 单字段覆盖(--set name=value):按 name 更新/追加。
+    if fields.any() && fields.apply(&mut item) {
         changed = true;
     }
-    // --otpauth:必须是 Password,覆盖 totp_secret。
+    // --otpauth:覆盖首个 kind=Totp 字段。
     if let Some(uri) = otpauth {
-        match &mut item.data {
-            ItemData::Password { totp_secret, .. } => {
-                let secret = parse_otpauth(uri)?;
-                *totp_secret = secret;
+        let secret = parse_otpauth(uri)?;
+        let target = item.fields.iter_mut().find(|f| f.kind == FieldKind::Totp);
+        match target {
+            Some(f) => {
+                f.value = secret;
                 changed = true;
             }
-            _ => {
-                return Err(Error::Other(
-                    "--otpauth only applies to password items".into(),
-                ));
+            None => {
+                return Err(Error::Other("--otpauth needs a Totp field".into()));
             }
         }
     }
@@ -1109,43 +1064,103 @@ pub fn export_json(items: &[Item]) -> Result<String> {
     Ok(serde_json::to_string(items)?)
 }
 
-/// 解析 JSON 字符串为条目列表。整体解析失败返回 Err。
+/// 解析 JSON 字符串为条目列表。
+///
+/// 兼容:
+/// 1. 新形状 `Vec<Item>`(含 `template_id`+`fields`)→ 直接用。
+/// 2. 旧形状(每条含 `item_type`+`data`):逐条把 `data`(legacy ItemData)经
+///    `legacy_to_fields` 转;`template_id` 取 `item_type` 字符串。
+///
+/// 整体新形状解析失败时,回退尝试旧形状数组;仍失败返回原解析错误。
 pub fn import_json(s: &str) -> Result<Vec<Item>> {
-    Ok(serde_json::from_str::<Vec<Item>>(s)?)
+    // 1. 新形状。
+    match serde_json::from_str::<Vec<Item>>(s) {
+        Ok(v) => Ok(v),
+        Err(new_err) => {
+            // 2. 旧形状:逐条容错解析。
+            #[derive(serde::Deserialize)]
+            struct LegacyItem {
+                id: Option<i64>,
+                #[serde(alias = "item_type", alias = "type")]
+                template_id: Option<String>,
+                title: String,
+                category_id: Option<i64>,
+                #[serde(default)]
+                favorite: bool,
+                tags: Vec<String>,
+                created_at: i64,
+                updated_at: i64,
+                // 任意其余字段(含 data)落到这里,逐条提取 data。
+                #[serde(flatten)]
+                extra: serde_json::Value,
+            }
+            if let Ok(arr) = serde_json::from_str::<Vec<LegacyItem>>(s) {
+                let mut out = Vec::new();
+                for li in arr {
+                    let (tpl, fields) = if let Some(data) = li.extra.get("data") {
+                        // 尝试 legacy ItemData;失败则尝试 Vec<Field>;都失败用空。
+                        if let Ok(legacy) =
+                            serde_json::from_value::<LegacyItemData>(data.clone())
+                        {
+                            legacy_to_fields(legacy)
+                        } else if let Ok(fs) = serde_json::from_value::<Vec<Field>>(data.clone()) {
+                            (li.template_id.clone().unwrap_or_else(|| "password".into()), fs)
+                        } else {
+                            (li.template_id.clone().unwrap_or_else(|| "password".into()), Vec::new())
+                        }
+                    } else {
+                        (li.template_id.clone().unwrap_or_else(|| "password".into()), Vec::new())
+                    };
+                    out.push(Item {
+                        id: li.id,
+                        template_id: tpl,
+                        title: li.title,
+                        category_id: li.category_id,
+                        fields,
+                        favorite: li.favorite,
+                        tags: li.tags,
+                        created_at: li.created_at,
+                        updated_at: li.updated_at,
+                    });
+                }
+                Ok(out)
+            } else {
+                // 都失败:返回新形状的原始错误。
+                Err(new_err.into())
+            }
+        }
+    }
 }
 
-/// 把 password 类型的条目序列化为 CSV 字符串。
+/// 把 password 模板的条目序列化为 CSV 字符串。
 ///
 /// 首行 header:`title,username,password,url,totp_secret,notes,tags`。
-/// 非 password 条目被跳过(返回跳过计数,供调用方提示)。
-/// 字段用 CSV 双引号转义:含逗号/引号/换行 → 引号包裹,内部引号翻倍。
-/// tags 列用 `;` 分隔。
+/// 非 password 模板的条目被跳过(返回跳过计数)。字段用 CSV 双引号转义,tags 用 `;` 分隔。
 ///
 /// 返回 `(csv, skipped)`:skipped 为被跳过的非 password 条目数。
 pub fn export_csv(items: &[Item]) -> (String, usize) {
     let mut out = String::from("title,username,password,url,totp_secret,notes,tags\n");
     let mut skipped = 0usize;
     for it in items {
-        let (username, password, url, totp_secret, notes) = match &it.data {
-            ItemData::Password {
-                username,
-                password,
-                url,
-                totp_secret,
-                notes,
-            } => (username, password, url, totp_secret, notes),
-            _ => {
-                skipped += 1;
-                continue;
-            }
+        if it.template_id != "password" {
+            skipped += 1;
+            continue;
+        }
+        let get = |name: &str| -> String {
+            it.field_value(name).unwrap_or("").to_string()
         };
+        let username = get("username");
+        let password = get("password");
+        let url = get("url");
+        let totp_secret = get("totp");
+        let notes = get("notes");
         out.push_str(&csv_join(&[
             &it.title,
-            username,
-            password,
-            url,
-            totp_secret,
-            notes,
+            &username,
+            &password,
+            &url,
+            &totp_secret,
+            &notes,
             &it.tags.join(";"),
         ]));
         out.push('\n');
@@ -1207,16 +1222,16 @@ pub fn import_csv(s: &str) -> Result<(Vec<Item>, usize)> {
             .collect();
         let item = Item {
             id: None,
-            item_type: ItemType::Password,
+            template_id: "password".into(),
             title,
             category_id: None,
-            data: ItemData::Password {
-                username,
-                password,
-                url,
-                totp_secret,
-                notes,
-            },
+            fields: vec![
+                Field { name: "username".into(), value: username, kind: FieldKind::Text, protected: false },
+                Field { name: "password".into(), value: password, kind: FieldKind::Secret, protected: true },
+                Field { name: "url".into(), value: url, kind: FieldKind::Text, protected: false },
+                Field { name: "totp".into(), value: totp_secret, kind: FieldKind::Totp, protected: true },
+                Field { name: "notes".into(), value: notes, kind: FieldKind::Multiline, protected: false },
+            ],
             favorite: false,
             tags,
             created_at: 0,
@@ -1463,7 +1478,7 @@ pub fn run_search(u: &Unlocked, query: &str, json: bool) -> Result<()> {
         query: Some(query.to_string()),
         category: None,
         tags: vec![],
-        item_type: None,
+        template_id: None,
         favorite_only: false,
     };
     let items = search::search(u.db.conn(), &sf)?;
@@ -1499,12 +1514,11 @@ pub fn run_cp(u: &Unlocked, id: i64, field: Option<&str>, clear_secs: u64) -> Re
 
 /// 计算单条条目的实时 TOTP 验证码(6 位)。供 `run_otp`/`run_cp` 复用。
 ///
-/// 仅 `ItemData::Password { totp_secret, .. }` 且 secret 非空时可生成;否则 [`Error::Other`]。
+/// 找首个 kind=Totp 字段且 secret 非空时可生成;否则 [`Error::Other`]。
 pub fn otp_of_item(item: &Item) -> Result<String> {
-    let secret = match &item.data {
-        ItemData::Password { totp_secret, .. } => totp_secret,
-        _ => return Err(Error::Other("item has no totp secret".into())),
-    };
+    let secret = item
+        .totp_value()
+        .ok_or_else(|| Error::Other("item has no totp secret".into()))?;
     if secret.trim().is_empty() {
         return Err(Error::Other("item has no totp secret".into()));
     }
@@ -1534,12 +1548,11 @@ pub fn run_otp(u: &Unlocked, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// 人类可读地打印单条条目(字段表)。
+/// 人类可读地打印单条条目(字段表)。按 fields 顺序逐字段列出。
 fn write_item_human<W: Write>(out: &mut W, item: &Item) -> Result<()> {
-    use crate::model::ItemData::*;
     let id = item.id.unwrap_or(-1);
     writeln!(out, "id:       {id}")?;
-    writeln!(out, "type:     {}", item.item_type.as_str())?;
+    writeln!(out, "type:     {}", item.template_id)?;
     writeln!(out, "title:    {}", item.title)?;
     if item.favorite {
         writeln!(out, "favorite: yes")?;
@@ -1547,44 +1560,8 @@ fn write_item_human<W: Write>(out: &mut W, item: &Item) -> Result<()> {
     if !item.tags.is_empty() {
         writeln!(out, "tags:     {}", item.tags.join(", "))?;
     }
-    match &item.data {
-        Password {
-            username,
-            password,
-            url,
-            totp_secret,
-            notes,
-        } => {
-            writeln!(out, "username: {username}")?;
-            writeln!(out, "password: {password}")?;
-            writeln!(out, "url:      {url}")?;
-            writeln!(out, "totp:     {totp_secret}")?;
-            if !notes.is_empty() {
-                writeln!(out, "notes:    {notes}")?;
-            }
-        }
-        Note { format, content } => {
-            writeln!(out, "format:   {format}")?;
-            writeln!(out, "content:")?;
-            writeln!(out, "{content}")?;
-        }
-        Card {
-            holder,
-            number,
-            expiry,
-            cvv,
-            bank,
-            notes,
-        } => {
-            writeln!(out, "holder:   {holder}")?;
-            writeln!(out, "number:   {number}")?;
-            writeln!(out, "expiry:   {expiry}")?;
-            writeln!(out, "cvv:      {cvv}")?;
-            writeln!(out, "bank:     {bank}")?;
-            if !notes.is_empty() {
-                writeln!(out, "notes:    {notes}")?;
-            }
-        }
+    for f in &item.fields {
+        writeln!(out, "{:<9}{}", f.name, f.value)?;
     }
     writeln!(out, "updated:  {}", item.updated_at)?;
     Ok(())
@@ -1597,8 +1574,9 @@ fn write_item_human<W: Write>(out: &mut W, item: &Item) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Item, ItemData};
+    use crate::model::{Field, FieldKind};
     use crate::store;
+    use crate::test_support::{mk_item, mk_password_item};
 
     /// 串行化所有读写 `ZKV_PASSPHRASE` 的测试(默认并行运行器下 env 非线程隔离)。
     /// 任何会 set/remove 或语义上依赖该 env 是否存在的测试,都先拿这把锁。
@@ -1652,38 +1630,38 @@ mod tests {
         {
             let conn = db.conn();
             let mut pw = Item {
-                id: None,
-                item_type: ItemType::Password,
-                title: "GitHub".into(),
-                category_id: None,
-                data: ItemData::Password {
-                    username: "alice".into(),
-                    password: "s3cret".into(),
-                    url: "https://github.com".into(),
-                    totp_secret: "JBSWY3DPEHPK3PXP".into(),
-                    notes: "main".into(),
-                },
-                favorite: false,
-                tags: vec!["work".into(), "vip".into()],
-                created_at: 0,
-                updated_at: 0,
-            };
+        id: None,
+        template_id: "password".into(),
+        title: "GitHub".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "username".into(), value: "alice".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "password".into(), value: "s3cret".into(), kind: FieldKind::Secret, protected: true },
+                Field { name: "url".into(), value: "https://github.com".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "totp".into(), value: "JBSWY3DPEHPK3PXP".into(), kind: FieldKind::Totp, protected: true },
+                Field { name: "notes".into(), value: "main".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec!["work".into(), "vip".into()],
+        created_at: 0,
+        updated_at: 0,
+    };
             store::insert_item(conn, &mut pw).unwrap();
 
             let mut note = Item {
-                id: None,
-                item_type: ItemType::Note,
-                title: "Ideas".into(),
-                category_id: None,
-                data: ItemData::Note {
-                    format: "markdown".into(),
-                    content: "# hello world".into(),
-                },
-                favorite: false,
-                tags: vec!["work".into()],
-                created_at: 0,
-                updated_at: 0,
-            };
+        id: None,
+        template_id: "note".into(),
+        title: "Ideas".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "format".into(), value: "markdown".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "content".into(), value: "# hello world".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec!["work".into()],
+        created_at: 0,
+        updated_at: 0,
+    };
             store::insert_item(conn, &mut note).unwrap();
         }
         vault::save_with_key(&p, &key, &kdf2, salt, &db).unwrap();
@@ -1706,22 +1684,22 @@ mod tests {
     #[test]
     fn item_field_password_mapping() {
         let item = Item {
-            id: Some(1),
-            item_type: ItemType::Password,
-            title: "T".into(),
-            category_id: None,
-            data: ItemData::Password {
-                username: "u".into(),
-                password: "p".into(),
-                url: "https://x".into(),
-                totp_secret: "TOTP".into(),
-                notes: "n".into(),
-            },
-            favorite: false,
-            tags: vec![],
-            created_at: 0,
-            updated_at: 0,
-        };
+        id: Some(1),
+        template_id: "password".into(),
+        title: "T".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "username".into(), value: "u".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "password".into(), value: "p".into(), kind: FieldKind::Secret, protected: true },
+                Field { name: "url".into(), value: "https://x".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "totp".into(), value: "TOTP".into(), kind: FieldKind::Totp, protected: true },
+                Field { name: "notes".into(), value: "n".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec![],
+        created_at: 0,
+        updated_at: 0,
+    };
         assert_eq!(item_field(&item, "title").unwrap(), "T");
         assert_eq!(item_field(&item, "username").unwrap(), "u");
         assert_eq!(item_field(&item, "password").unwrap(), "p");
@@ -1733,40 +1711,40 @@ mod tests {
     #[test]
     fn item_field_note_and_card_mapping() {
         let note = Item {
-            id: Some(1),
-            item_type: ItemType::Note,
-            title: "N".into(),
-            category_id: None,
-            data: ItemData::Note {
-                format: "markdown".into(),
-                content: "body".into(),
-            },
-            favorite: false,
-            tags: vec![],
-            created_at: 0,
-            updated_at: 0,
-        };
+        id: Some(1),
+        template_id: "note".into(),
+        title: "N".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "format".into(), value: "markdown".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "content".into(), value: "body".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec![],
+        created_at: 0,
+        updated_at: 0,
+    };
         assert_eq!(item_field(&note, "format").unwrap(), "markdown");
         assert_eq!(item_field(&note, "content").unwrap(), "body");
 
         let card = Item {
-            id: Some(2),
-            item_type: ItemType::Card,
-            title: "C".into(),
-            category_id: None,
-            data: ItemData::Card {
-                holder: "H".into(),
-                number: "4111".into(),
-                expiry: "12/29".into(),
-                cvv: "123".into(),
-                bank: "B".into(),
-                notes: "cn".into(),
-            },
-            favorite: false,
-            tags: vec![],
-            created_at: 0,
-            updated_at: 0,
-        };
+        id: Some(2),
+        template_id: "card".into(),
+        title: "C".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "holder".into(), value: "H".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "number".into(), value: "4111".into(), kind: FieldKind::Secret, protected: true },
+                Field { name: "expiry".into(), value: "12/29".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "cvv".into(), value: "123".into(), kind: FieldKind::Secret, protected: true },
+                Field { name: "bank".into(), value: "B".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "notes".into(), value: "cn".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec![],
+        created_at: 0,
+        updated_at: 0,
+    };
         assert_eq!(item_field(&card, "holder").unwrap(), "H");
         assert_eq!(item_field(&card, "number").unwrap(), "4111");
         assert_eq!(item_field(&card, "expiry").unwrap(), "12/29");
@@ -1778,19 +1756,19 @@ mod tests {
     #[test]
     fn item_field_unknown_field_errors() {
         let item = Item {
-            id: Some(1),
-            item_type: ItemType::Note,
-            title: "N".into(),
-            category_id: None,
-            data: ItemData::Note {
-                format: "text".into(),
-                content: "c".into(),
-            },
-            favorite: false,
-            tags: vec![],
-            created_at: 0,
-            updated_at: 0,
-        };
+        id: Some(1),
+        template_id: "note".into(),
+        title: "N".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "format".into(), value: "text".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "content".into(), value: "c".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec![],
+        created_at: 0,
+        updated_at: 0,
+    };
         // note 条目请求 password 字段 → 类型不匹配。
         assert!(item_field(&item, "password").is_err());
         // 完全未知字段。
@@ -1800,14 +1778,14 @@ mod tests {
     #[test]
     fn to_search_filter_maps_fields() {
         let lf = ListFilter {
-            item_type: Some(ItemType::Password),
+            template_id: Some("password".into()),
             tags: vec!["a".into()],
             category: Some("Personal".into()),
             query: Some("q".into()),
             favorite_only: true,
         };
         let sf = to_search_filter(&lf, Some(7));
-        assert_eq!(sf.item_type, Some(ItemType::Password));
+        assert_eq!(sf.template_id.as_deref(), Some("password"));
         assert_eq!(sf.tags, vec!["a".to_string()]);
         assert_eq!(sf.category, Some(7));
         assert_eq!(sf.query.as_deref(), Some("q"));
@@ -1833,13 +1811,13 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         let f = ListFilter {
-            item_type: Some(ItemType::Note),
+            template_id: Some("note".into()),
             ..Default::default()
         };
         // 直接查 search 验证过滤语义(避免依赖 stdout 捕获)。
         let sf = to_search_filter(&f, None);
         let items = search::search(u.db.conn(), &sf).unwrap();
-        assert!(items.iter().all(|i| i.item_type == ItemType::Note));
+        assert!(items.iter().all(|i| i.template_id == "note"));
 
         let f2 = ListFilter {
             tags: vec!["vip".into()],
@@ -1928,39 +1906,39 @@ mod tests {
     fn otp_of_item_no_secret_errors() {
         // note 条目无 totp_secret。
         let note = Item {
-            id: Some(2),
-            item_type: ItemType::Note,
-            title: "N".into(),
-            category_id: None,
-            data: ItemData::Note {
-                format: "text".into(),
-                content: "c".into(),
-            },
-            favorite: false,
-            tags: vec![],
-            created_at: 0,
-            updated_at: 0,
-        };
+        id: Some(2),
+        template_id: "note".into(),
+        title: "N".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "format".into(), value: "text".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "content".into(), value: "c".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec![],
+        created_at: 0,
+        updated_at: 0,
+    };
         assert!(matches!(otp_of_item(&note), Err(Error::Other(_))));
 
         // 空 secret 也报错。
         let pw = Item {
-            id: Some(3),
-            item_type: ItemType::Password,
-            title: "P".into(),
-            category_id: None,
-            data: ItemData::Password {
-                username: "u".into(),
-                password: "p".into(),
-                url: "".into(),
-                totp_secret: "   ".into(),
-                notes: "".into(),
-            },
-            favorite: false,
-            tags: vec![],
-            created_at: 0,
-            updated_at: 0,
-        };
+        id: Some(3),
+        template_id: "password".into(),
+        title: "P".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "username".into(), value: "u".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "password".into(), value: "p".into(), kind: FieldKind::Secret, protected: true },
+                Field { name: "url".into(), value: "".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "totp".into(), value: "   ".into(), kind: FieldKind::Totp, protected: true },
+                Field { name: "notes".into(), value: "".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec![],
+        created_at: 0,
+        updated_at: 0,
+    };
         assert!(matches!(otp_of_item(&pw), Err(Error::Other(_))));
     }
 
@@ -2109,13 +2087,13 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         let data = r#"{"type":"password","username":"bob","password":"pw1","url":"https://x","totp_secret":"","notes":""}"#;
-        let id = run_add(&u, "Server", data, vec!["ops".into()], true, None, None).unwrap();
+        let id = run_add(&u, "Server", "password", Some(data), &EditFields::default(), vec!["ops".into()], true, None, None).unwrap();
         assert!(id > 0);
 
         // 内存中能取到正确字段。
         let got = store::get_item(u.db.conn(), id).unwrap().unwrap();
         assert_eq!(got.title, "Server");
-        assert_eq!(got.item_type, ItemType::Password);
+        assert_eq!(got.template_id, "password");
         assert!(got.favorite);
         assert_eq!(got.tags, vec!["ops".to_string()]);
         assert_eq!(item_field(&got, "username").unwrap(), "bob");
@@ -2126,7 +2104,7 @@ mod tests {
         let u2 = Unlocked::unlock(&p, Some(&pf2)).unwrap();
         let got2 = store::get_item(u2.db.conn(), id).unwrap().unwrap();
         assert_eq!(got2.title, "Server");
-        assert_eq!(got2.item_type, ItemType::Password);
+        assert_eq!(got2.template_id, "password");
         let items = search::search(u2.db.conn(), &Filter::default()).unwrap();
         assert_eq!(items.len(), 3);
         cleanup(&p);
@@ -2138,7 +2116,7 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // 缺 type tag → serde 报错(非 Error::Other,但仍是 Err)。
-        assert!(run_add(&u, "X", "{ not json", vec![], false, None, None).is_err());
+        assert!(run_add(&u, "X", "password", Some("{ not json"), &EditFields::default(), vec![], false, None, None).is_err());
         cleanup(&p);
     }
 
@@ -2166,7 +2144,7 @@ mod tests {
 
         let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
         assert_eq!(got.title, "Renamed");
-        assert_eq!(got.item_type, ItemType::Note); // 随 data 同步
+        assert_eq!(got.template_id, "note"); // 随 data 同步
         assert_eq!(got.tags, vec!["archive".to_string()]);
         assert!(!got.favorite);
         assert_eq!(item_field(&got, "content").unwrap(), "moved");
@@ -2177,7 +2155,7 @@ mod tests {
         let u2 = Unlocked::unlock(&p, Some(&pf2)).unwrap();
         let got2 = store::get_item(u2.db.conn(), 1).unwrap().unwrap();
         assert_eq!(got2.title, "Renamed");
-        assert_eq!(got2.item_type, ItemType::Note);
+        assert_eq!(got2.template_id, "note");
         cleanup(&p);
     }
 
@@ -2190,7 +2168,7 @@ mod tests {
         let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
         assert_eq!(got.title, "JustTitle");
         // data 未动,仍是 password。
-        assert_eq!(got.item_type, ItemType::Password);
+        assert_eq!(got.template_id, "password");
         cleanup(&p);
     }
 
@@ -2355,7 +2333,7 @@ mod tests {
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // make_vault 的两条 item 都不是收藏;add 一条收藏项。
         let data = r#"{"type":"password","username":"bob","password":"pw","url":"","totp_secret":"","notes":""}"#;
-        let _fav_id = run_add(&u, "Fav", data, vec![], true, None, None).unwrap();
+        let _fav_id = run_add(&u, "Fav", "password", Some(data), &EditFields::default(), vec![], true, None, None).unwrap();
 
         let f = ListFilter::default();
         // favorite=false:返回全部 3 条。
@@ -2646,7 +2624,7 @@ mod tests {
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // --data 里 password 是占位 "old",--gen-password 12 应覆盖。
         let data = r#"{"type":"password","username":"bob","password":"old","url":"https://x","totp_secret":"","notes":""}"#;
-        let id = run_add(&u, "Gen", data, vec![], false, Some(12), None).unwrap();
+        let id = run_add(&u, "Gen", "password", Some(data), &EditFields::default(), vec![], false, Some(12), None).unwrap();
         assert!(id > 0);
 
         let got = store::get_item(u.db.conn(), id).unwrap().unwrap();
@@ -2666,7 +2644,7 @@ mod tests {
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // note 条目 + --gen-password → 报错。
         let data = r#"{"type":"note","format":"text","content":"hi"}"#;
-        let err = run_add(&u, "N", data, vec![], false, Some(20), None);
+        let err = run_add(&u, "N", "password", Some(data), &EditFields::default(), vec![], false, Some(20), None);
         assert!(matches!(err, Err(Error::Other(m)) if m.contains("--gen-password")));
         cleanup(&p);
     }
@@ -2677,53 +2655,53 @@ mod tests {
     fn sample_items() -> Vec<Item> {
         vec![
             Item {
-                id: Some(1),
-                item_type: ItemType::Password,
-                title: "GitHub".into(),
-                category_id: None,
-                data: ItemData::Password {
-                    username: "alice".into(),
-                    password: "p,ass\"word".into(), // 含逗号 + 引号
-                    url: "https://github.com".into(),
-                    totp_secret: "JBSWY3DPEHPK3PXP".into(),
-                    notes: "main\nline2".into(), // 含换行
-                },
-                favorite: true,
-                tags: vec!["work".into(), "vip".into()],
-                created_at: 1_700_000_000,
-                updated_at: 1_700_000_100,
-            },
+        id: Some(1),
+        template_id: "password".into(),
+        title: "GitHub".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "username".into(), value: "alice".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "password".into(), value: "p,ass\"word".into(), kind: FieldKind::Secret, protected: true },
+                Field { name: "url".into(), value: "https://github.com".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "totp".into(), value: "JBSWY3DPEHPK3PXP".into(), kind: FieldKind::Totp, protected: true },
+                Field { name: "notes".into(), value: "main\nline2".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: true,
+        tags: vec!["work".into(), "vip".into()],
+        created_at: 1_700_000_000,
+        updated_at: 1_700_000_100,
+    },
             Item {
-                id: Some(2),
-                item_type: ItemType::Note,
-                title: "Ideas".into(),
-                category_id: None,
-                data: ItemData::Note {
-                    format: "markdown".into(),
-                    content: "hello".into(),
-                },
-                favorite: false,
-                tags: vec![],
-                created_at: 0,
-                updated_at: 0,
-            },
+        id: Some(2),
+        template_id: "note".into(),
+        title: "Ideas".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "format".into(), value: "markdown".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "content".into(), value: "hello".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec![],
+        created_at: 0,
+        updated_at: 0,
+    },
             Item {
-                id: Some(3),
-                item_type: ItemType::Password,
-                title: "Bank".into(),
-                category_id: None,
-                data: ItemData::Password {
-                    username: "bob".into(),
-                    password: "plain".into(),
-                    url: "".into(),
-                    totp_secret: "".into(),
-                    notes: "".into(),
-                },
-                favorite: false,
-                tags: vec!["finance".into()],
-                created_at: 0,
-                updated_at: 0,
-            },
+        id: Some(3),
+        template_id: "password".into(),
+        title: "Bank".into(),
+        category_id: None,
+        fields: vec![
+                Field { name: "username".into(), value: "bob".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "password".into(), value: "plain".into(), kind: FieldKind::Secret, protected: true },
+                Field { name: "url".into(), value: "".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "totp".into(), value: "".into(), kind: FieldKind::Totp, protected: true },
+                Field { name: "notes".into(), value: "".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+        favorite: false,
+        tags: vec!["finance".into()],
+        created_at: 0,
+        updated_at: 0,
+    },
         ]
     }
 
@@ -2736,8 +2714,8 @@ mod tests {
         // 字段逐一对比(id 也保留)。
         for (a, b) in items.iter().zip(back.iter()) {
             assert_eq!(a.title, b.title);
-            assert_eq!(a.item_type, b.item_type);
-            assert_eq!(a.data, b.data);
+            assert_eq!(a.template_id, b.template_id);
+            assert_eq!(a.fields, b.fields);
             assert_eq!(a.tags, b.tags);
             assert_eq!(a.favorite, b.favorite);
         }
@@ -2779,7 +2757,7 @@ mod tests {
         assert_eq!(fail, 0);
         // 只导出了 2 个 password。
         assert_eq!(back.len(), 2);
-        assert!(back.iter().all(|i| i.item_type == ItemType::Password));
+        assert!(back.iter().all(|i| i.template_id == "password"));
 
         // GitHub 行字段一致(含特殊字符)。
         let gh = back.iter().find(|i| i.title == "GitHub").unwrap();
@@ -2852,7 +2830,7 @@ mod tests {
         let dst = store::list_items(u2.db.conn()).unwrap();
         assert_eq!(dst.len(), 2);
         let gh = dst.iter().find(|i| i.title == "GitHub").unwrap();
-        assert_eq!(gh.item_type, ItemType::Password);
+        assert_eq!(gh.template_id, "password");
         assert_eq!(item_field(gh, "username").unwrap(), "alice");
         assert_eq!(gh.tags, vec!["vip".to_string(), "work".to_string()]);
 
@@ -3021,7 +2999,7 @@ mod tests {
         // --data 里 totp_secret 占位为空,--otpauth 应覆盖。
         let data = r#"{"type":"password","username":"bob","password":"pw","url":"https://x","totp_secret":"","notes":""}"#;
         let uri = "otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example";
-        let id = run_add(&u, "Totp", data, vec![], false, None, Some(uri)).unwrap();
+        let id = run_add(&u, "Totp", "password", Some(data), &EditFields::default(), vec![], false, None, Some(uri)).unwrap();
         let got = store::get_item(u.db.conn(), id).unwrap().unwrap();
         assert_eq!(item_field(&got, "totp").unwrap(), "JBSWY3DPEHPK3PXP");
         // 覆盖的 secret 能直接生成 TOTP。
@@ -3036,7 +3014,7 @@ mod tests {
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         let data = r#"{"type":"note","format":"text","content":"hi"}"#;
         let uri = "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP";
-        let err = run_add(&u, "N", data, vec![], false, None, Some(uri));
+        let err = run_add(&u, "N", "password", Some(data), &EditFields::default(), vec![], false, None, Some(uri));
         assert!(matches!(err, Err(Error::Other(m)) if m.contains("--otpauth")));
         cleanup(&p);
     }
@@ -3049,7 +3027,7 @@ mod tests {
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         let data = r#"{"type":"password","username":"bob","password":"old","url":"","totp_secret":"","notes":""}"#;
         let uri = "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP";
-        let id = run_add(&u, "Both", data, vec![], false, Some(12), Some(uri)).unwrap();
+        let id = run_add(&u, "Both", "password", Some(data), &EditFields::default(), vec![], false, Some(12), Some(uri)).unwrap();
         let got = store::get_item(u.db.conn(), id).unwrap().unwrap();
         let pw = item_field(&got, "password").unwrap();
         assert_eq!(pw.len(), 12);
@@ -3087,70 +3065,43 @@ mod tests {
 
     #[test]
     fn edit_fields_apply_password() {
-        let mut data = ItemData::Password {
-            username: "u".into(),
-            password: "p".into(),
-            url: "".into(),
-            totp_secret: "".into(),
-            notes: "".into(),
-        };
-        let f = EditFields {
-            username: Some("bob".into()),
-            url: Some("https://y".into()),
-            ..Default::default()
-        };
-        assert!(f.apply(&mut data));
-        match data {
-            ItemData::Password {
-                username, url, ..
-            } => {
-                assert_eq!(username, "bob");
-                assert_eq!(url, "https://y");
-            }
-            _ => panic!("still password"),
-        }
+        let mut item = mk_password_item("u", "p");
+        let f = EditFields { sets: vec![("username".into(), "bob".into()), ("url".into(), "https://y".into())] };
+        assert!(f.apply(&mut item));
+        assert_eq!(item_field(&item, "username").unwrap(), "bob");
+        assert_eq!(item_field(&item, "url").unwrap(), "https://y");
     }
 
     #[test]
     fn edit_fields_apply_note_content() {
-        let mut data = ItemData::Note {
-            format: "text".into(),
-            content: "old".into(),
-        };
-        let f = EditFields {
-            content: Some("new body".into()),
-            ..Default::default()
-        };
-        assert!(f.apply(&mut data));
-        match data {
-            ItemData::Note { content, .. } => assert_eq!(content, "new body"),
-            _ => panic!("still note"),
-        }
+        let mut item = mk_item(
+            "note",
+            "",
+            &[("format", "text", FieldKind::Text), ("content", "old", FieldKind::Multiline)],
+        );
+        let f = EditFields { sets: vec![("content".into(), "new body".into())] };
+        assert!(f.apply(&mut item));
+        assert_eq!(item_field(&item, "content").unwrap(), "new body");
     }
 
     #[test]
     fn edit_fields_apply_card_fields() {
-        let mut data = ItemData::Card {
-            holder: "h".into(),
-            number: "n".into(),
-            expiry: "e".into(),
-            cvv: "c".into(),
-            bank: "b".into(),
-            notes: "".into(),
-        };
-        let f = EditFields {
-            holder: Some("HH".into()),
-            cvv: Some("999".into()),
-            ..Default::default()
-        };
-        assert!(f.apply(&mut data));
-        match data {
-            ItemData::Card { holder, cvv, .. } => {
-                assert_eq!(holder, "HH");
-                assert_eq!(cvv, "999");
-            }
-            _ => panic!("still card"),
-        }
+        let mut item = mk_item(
+            "card",
+            "",
+            &[
+                ("holder", "h", FieldKind::Text),
+                ("number", "n", FieldKind::Secret),
+                ("expiry", "e", FieldKind::Text),
+                ("cvv", "c", FieldKind::Secret),
+                ("bank", "b", FieldKind::Text),
+                ("notes", "", FieldKind::Multiline),
+            ],
+        );
+        let f = EditFields { sets: vec![("holder".into(), "HH".into()), ("cvv".into(), "999".into())] };
+        assert!(f.apply(&mut item));
+        assert_eq!(item_field(&item, "holder").unwrap(), "HH");
+        assert_eq!(item_field(&item, "cvv").unwrap(), "999");
     }
 
     #[test]
@@ -3158,10 +3109,7 @@ mod tests {
         let p = make_vault("editfield");
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
-        let f = EditFields {
-            username: Some("bob".into()),
-            ..Default::default()
-        };
+        let f = EditFields { sets: vec![("username".into(), "bob".into())] };
         run_edit(
             &u,
             1,
@@ -3187,10 +3135,7 @@ mod tests {
         let p = make_vault("editconf");
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
-        let f = EditFields {
-            username: Some("bob".into()),
-            ..Default::default()
-        };
+        let f = EditFields { sets: vec![("username".into(), "bob".into())] };
         let err = run_edit(
             &u,
             1,
@@ -3325,7 +3270,7 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         let data = r#"{"type":"password","username":"x","password":"p","url":"","totp_secret":"","notes":""}"#;
-        let _id1 = run_add(&u, "GitLab", data, vec![], false, None, None).unwrap();
+        let _id1 = run_add(&u, "GitLab", "password", Some(data), &EditFields::default(), vec![], false, None, None).unwrap();
         let conn = u.db.conn();
         // 现在 Git* 有 GitHub + GitLab → 歧义。
         let err = find_item_id_by_title(conn, "Git");

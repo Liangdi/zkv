@@ -8,8 +8,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::theme;
-use crate::app::{App, DataField, Field};
-use crate::model::{Item, ItemData, ItemType};
+use crate::app::{App, Cursor};
+use crate::model::{template_display_name, FieldKind, Item};
 
 /// 渲染右栏。
 pub fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
@@ -99,59 +99,33 @@ fn attachment_summary(app: &App, item_id: i64) -> Vec<(String, i64)> {
     }
 }
 
-/// 只读视图的字段行。
+/// 只读视图的字段行。按 `kind` 渲染每个字段:Text/Multiline→普通,Secret→掩码,Totp→验证码。
 fn view_lines(item: &Item) -> Vec<ratatui::text::Line<'static>> {
     let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
-    lines.push(field_view("Type", type_str(item.item_type)));
+    lines.push(field_view("Type", &template_display_name(&item.template_id)));
     lines.push(blank());
-    match &item.data {
-        ItemData::Password {
-            username,
-            password,
-            url,
-            totp_secret,
-            notes,
-        } => {
-            lines.push(field_view("Username", username));
-            lines.push(password_view(password));
-            lines.push(field_view("URL", url));
-            lines.push(totp_code_line(totp_secret));
-            lines.push(blank());
-            lines.push(field_view("Notes", notes));
-        }
-        ItemData::Note { format, content } => {
-            lines.push(field_view("Format", format));
-            lines.push(blank());
-            if content.is_empty() {
-                lines.push(ratatui::text::Line::from("(empty)").style(theme::muted()));
-            } else {
-                for ln in content.lines() {
-                    lines.push(ratatui::text::Line::from(ln.to_string()).style(theme::fg()));
+    for f in &item.fields {
+        match f.kind {
+            FieldKind::Totp => lines.push(totp_code_line_labeled(&f.name, &f.value)),
+            FieldKind::Secret => lines.push(secret_view(&f.name, &f.value)),
+            FieldKind::Multiline => {
+                lines.push(blank());
+                if f.value.is_empty() {
+                    lines.push(ratatui::text::Line::from("(empty)").style(theme::muted()));
+                } else {
+                    for ln in f.value.lines() {
+                        lines.push(ratatui::text::Line::from(ln.to_string()).style(theme::fg()));
+                    }
                 }
             }
-        }
-        ItemData::Card {
-            holder,
-            number,
-            expiry,
-            cvv,
-            bank,
-            notes,
-        } => {
-            lines.push(field_view("Holder", holder));
-            lines.push(secret_view("Number", number));
-            lines.push(field_view("Expiry", expiry));
-            lines.push(secret_view("CVV", cvv));
-            lines.push(field_view("Bank", bank));
-            lines.push(blank());
-            lines.push(field_view("Notes", notes));
+            FieldKind::Text => lines.push(field_view(&f.name, &f.value)),
         }
     }
     lines
 }
 
 /// 编辑器视图:把 draft 渲染为表单,当前字段用高亮 + `▍` 光标标记。
-fn render_editor(frame: &mut Frame, area: Rect, draft: &Item, field: &Field) {
+fn render_editor(frame: &mut Frame, area: Rect, draft: &Item, field: &Cursor) {
     let inner = theme::panel_frame(frame, area, Some("Editor · Tab/Enter/Esc"));
 
     let rows = editor_rows(draft, field);
@@ -159,98 +133,23 @@ fn render_editor(frame: &mut Frame, area: Rect, draft: &Item, field: &Field) {
     frame.render_widget(p, inner);
 }
 
-fn editor_rows(draft: &Item, field: &Field) -> Vec<ratatui::text::Line<'static>> {
+fn editor_rows(draft: &Item, field: &Cursor) -> Vec<ratatui::text::Line<'static>> {
     let mut rows = Vec::new();
-    rows.push(field_line("Title", &draft.title, field, &Field::Title));
-
-    match (&draft.data, draft.item_type) {
-        (
-            ItemData::Password {
-                username,
-                password,
-                url,
-                totp_secret,
-                notes,
-            },
-            ItemType::Password,
-        ) => {
-            rows.push(field_line(
-                "Username",
-                username,
-                field,
-                &Field::Data(DataField::Username),
-            ));
-            rows.push(field_line_mask(
-                "Password",
-                password,
-                field,
-                &Field::Data(DataField::Password),
-            ));
-            rows.push(field_line("URL", url, field, &Field::Data(DataField::Url)));
-            rows.push(field_line_mask(
-                "TOTP",
-                totp_secret,
-                field,
-                &Field::Data(DataField::TotpSecret),
-            ));
-            rows.push(field_line("Notes", notes, field, &Field::Data(DataField::Notes)));
-        }
-        (ItemData::Note { format, content }, ItemType::Note) => {
-            rows.push(field_line(
-                "Format",
-                format,
-                field,
-                &Field::Data(DataField::Format),
-            ));
-            rows.push(field_line(
-                "Content",
-                content,
-                field,
-                &Field::Data(DataField::Content),
-            ));
-        }
-        (
-            ItemData::Card {
-                holder,
-                number,
-                expiry,
-                cvv,
-                bank,
-                notes,
-            },
-            ItemType::Card,
-        ) => {
-            rows.push(field_line(
-                "Holder",
-                holder,
-                field,
-                &Field::Data(DataField::Holder),
-            ));
-            rows.push(field_line_mask(
-                "Number",
-                number,
-                field,
-                &Field::Data(DataField::Number),
-            ));
-            rows.push(field_line(
-                "Expiry",
-                expiry,
-                field,
-                &Field::Data(DataField::Expiry),
-            ));
-            rows.push(field_line_mask("CVV", cvv, field, &Field::Data(DataField::Cvv)));
-            rows.push(field_line("Bank", bank, field, &Field::Data(DataField::Bank)));
-            rows.push(field_line("Notes", notes, field, &Field::Data(DataField::Notes)));
-        }
-        _ => {
-            rows.push(ratatui::text::Line::from("(type/data mismatch)").style(theme::error()));
+    rows.push(field_line("Title", &draft.title, field, &Cursor::Title));
+    for (i, f) in draft.fields.iter().enumerate() {
+        let cur = Cursor::Field(i);
+        match f.kind {
+            FieldKind::Secret | FieldKind::Totp => {
+                rows.push(field_line_mask(&f.name, &f.value, field, &cur));
+            }
+            _ => rows.push(field_line(&f.name, &f.value, field, &cur)),
         }
     }
     rows
 }
 
 /// 构造一行:label(青、定宽 10) + value;当前字段 == this 则高亮并加光标标记。
-fn field_line(label: &str, value: &str, cur: &Field, this: &Field) -> ratatui::text::Line<'static> {
+fn field_line(label: &str, value: &str, cur: &Cursor, this: &Cursor) -> ratatui::text::Line<'static> {
     let active = cur == this;
     let body = if active {
         format!("▍{value}")
@@ -274,7 +173,7 @@ fn field_line(label: &str, value: &str, cur: &Field, this: &Field) -> ratatui::t
 }
 
 /// 同上,但 value 以掩码展示(密码类字段)。
-fn field_line_mask(label: &str, value: &str, cur: &Field, this: &Field) -> ratatui::text::Line<'static> {
+fn field_line_mask(label: &str, value: &str, cur: &Cursor, this: &Cursor) -> ratatui::text::Line<'static> {
     let masked = mask(value);
     field_line(label, &masked, cur, this)
 }
@@ -313,36 +212,27 @@ fn secret_view(label: &str, value: &str) -> ratatui::text::Line<'static> {
     ])
 }
 
-/// 密码字段:掩码圆点 + `[y] copy` 提示。
-fn password_view(password: &str) -> ratatui::text::Line<'static> {
-    let mut spans = vec![
-        ratatui::text::Span::styled(format!("{:<10}", "Password"), theme::accent2()),
-        ratatui::text::Span::raw(": "),
-    ];
-    if password.is_empty() {
-        spans.push(ratatui::text::Span::styled("—", theme::muted()));
-    } else {
-        spans.push(ratatui::text::Span::styled(mask(password), theme::accent()));
-        spans.push(ratatui::text::Span::styled("   [y] copy", theme::accent2()));
-    }
-    ratatui::text::Line::from(spans)
+/// 给定 totp secret(可能为空/非法),返回详情页 TOTP 行的渲染文本与样式。
+///
+/// - 空 secret → `<label> : —`(弱化)。
+/// - 合法 secret → `<label> : <code>  (~Ns)`,code 用强调色,剩余秒用弱化色。
+/// - 非法 secret → `<label> : (invalid)`,错误色。
+///
+/// label 用次强调(accent2),定宽 10 + `: ` 拼接风格。
+#[cfg(test)]
+fn totp_code_line(secret: &str) -> ratatui::text::Line<'static> {
+    totp_code_line_labeled("TOTP", secret)
 }
 
-/// 给定 totp_secret(可能为空/非法),返回详情页 TOTP 行的渲染文本与样式。
-///
-/// - 空 secret → `TOTP      : —`(弱化)。
-/// - 合法 secret → `TOTP      : <code>  (~Ns)`,code 用强调色,剩余秒用弱化色。
-/// - 非法 secret → `TOTP      : (invalid)`,错误色。
-///
-/// label `TOTP` 用次强调(accent2),与其它字段保持定宽 10 + `: ` 拼接风格。
-fn totp_code_line(totp_secret: &str) -> ratatui::text::Line<'static> {
+/// 同 [`totp_code_line`],但用自定义 label(字段名)。
+fn totp_code_line_labeled(label: &str, secret: &str) -> ratatui::text::Line<'static> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let label = ratatui::text::Span::styled(format!("{:<10}", "TOTP"), theme::accent2());
+    let label = ratatui::text::Span::styled(format!("{:<10}", label), theme::accent2());
     let sep = ratatui::text::Span::raw(": ");
 
     // 空 secret:弱化破折号。
-    if totp_secret.is_empty() {
+    if secret.is_empty() {
         return ratatui::text::Line::from(vec![
             label,
             sep,
@@ -355,7 +245,7 @@ fn totp_code_line(totp_secret: &str) -> ratatui::text::Line<'static> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    match crate::totp::totp_at(totp_secret, now) {
+    match crate::totp::totp_at(secret, now) {
         Ok(code) => {
             let remaining = 30 - (now % 30);
             ratatui::text::Line::from(vec![
@@ -380,15 +270,6 @@ fn mask(s: &str) -> String {
         String::new()
     } else {
         "•".repeat(s.chars().count())
-    }
-}
-
-
-fn type_str(t: ItemType) -> &'static str {
-    match t {
-        ItemType::Password => "Password",
-        ItemType::Note => "Note",
-        ItemType::Card => "Card",
     }
 }
 

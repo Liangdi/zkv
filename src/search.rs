@@ -13,7 +13,7 @@
 use rusqlite::{types::Value, Connection};
 
 use crate::error::Result;
-use crate::model::{Item, ItemType};
+use crate::model::Item;
 use crate::store::row_to_item_with_tags;
 
 /// 搜索过滤条件。全部字段可组合;`Default` 表示「无任何过滤」。
@@ -25,8 +25,8 @@ pub struct Filter {
     pub category: Option<i64>,
     /// 仅返回挂有这些标签中任意一个的条目。
     pub tags: Vec<String>,
-    /// 仅返回该类型的条目。
-    pub item_type: Option<ItemType>,
+    /// 仅返回该模板 id(`items.type` 列)的条目。
+    pub template_id: Option<String>,
     /// 仅返回收藏条目。
     pub favorite_only: bool,
 }
@@ -86,9 +86,9 @@ pub fn search(conn: &Connection, f: &Filter) -> Result<Vec<Item>> {
         bind_params.push(Value::from(cat));
     }
 
-    if let Some(ty) = f.item_type {
+    if let Some(tpl) = &f.template_id {
         where_clauses.push("i.type = ?".to_string());
-        bind_params.push(Value::from(ty.as_str().to_string()));
+        bind_params.push(Value::from(tpl.clone()));
     }
 
     if f.favorite_only {
@@ -134,27 +134,25 @@ pub fn search(conn: &Connection, f: &Filter) -> Result<Vec<Item>> {
 mod tests {
     use super::*;
     use crate::db::Database;
-    use crate::model::{Item, ItemData, ItemType};
+    use crate::model::{FieldKind, Item};
     use crate::store;
+    use crate::test_support::mk_item;
 
     fn make_password(title: &str, body: &str, tags: Vec<&str>, favorite: bool) -> Item {
-        Item {
-            id: None,
-            item_type: ItemType::Password,
-            title: title.into(),
-            category_id: None,
-            data: ItemData::Password {
-                username: "u".into(),
-                password: "p".into(),
-                url: "https://x".into(),
-                totp_secret: body.into(),
-                notes: body.into(),
-            },
-            favorite,
-            tags: tags.into_iter().map(String::from).collect(),
-            created_at: 0,
-            updated_at: 0,
-        }
+        let mut it = mk_item(
+            "password",
+            title,
+            &[
+                ("username", "u", FieldKind::Text),
+                ("password", "p", FieldKind::Secret),
+                ("url", "https://x", FieldKind::Text),
+                ("totp", body, FieldKind::Totp),
+                ("notes", body, FieldKind::Multiline),
+            ],
+        );
+        it.favorite = favorite;
+        it.tags = tags.into_iter().map(String::from).collect();
+        it
     }
 
     fn seed() -> Database {
@@ -178,20 +176,15 @@ mod tests {
         b.category_id = Some(cid);
         store::insert_item(conn, &mut b).unwrap();
 
-        let mut c = Item {
-            id: None,
-            item_type: ItemType::Note,
-            title: "Personal Diary".into(),
-            category_id: None,
-            data: ItemData::Note {
-                format: "markdown".into(),
-                content: "today was a good day".into(),
-            },
-            favorite: false,
-            tags: vec!["personal".into()],
-            created_at: 0,
-            updated_at: 0,
-        };
+        let mut c = mk_item(
+            "note",
+            "Personal Diary",
+            &[
+                ("format", "markdown", FieldKind::Text),
+                ("content", "today was a good day", FieldKind::Multiline),
+            ],
+        );
+        c.tags = vec!["personal".into()];
         store::insert_item(conn, &mut c).unwrap();
 
         db
@@ -285,19 +278,38 @@ mod tests {
     }
 
     #[test]
-    fn filter_by_item_type() {
+    fn filter_by_template_id() {
         let db = seed();
         let conn = db.conn();
         let notes = search(
             conn,
             &Filter {
-                item_type: Some(ItemType::Note),
+                template_id: Some("note".into()),
                 ..Default::default()
             },
         )
         .unwrap();
         assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].item_type, ItemType::Note);
+        assert_eq!(notes[0].template_id, "note");
+    }
+
+    #[test]
+    fn fts_does_not_match_secret_values() {
+        // Secret 字段(password/totp 的实际值)不入 search_text,FTS 不应命中。
+        let db = seed();
+        let conn = db.conn();
+        // "s3cret" 不是任何明文值;这里用 GitLab 的 notes 值 "gitlab secret"(Multiline,可搜)。
+        // 关键回归:password 字段值 "p"(Secret)不应被 FTS 命中 —— 用一个只可能来自 Secret 的 token。
+        let hits = search(
+            conn,
+            &Filter {
+                query: Some("p".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // "p" 是所有 password 条目的 Secret password 值 → 不应命中。
+        assert!(hits.is_empty(), "Secret 值不应进入 FTS: {:?}", hits);
     }
 
     #[test]

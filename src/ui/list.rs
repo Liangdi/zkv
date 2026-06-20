@@ -1,7 +1,7 @@
 //! 列表视图:条目列表(含搜索框)。对应 PRD §8。
 //!
 //! 重排后不再有常驻侧边栏;分类/标签计数折进 header,管理走 `c`/`t` 模态。
-//! 列表项两行:第 1 行类型标签 + 标题,第 2 行次要信息(用户名/预览/持卡人)。
+//! 列表项两行:第 1 行类型标签 + 标题,第 2 行次要信息(用户名/预览)。
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
@@ -10,7 +10,7 @@ use ratatui::Frame;
 use super::input;
 use super::theme;
 use crate::app::App;
-use crate::model::{Item, ItemData, ItemType};
+use crate::model::{FieldKind, Item};
 
 /// 渲染条目列表(Search 模式时顶部叠搜索框)。
 pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
@@ -47,7 +47,7 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             // 第 1 行:留 2 列给选中标记 "▸ ";类型标签 + 标题。
             let l1 = ratatui::text::Line::from(vec![
                 ratatui::text::Span::raw("  "),
-                type_span(it.item_type),
+                type_span(&it.template_id),
                 ratatui::text::Span::raw(" "),
                 ratatui::text::Span::styled(it.title.clone(), theme::fg()),
             ]);
@@ -71,40 +71,36 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
-/// 类型 → 配色标签 span(PW=青、NO=绿、CD=品红)。
-fn type_span(ty: ItemType) -> ratatui::text::Span<'static> {
-    let (label, style) = match ty {
-        ItemType::Password => ("[PW]", theme::accent2()),
-        ItemType::Note => ("[NO]", theme::accent()),
-        ItemType::Card => ("[CD]", theme::title_style()),
+/// 模板 id → 配色标签 span。password/note/card 保留旧配色;其余用通用 `[…]` 标签。
+fn type_span(template_id: &str) -> ratatui::text::Span<'static> {
+    let (label, style) = match template_id {
+        "password" => ("[PW]", theme::accent2()),
+        "note" => ("[NO]", theme::accent()),
+        "card" => ("[CD]", theme::title_style()),
+        _ => ("[··]", theme::muted()),
     };
     ratatui::text::Span::styled(label, style)
 }
 
-/// 条目的次要信息:密码→用户名、笔记→内容预览、卡片→持卡人。
+/// 条目的次要信息:取 `username` 字段值;否则首个 Text 字段预览;否则标题。
 fn secondary(it: &Item) -> String {
-    match &it.data {
-        ItemData::Password { username, .. } => {
-            if username.is_empty() {
-                "—".into()
-            } else {
-                username.clone()
-            }
+    // username 字段优先。
+    if let Some(v) = it.field_value("username") {
+        if !v.is_empty() {
+            return v.to_string();
         }
-        ItemData::Note { content, .. } => {
-            let first = content.lines().next().unwrap_or("");
-            if first.is_empty() {
-                "(empty)".into()
-            } else {
-                first.chars().take(24).collect()
-            }
+    }
+    // 否则取首个 Text 字段(取首行预览)。
+    if let Some(f) = it.fields.iter().find(|f| f.kind == FieldKind::Text) {
+        let first = f.value.lines().next().unwrap_or("");
+        if !first.is_empty() {
+            return first.chars().take(24).collect();
         }
-        ItemData::Card { holder, .. } => {
-            if holder.is_empty() {
-                "—".into()
-            } else {
-                format!("•••• {holder}")
-            }
-        }
+    }
+    // 都没有 → 标题。
+    if it.title.is_empty() {
+        "(empty)".into()
+    } else {
+        it.title.clone()
     }
 }

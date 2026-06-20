@@ -172,6 +172,7 @@ fn draw(frame: &mut Frame, app: &App) {
     // 叠加模态
     match app.mode {
         Mode::ConfirmDelete => draw_confirm_delete(frame, app),
+        Mode::PickTemplate => draw_pick_template(frame, app),
         Mode::CategoryMgr => draw_category_mgr(frame, app),
         Mode::TagMgr => draw_tag_mgr(frame, app),
         Mode::Attachments => draw_attachments(frame, app),
@@ -231,6 +232,23 @@ fn draw_confirm_delete(frame: &mut Frame, app: &App) {
 }
 
 /// 分类管理面板。
+/// 模板选择面板(`n` 新建时挑选预设模板;j/k 选,Enter 进编辑器)。
+fn draw_pick_template(frame: &mut Frame, app: &App) {
+    let entries: Vec<String> = crate::model::builtin_templates()
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    draw_mgr(
+        frame,
+        app,
+        "New Item · Pick Template",
+        &entries,
+        app.tpl_selected,
+        "j/k select  Enter confirm  Esc back",
+        "(no templates)",
+    );
+}
+
 fn draw_category_mgr(frame: &mut Frame, app: &App) {
     let entries: Vec<String> = app
         .categories
