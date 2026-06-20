@@ -6,8 +6,8 @@
 ## 当前状态
 
 - **阶段**:✅ **MVP 完成**(SA1–SA6 全部交付,端到端验证通过)
-- **最后更新**:2026-06-18
-- **验证**:`cargo build` / `cargo test`(59 passed, +1 ignored)/ `cargo build --release` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过。
+- **最后更新**:2026-06-20
+- **验证**:`cargo build` / `cargo test`(59 passed, +1 ignored)/ `cargo build --release` / `cargo clippy --all-targets` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过。
 
 ## 使用方法
 
@@ -21,11 +21,11 @@ TUI 快捷键:`n` 新建 · `e` 编辑 · `x` 删除 · `/` 搜索 · `y` 复制
 ## 关键决策记录
 
 1. 加密:Argon2id(m=64MiB, t=3, p=4, salt=16B)+ XChaCha20-Poly1305(key=32B, nonce=24B, tag=16B)。
-2. 加密粒度:整库加密;解锁 = 解密 → 内存 SQLite(`:memory:`);保存 = dump → 加密 → 原子写回。
+2. 加密粒度:整库加密;解锁 = 解密 → 内存 SQLite(`:memory:`);保存 = dump → 加密(**复用解锁时派生并缓存的 `MasterKey`/salt,不再每次重跑 Argon2id**)→ 原子写回。
 3. 数据模型:统一 `items` + JSON `data`;三类 password/note/card;FTS5 全文搜索 + 分类/标签过滤。
 4. UI 主题:`ratatui-sci-fi` 0.2.0(默认 Cyberpunk;8 主题 Palette),作者即 Liangdi。
 5. MVC:App(L4)= Model+Controller;UI(L5)= View(只读 App pub 状态 + 转发 `KeyEvent`)。
-6. 安全:忘口令不可恢复;复制密码 20s 清空;`from_bytes` 用 backup 灌入真 `:memory:`(明文不落盘);`.zkv` 与临时文件均 0600。
+6. 安全:忘口令不可恢复;复制密码 20s 清空;`from_bytes` 用 backup 灌入真 `:memory:`(明文不落盘);`.zkv` 与临时文件均 0600,临时文件名取自 CSPRNG(不可预测);`MasterKey` 以 `ZeroizeOnDrop` 缓存于 App,`lock()` 即清零,App 不再驻留明文口令。
 
 ## 模块架构与分层依赖
 
@@ -87,3 +87,10 @@ src/
 - **2026-06-18** 截图脚本(`tests/screenshot.py`,`just shots`):改用**真终端渲染**——PTY 采集 zkv 原始 ANSI 流 → 在 Xvfb 里 `cat` 进真 `xterm`(Source Code Pro、深底)→ `xdotool`+`import` 按窗口截 PNG。取代之前的 pyte+Pillow 近似(字体/行高/抗锯齿/背景都对不上真终端)。依赖 `Xvfb`/`xterm`/`xdotool`/`ImageMagick`。**顺带暴露并修复**口令模态在 80×24 下高度不足(`centered_rect` 20%→40%→50%)导致口令输入框被布局压扁挤没的 bug([src/ui/mod.rs](../src/ui/mod.rs))。
 - **2026-06-18** UI 重排(纯 View 层):浏览态改为 **header(品牌·消息·`N items · unlocked`)+ 两栏(list/detail,留缝)+ footer 键位栏**;列表项两行(配色类型标签 `[PW]`青/`[NO]`绿/`[CD]`品红 + 标题 + 弱化次要信息);Detail 动态标题、定宽标签列、密码掩码圆点、空值 `—` 占位、`[y] copy` 提示;移除常驻侧边栏(分类/标签计数折进 header,管理仍走 `c`/`t` 模态)。状态机/键位/加密零改动;`cargo test` 59 passed、`just e2e` 6/6。
 - **2026-06-18** UI 科幻化:启用自家的 `ratatui-sci-fi` `Panel` 组件——list/detail/编辑器/口令模态全部换成**圆角霓虹面板**(主题级边框 + 1 内边距 + 级联标题),口令框内嵌圆角输入盒,小模态与输入框统一圆角;header 加 `●` 状态点。边框形态集中在 [theme.rs](../src/ui/theme.rs) 的 `PANEL_SHAPE` 常量(改一处可切 Rounded/Double/Thick)。`cargo test` 59、`just e2e` 6/6、`just shots` 7 张更新。
+- **2026-06-20** 性能与加固优化(`cargo clippy --all-targets` 0 warning):
+  - **缓存 MasterKey**(性能,主修复):[app.rs](../src/app.rs) 在 `unlock` 后缓存派生出的 `MasterKey`/salt/kdf,`save()` 只做 AEAD,不再每次新建/编辑/删除条目都重跑 64MiB/3/4 的 Argon2id(原每次 ~0.3–1s)。`lock()` 清零缓存的 key;**移除 `passphrase` 字段,App 不再驻留明文口令**。新增 [vault.rs](../src/vault.rs) `unlock_full`(返回 db+key+salt+kdf)与 `save_with_key`(仅 AEAD,不派生、不重读文件);`kdf` 一并回写文件头以保持解锁闭环一致。
+  - **消除 N+1 标签查询**:[store.rs](../src/store.rs) `list_items` 与 [search.rs](../src/search.rs) `search` 改为单条 SQL + `GROUP_CONCAT`(`char(31)` 分隔)相关子查询一次性聚合标签,删除 per-item 的 `fill_tags` 循环(`get_item` 仍用,单条 O(1))。
+  - **缓存剪贴板后端**:[clipboard.rs](../src/clipboard.rs) 用 `OnceLock` 缓存首次探测结果,`copy()` 不再每次 spawn 探测进程(清空线程也复用缓存)。
+  - **临时文件加固 + 写入持久性**:[db.rs](../src/db.rs) 临时文件名改用 `getrandom` CSPRNG(原为可预测的纳秒+计数器);[vault.rs](../src/vault.rs) 原子 `rename` 后 fsync 父目录(Unix,best-effort;崩溃不丢重命名)。
+  - **clippy 清扫(8→0)**:`single_match` ×3、`map_identity`、`op_ref`、`doc_nested_refdefs` ×2、`should_implement_trait`(`ItemType::from_str` 固有方法 → `std::str::FromStr` trait;UFCS 调用点不变)。
+  - 验证:`cargo build` / `cargo test`(59 passed)/ `cargo clippy --all-targets` 全绿、0 warning。
