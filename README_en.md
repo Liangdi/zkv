@@ -7,7 +7,7 @@ English | [中文](README.md)
 ![Rust](https://img.shields.io/badge/Rust-edition%202024-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-green)
-![Tests](https://img.shields.io/badge/tests-176%20passed-success)
+![Tests](https://img.shields.io/badge/tests-196%20passed-success)
 
 A terminal-based manager for passwords / notes / cards with a sci-fi TUI ([ratatui-sci-fi](https://crates.io/crates/ratatui-sci-fi) Cyberpunk theme). All data is encrypted at rest with **Argon2id + XChaCha20-Poly1305**; ships with a fully **scriptable, TTY-free headless CLI**.
 
@@ -22,6 +22,7 @@ A terminal-based manager for passwords / notes / cards with a sci-fi TUI ([ratat
 - 🏷️ **Categories & tags** — Hierarchical categories + many-to-many tags + favorites, freely combinable.
 - 🖼️ **Embedded attachments** — Images / documents are stored inside the database and encrypted with it.
 - 🔢 **TOTP codes** — Store 2FA secrets and generate live 6-digit codes (RFC 6238).
+- 🧩 **Field templates** — Generic field/template model with 8 built-in presets (password/note/card/wifi/bank/ssh/identity/email); fields are typed (Text/Secret/Multiline/TOTP) and drive rendering/copying; old vaults auto-migrate.
 - 🎲 **Password generation** — CSPRNG strong passwords (configurable length / symbols / ambiguous chars).
 - 💻 **Headless CLI** — Fully scriptable, no TTY required; passphrase from env var / file / prompt.
 - 🔁 **Import / export** — Lossless JSON round-trip, or flat CSV (passwords), for migration and backup.
@@ -169,7 +170,7 @@ cargo build --release  # release build
 - [x] Category / tag add-rename-delete (CLI + TUI)
 - [x] Import / export (JSON / CSV)
 - [x] TOTP codes + headless CLI + idle auto-lock
-- [ ] Custom field templates
+- [x] Field templates (8 built-in presets + generic field model; custom-template CRUD is a follow-up)
 - [ ] KeePass import / export
 - [ ] Per-page encryption for very large vaults (on demand: ~50–200ms per save under 100MB today; see [PROGRESS.md](docs/PROGRESS.md) 2026-06-21 decision)
 - [x] Windows clipboard backend (PowerShell `Set-Clipboard`, via stdin, UTF-8)

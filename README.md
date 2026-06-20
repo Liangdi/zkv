@@ -7,7 +7,7 @@
 ![Rust](https://img.shields.io/badge/Rust-edition%202024-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-green)
-![Tests](https://img.shields.io/badge/tests-176%20passed-success)
+![Tests](https://img.shields.io/badge/tests-196%20passed-success)
 
 一个跑在终端里的密码 / 笔记 / 卡片管理器,采用科幻风 TUI([ratatui-sci-fi](https://crates.io/crates/ratatui-sci-fi) Cyberpunk 主题),所有数据经 **Argon2id + XChaCha20-Poly1305** 整库加密;并附带一套**可脚本化、无需 TTY 的无头 CLI**。
 
@@ -22,6 +22,7 @@
 - 🏷️ **分类与标签** — 树状分类 + 多对多标签 + 收藏,任意组合过滤。
 - 🖼️ **附件内嵌** — 图片 / 电子档直接存入数据库,随库加密。
 - 🔢 **TOTP 验证码** — 存储 2FA 密钥并实时生成 6 位验证码(RFC 6238)。
+- 🧩 **字段模板** — 通用字段/模板模型,8 内置预设(密码/笔记/卡片/Wi-Fi/银行/SSH/身份/邮箱),字段按类型(Text/Secret/Multiline/TOTP)驱动渲染与复制;老库自动迁移。
 - 🎲 **密码生成** — CSPRNG 强随机密码(可配长度 / 符号 / 易混字符)。
 - 💻 **无头 CLI** — 全功能命令行,可脚本化、无需 TTY,口令取自环境变量 / 文件 / 交互。
 - 🔁 **导入 / 导出** — JSON 无损往返,或 CSV(password 扁平),便于迁移与备份。
@@ -168,7 +169,7 @@ cargo build --release  # 发布构建
 - [x] 分类 / 标签的增删改(CLI + TUI)
 - [x] 导入 / 导出(JSON / CSV)
 - [x] TOTP 验证码 + 无头 CLI + 闲置自动锁定
-- [ ] 自定义字段模板
+- [x] 字段模板(8 内置预设 + 通用字段模型;自定义模板 CRUD 待后续)
 - [ ] KeePass 导入 / 导出
 - [ ] 大库 per-page 加密优化(按需:当前整库模型 <100MB 每次保存约 50–200ms,收益微小;详见 [PROGRESS.md](docs/PROGRESS.md) 2026-06-21 决策)
 - [x] Windows 剪贴板后端(PowerShell `Set-Clipboard`,经 stdin、UTF-8)
