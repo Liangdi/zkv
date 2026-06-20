@@ -6,7 +6,7 @@
 //! - [`Database::migrate`]:按 PRD §5 建 `categories`/`tags`/`items`/`item_tags`/`attachments`
 //!   + FTS5 虚拟表 `items_fts` 及其同步触发器。
 //! - [`Database::dump_bytes`]:把整个库导出为字节(`VACUUM INTO` 到临时文件 → 读回 → 删临时文件)。
-//! - [`Database::from_bytes`]:从字节恢复内存库。
+//! - [`Database::from_bytes`][]:从字节恢复内存库。
 //! - [`Database::conn`]:借用底层连接(供 store/search 层使用)。
 //!
 //! ## FTS5
@@ -205,22 +205,19 @@ impl Drop for Database {
     }
 }
 
-/// 在系统临时目录下生成一个随机命名的路径(不带文件后缀,由调用方追加)。
+/// 在系统临时目录下生成一个不可预测命名的路径(不带文件后缀,由调用方追加)。
+///
+/// 文件名后缀取自 CSPRNG(`getrandom`),避免可预测的时间戳/计数器(防御纵深):
+/// 这些临时文件瞬时持有**明文 SQLite**,名不可预测减少攻击面。唯一性由
+/// `open_secure` 的 `create_new(true)` 原子创建保证。
 fn secure_tmp_base(prefix: &str) -> PathBuf {
+    let mut buf = [0u8; 16];
+    // CSPRNG;系统熵故障无合理恢复路径,直接 expect(与 crypto.rs 一致)。
+    getrandom::fill(&mut buf).expect("getrandom::fill failed for temp name");
+    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     let mut name = String::from(prefix);
     name.push('-');
-    // 用进程内计数 + 时间 + 一段随机,确保唯一性。
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    name.push_str(&format!(
-        "{}{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-        n
-    ));
+    name.push_str(&hex);
     std::env::temp_dir().join(name)
 }
 

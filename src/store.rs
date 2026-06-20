@@ -12,6 +12,7 @@
 //!
 //! 分层(L3):依赖 `crate::error`/`crate::model`/`crate::db` 与外部 crate,不引用 vault/app/ui。
 
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, Row};
@@ -37,8 +38,13 @@ impl ItemType {
         }
     }
 
-    /// 从小写字符串解析。
-    pub fn from_str(s: &str) -> Result<Self> {
+}
+
+/// 从小写字符串解析 `ItemType`(实现 [`std::str::FromStr`],支持 `.parse()`)。
+impl std::str::FromStr for ItemType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s {
             "password" => Ok(ItemType::Password),
             "note" => Ok(ItemType::Note),
@@ -95,6 +101,21 @@ pub(crate) fn row_to_item(row: &Row<'_>) -> rusqlite::Result<Item> {
         created_at,
         updated_at,
     })
+}
+
+/// 把一行(标准 9 列 + 第 10 列聚合标签串)解析为 `Item`(含 tags)。
+///
+/// 前 9 列与 [`row_to_item`] 完全一致;第 10 列(索引 9)为相关子查询用
+/// `GROUP_CONCAT(t.name, char(31))` 聚合出的标签串(按 `t.name` 升序),可能为 `NULL`。
+/// 用 ASCII Unit Separator(`char(31)` / `\u{1f}`)分词,避免标签名含逗号被误切。
+pub(crate) fn row_to_item_with_tags(row: &Row<'_>) -> rusqlite::Result<Item> {
+    let mut item = row_to_item(row)?;
+    let tags_blob: Option<String> = row.get(9)?;
+    item.tags = match tags_blob {
+        Some(s) => s.split('\u{1f}').filter(|x| !x.is_empty()).map(String::from).collect(),
+        None => Vec::new(),
+    };
+    Ok(item)
 }
 
 /// 加载某个 item 的所有标签名(按 name 升序)。
@@ -231,18 +252,22 @@ pub fn get_item(conn: &Connection, id: i64) -> Result<Option<Item>> {
 }
 
 /// 列出全部条目(按 `updated_at` 倒序),含标签聚合。
+///
+/// 用相关子查询 + `GROUP_CONCAT` 一次性聚合每个 item 的标签(按 `t.name` 升序),
+/// 避免对 N 个 item 各发一条查询的 N+1 问题。
 pub fn list_items(conn: &Connection) -> Result<Vec<Item>> {
     let mut stmt = conn.prepare(
-        "SELECT id, type, title, category_id, data, favorite, search_text, created_at, updated_at
-         FROM items ORDER BY updated_at DESC",
+        "SELECT i.id, i.type, i.title, i.category_id, i.data, i.favorite, i.search_text, i.created_at, i.updated_at,
+                (SELECT GROUP_CONCAT(tn, char(31))
+                 FROM (SELECT t.name AS tn FROM item_tags it JOIN tags t ON t.id = it.tag_id
+                       WHERE it.item_id = i.id ORDER BY t.name ASC)) AS tags
+         FROM items i
+         ORDER BY i.updated_at DESC",
     )?;
-    let mut items: Vec<Item> = stmt
-        .query_map([], row_to_item)?
+    let items: Vec<Item> = stmt
+        .query_map([], row_to_item_with_tags)?
         .filter_map(|r| r.ok())
         .collect();
-    for it in items.iter_mut() {
-        fill_tags(conn, it)?;
-    }
     Ok(items)
 }
 

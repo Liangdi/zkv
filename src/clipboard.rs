@@ -1,7 +1,7 @@
 //! 剪贴板:复制 + 定时自动清空。对应 PRD §7(安全特性)。
 //!
 //! 对外接口:
-//! - [`copy`]:跨平台复制到系统剪贴板。
+//! - [`copy`][]:跨平台复制到系统剪贴板。
 //! - [`copy_and_clear_after`]:复制后起后台线程,sleep `secs` 秒后清空剪贴板(写空串)。
 //!
 //! ## 后端选择
@@ -15,16 +15,30 @@
 //! 分层(L3):仅依赖 `crate::error` 与标准库,不引用 vault/app/ui。
 
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
 
+/// 剪贴板写入后端:首个可用的静态闭包引用(无捕获,可提升为 `'static`)。
+type Backend = Option<&'static (dyn Fn(&str) -> Result<()> + Sync)>;
+
+/// 缓存后的后端探测:首次调用执行实际探测(spawn),之后直接复用结果。
+///
+/// `OnceLock` 线程安全,多个 `copy` 并发首次调用也只会探测一次。
+/// 已知可接受的权衡:缓存后若后端在运行时由「不可用」变为「可用」
+/// (例如用户事后才启动 X server),不会被重新探测。保持简单、确定。
+fn backend() -> Backend {
+    static BACKEND: OnceLock<Backend> = OnceLock::new();
+    *BACKEND.get_or_init(detect_backend_impl)
+}
+
 /// 命令成功执行后即认为该后端可用。返回首个可用后端的「写入函数」(闭包)。
 ///
 /// 探测策略:对每个候选,尝试以空串实际运行一次;不报错即视为可用。
 /// 这样避免依赖 `which`,且区分「装了但当前会话无显示服务器」等场景。
-fn detect_backend() -> Option<&'static (dyn Fn(&str) -> Result<()> + Sync)> {
+fn detect_backend_impl() -> Backend {
     // 用函数表 + cfg 选择候选,逐一探测。
     #[cfg(target_os = "macos")]
     {
@@ -106,7 +120,7 @@ fn run_pipe(cmd: &[&str], text: &str) -> Result<()> {
 
 /// 复制文本到系统剪贴板。
 pub fn copy(text: &str) -> Result<()> {
-    match detect_backend() {
+    match backend() {
         Some(backend) => (backend)(text),
         None => Err(Error::Other(
             "no clipboard backend available (pbcopy/wl-copy/xclip/xsel)".into(),
@@ -122,8 +136,7 @@ pub fn copy_and_clear_after(text: &str, secs: u64) -> Result<()> {
     // 先复制(若失败则不安排清空)。
     copy(text)?;
 
-    // 后台线程定时清空。重用 detect_backend 的探测结果,避免重复探测不一致。
-    // 为简化:清空调用 copy(""),它会重新探测;在常见环境下探测结果稳定。
+    // 后台线程定时清空。清空调用 copy(""),复用 backend() 的缓存探测结果,不再重复 spawn 探测进程。
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(secs));
         let _ = copy("");

@@ -78,7 +78,7 @@ fn main_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
         };
 
         if let Event::Key(key) = ev {
-            let action = app.handle_key(key).map_err(|e| e)?;
+            let action = app.handle_key(key)?;
             if matches!(action, Action::Quit) || app.quit {
                 break;
             }
@@ -89,12 +89,9 @@ fn main_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
 
 /// 单帧渲染:按 `app.mode` 分发。
 fn draw(frame: &mut Frame, app: &App) {
-    match &app.mode {
-        Mode::PromptPassphrase(kind) => {
-            draw_passphrase(frame, app, *kind);
-            return;
-        }
-        _ => {}
+    if let Mode::PromptPassphrase(kind) = &app.mode {
+        draw_passphrase(frame, app, *kind);
+        return;
     }
 
     // 纵向三段:header / body / footer。

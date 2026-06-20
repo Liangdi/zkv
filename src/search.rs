@@ -5,7 +5,7 @@
 //! - [`search`]:根据 `Filter` 执行查询,query 走 FTS5 `MATCH`,其余走 WHERE 组合,
 //!   返回 `Vec<Item>`(含标签聚合),按 `updated_at` 倒序。
 //!
-//! 行 → Item 解析与标签聚合复用 [`crate::store`] 的 `row_to_item` / `fill_tags`。
+//! 行 → Item 解析(含标签聚合)复用 [`crate::store`] 的 `row_to_item_with_tags`(单查询)。
 //!
 //! 分层(L3):依赖 `crate::error`/`crate::model`/`crate::db`/`crate::store` 与外部 crate,
 //! 不引用 vault/app/ui。
@@ -14,7 +14,7 @@ use rusqlite::{types::Value, Connection};
 
 use crate::error::Result;
 use crate::model::{Item, ItemType};
-use crate::store::{fill_tags, row_to_item};
+use crate::store::row_to_item_with_tags;
 
 /// 搜索过滤条件。全部字段可组合;`Default` 表示「无任何过滤」。
 #[derive(Debug, Clone, Default)]
@@ -63,14 +63,20 @@ pub fn search(conn: &Connection, f: &Filter) -> Result<Vec<Item>> {
 
     if let Some(q) = query_trimmed {
         sql.push_str(
-            "SELECT i.id, i.type, i.title, i.category_id, i.data, i.favorite, i.search_text, i.created_at, i.updated_at
+            "SELECT i.id, i.type, i.title, i.category_id, i.data, i.favorite, i.search_text, i.created_at, i.updated_at,
+                    (SELECT GROUP_CONCAT(tn, char(31))
+                     FROM (SELECT t.name AS tn FROM item_tags it JOIN tags t ON t.id = it.tag_id
+                           WHERE it.item_id = i.id ORDER BY t.name ASC)) AS tags
              FROM items_fts f JOIN items i ON i.id = f.rowid",
         );
         where_clauses.push("f.items_fts MATCH ?1".to_string());
         bind_params.push(Value::from(sanitize_fts(q)));
     } else {
         sql.push_str(
-            "SELECT i.id, i.type, i.title, i.category_id, i.data, i.favorite, i.search_text, i.created_at, i.updated_at
+            "SELECT i.id, i.type, i.title, i.category_id, i.data, i.favorite, i.search_text, i.created_at, i.updated_at,
+                    (SELECT GROUP_CONCAT(tn, char(31))
+                     FROM (SELECT t.name AS tn FROM item_tags it JOIN tags t ON t.id = it.tag_id
+                           WHERE it.item_id = i.id ORDER BY t.name ASC)) AS tags
              FROM items i",
         );
     }
@@ -117,13 +123,10 @@ pub fn search(conn: &Connection, f: &Filter) -> Result<Vec<Item>> {
         .iter()
         .map(|v| v as &dyn rusqlite::ToSql)
         .collect();
-    let mut items: Vec<Item> = stmt
-        .query_map(binds.as_slice(), row_to_item)?
+    let items: Vec<Item> = stmt
+        .query_map(binds.as_slice(), row_to_item_with_tags)?
         .filter_map(|r| r.ok())
         .collect();
-    for it in items.iter_mut() {
-        fill_tags(conn, it)?;
-    }
     Ok(items)
 }
 

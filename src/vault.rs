@@ -74,7 +74,7 @@ impl VaultHeader {
                 bytes.len()
             )));
         }
-        if &bytes[0..4] != MAGIC {
+        if bytes[0..4] != MAGIC {
             return Err(Error::CorruptFile("bad magic".to_string()));
         }
         let version = bytes[4];
@@ -115,11 +115,28 @@ pub fn create(path: &Path, passphrase: &str) -> Result<()> {
 pub fn create_with_params(path: &Path, passphrase: &str, kdf: &KdfParams) -> Result<()> {
     let db = Database::open_in_memory()?;
     let plaintext = db.dump_bytes()?;
-    encrypt_and_write(path, passphrase, kdf, crypto::gen_salt(), plaintext)
+    let salt = crypto::gen_salt();
+    let key = crypto::derive_key(passphrase.as_bytes(), &salt, kdf)?;
+    encrypt_and_write(path, &key, kdf, salt, plaintext)
 }
 
-/// 解锁现有 `.zkv` 库(默认 KDF 参数)。
+/// 解锁现有 `.zkv` 库(默认 KDF 参数),返回 `Database`。
+///
+/// 等价于调用 [`unlock_full`](返回 db/key/salt)后丢弃 key/salt。
 pub fn unlock(path: &Path, passphrase: &str) -> Result<Database> {
+    let (db, _key, _kdf, _salt) = unlock_full(path, passphrase)?;
+    Ok(db)
+}
+
+/// 解锁现有 `.zkv` 库,返回 `(Database, MasterKey, KdfParams, salt)`。
+///
+/// 解析文件头 → `derive_key`(用头中的 KDF 参数)→ `decrypt` → `Database::from_bytes`,
+/// 并把派生出的 [`MasterKey`]、`header.kdf` 与 `header.salt` 一并返回,供调用方缓存复用,
+/// 避免后续 `save` 时重复 Argon2id 派生且回写一致的头参数。
+pub fn unlock_full(
+    path: &Path,
+    passphrase: &str,
+) -> Result<(Database, MasterKey, KdfParams, [u8; 16])> {
     let file = fs::read(path)?;
     let header = VaultHeader::parse(&file)?;
     let key = crypto::derive_key(passphrase.as_bytes(), &header.salt, &header.kdf)?;
@@ -128,7 +145,8 @@ pub fn unlock(path: &Path, passphrase: &str) -> Result<Database> {
         ciphertext: file[HEADER_LEN..].to_vec(),
     };
     let plaintext = crypto::decrypt(&key, &enc)?;
-    Database::from_bytes(&plaintext)
+    let db = Database::from_bytes(&plaintext)?;
+    Ok((db, key, header.kdf, header.salt))
 }
 
 /// 解锁现有 `.zkv` 库,使用指定 KDF 参数。
@@ -166,19 +184,38 @@ pub fn save_with_params(
         Err(_) => crypto::gen_salt(),
     };
 
-    encrypt_and_write(path, passphrase, kdf, salt, plaintext)
+    let key = crypto::derive_key(passphrase.as_bytes(), &salt, kdf)?;
+    encrypt_and_write(path, &key, kdf, salt, plaintext)
 }
 
-/// 内部:派生密钥 → 加密(新 nonce 由 encrypt 生成,但我们需要它进文件头,故手写一遍)→ 原子写。
+/// 保存(覆盖)`.zkv` 库,复用已派生的 [`MasterKey`]、salt 与 KDF 参数。
+///
+/// 与 [`save_with_params`]( 不同:不重复 Argon2id 派生、也不重读整个文件取 salt,
+/// 直接用传入 key 做 AEAD(微秒级)。每次保存仍生成**新 nonce**。
+///
+/// `kdf` 仅用于回写文件头(下次 `unlock` 读取以派生),派生本身已由调用方完成。
+/// 为保持解锁闭环一致性,必须传入与生成该 key 时相同的 KDF 参数。
+pub fn save_with_key(
+    path: &Path,
+    key: &MasterKey,
+    kdf: &KdfParams,
+    salt: [u8; 16],
+    db: &Database,
+) -> Result<()> {
+    let plaintext = db.dump_bytes()?;
+    encrypt_and_write(path, key, kdf, salt, plaintext)
+}
+
+/// 内部:用**已派生**的 key 加密(新 nonce 由 encrypt 生成,但需要它进文件头)→ 原子写。
+/// 不再做任何 Argon2id 派生。
 fn encrypt_and_write(
     path: &Path,
-    passphrase: &str,
+    key: &MasterKey,
     kdf: &KdfParams,
     salt: [u8; 16],
     plaintext: Vec<u8>,
 ) -> Result<()> {
-    let key: MasterKey = crypto::derive_key(passphrase.as_bytes(), &salt, kdf)?;
-    let enc = crypto::encrypt(&key, &plaintext)?;
+    let enc = crypto::encrypt(key, &plaintext)?;
     let header = VaultHeader {
         version: VERSION,
         flags: 0,
@@ -220,6 +257,9 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     }
     // 确保最终文件也是 0600(rename 保留临时文件权限,已设;再兜底)。
     set_mode_0600(path);
+    // 持久化 rename 本身:fsync 父目录,避免崩溃时 rename 未落盘导致「丢失更新」。
+    // best-effort,忽略不支持目录 fsync 的文件系统错误。
+    fsync_parent(path);
     Ok(())
 }
 
@@ -251,6 +291,23 @@ fn set_mode_0600(path: &Path) {
 
 #[cfg(not(unix))]
 fn set_mode_0600(_path: &Path) {}
+
+/// best-effort fsync 父目录(Unix),把 rename 目录项变更刷到磁盘,避免崩溃丢失更新。
+///
+/// 标准库 `File::sync_all()` 对一个打开的目录 fd,在 Linux 上会 fsync 该目录
+/// (目录项/rename 落盘)。失败忽略:某些文件系统(如 tmpfs/网络 FS)不支持目录 fsync。
+#[cfg(unix)]
+fn fsync_parent(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_parent(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {

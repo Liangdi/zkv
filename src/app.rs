@@ -16,9 +16,9 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use zeroize::Zeroizing;
 
 use crate::clipboard;
+use crate::crypto::{KdfParams, MasterKey};
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::model::{Item, ItemData, ItemType};
@@ -112,8 +112,12 @@ pub struct App {
     pub db: Option<Database>,
     /// 库文件路径。
     pub path: Option<PathBuf>,
-    /// 解锁后持有的口令(用于 `save`);`lock` 时清零。
-    pub passphrase: Option<Zeroizing<String>>,
+    /// 解锁后缓存的已派生主密钥(用于 `save` 复用,跳过 Argon2id);`lock` 时清零。
+    pub master_key: Option<MasterKey>,
+    /// 解锁时读取的 salt(与 master_key 配套写回文件头)。
+    pub salt: Option<[u8; 16]>,
+    /// 解锁时读取的 KDF 参数(与 master_key 配套写回文件头)。
+    pub kdf: Option<KdfParams>,
     /// 当前模式。
     pub mode: Mode,
     /// 当前搜索/过滤条件。
@@ -148,7 +152,9 @@ impl App {
         App {
             db: None,
             path: Some(path),
-            passphrase: None,
+            master_key: None,
+            salt: None,
+            kdf: None,
             mode: Mode::PromptPassphrase(PassKind::Open),
             filter: Filter::default(),
             items: Vec::new(),
@@ -168,7 +174,9 @@ impl App {
         App {
             db: None,
             path: Some(path),
-            passphrase: None,
+            master_key: None,
+            salt: None,
+            kdf: None,
             mode: Mode::PromptPassphrase(PassKind::Create),
             filter: Filter::default(),
             items: Vec::new(),
@@ -184,11 +192,27 @@ impl App {
     }
 
     /// 已解锁构造(测试用):载入 db + 口令,执行首次 `reload`,进入 Normal。
+    ///
+    /// `passphrase` 仅用于从 `path` 文件头读 salt+kdf 派生一次 key 并缓存(这样后续
+    /// `save` 可复用、且用文件里存的 KDF 参数 —— 测试里用 fast KDF 创建的文件派生很快)。
+    /// 文件不存在/读失败时 key 为 None(此类 App 不会调用 save)。`passphrase` 不再驻留 App。
     pub fn from_unlocked(db: Database, path: PathBuf, passphrase: String) -> Result<App> {
+        let (master_key, salt, kdf) = match std::fs::read(&path) {
+            Ok(file) => match crate::vault::VaultHeader::parse(&file) {
+                Ok(h) => {
+                    let key = crate::crypto::derive_key(passphrase.as_bytes(), &h.salt, &h.kdf)?;
+                    (Some(key), Some(h.salt), Some(h.kdf))
+                }
+                Err(_) => (None, None, None),
+            },
+            Err(_) => (None, None, None),
+        };
         let mut app = App {
             db: Some(db),
             path: Some(path),
-            passphrase: Some(Zeroizing::new(passphrase)),
+            master_key,
+            salt,
+            kdf,
             mode: Mode::Normal,
             filter: Filter::default(),
             items: Vec::new(),
@@ -231,27 +255,34 @@ impl App {
         Ok(())
     }
 
-    /// 保存(落盘)。passphrase 取自 `self.passphrase`,缺则 `Error::Other`。
+    /// 保存(落盘)。复用缓存的 `master_key`/`salt`/`kdf`,只做 AEAD(微秒级),不再 Argon2id。
     pub fn save(&self) -> Result<()> {
         let path = self.path.as_ref().ok_or_else(|| {
             Error::Other("save: no vault path".into())
         })?;
-        let passphrase = self
-            .passphrase
+        let key = self
+            .master_key
             .as_ref()
-            .map(|p| p.as_str())
-            .ok_or_else(|| Error::Other("save: no passphrase (locked?)".into()))?;
+            .ok_or_else(|| Error::Other("save: no master key (locked?)".into()))?;
+        let salt = self
+            .salt
+            .ok_or_else(|| Error::Other("save: no salt (locked?)".into()))?;
+        let kdf = self
+            .kdf
+            .ok_or_else(|| Error::Other("save: no kdf (locked?)".into()))?;
         let db = self
             .db
             .as_ref()
             .ok_or_else(|| Error::Other("save: no database".into()))?;
-        vault::save(path, passphrase, db)
+        vault::save_with_key(path, key, &kdf, salt, db)
     }
 
     /// 锁定:清空 db/passphrase,切回 Normal,清空 items/categories/tags。
     pub fn lock(&mut self) {
         self.db = None;
-        self.passphrase = None;
+        self.master_key = None;
+        self.salt = None;
+        self.kdf = None;
         self.mode = Mode::Normal;
         self.items.clear();
         self.categories.clear();
@@ -331,9 +362,11 @@ impl App {
                     PassKind::Create => {
                         match vault::create(&path, &pass) {
                             Ok(()) => {
-                                match vault::unlock(&path, &pass) {
-                                    Ok(db) => {
-                                        self.passphrase = Some(Zeroizing::new(pass));
+                                match vault::unlock_full(&path, &pass) {
+                                    Ok((db, key, kdf, salt)) => {
+                                        self.master_key = Some(key);
+                                        self.salt = Some(salt);
+                                        self.kdf = Some(kdf);
                                         self.db = Some(db);
                                         self.mode = Mode::Normal;
                                         self.reload()?;
@@ -351,9 +384,11 @@ impl App {
                             }
                         }
                     }
-                    PassKind::Open => match vault::unlock(&path, &pass) {
-                        Ok(db) => {
-                            self.passphrase = Some(Zeroizing::new(pass));
+                    PassKind::Open => match vault::unlock_full(&path, &pass) {
+                        Ok((db, key, kdf, salt)) => {
+                            self.master_key = Some(key);
+                            self.salt = Some(salt);
+                            self.kdf = Some(kdf);
                             self.db = Some(db);
                             self.mode = Mode::Normal;
                             self.reload()?;
@@ -552,11 +587,8 @@ impl App {
     // ---- CategoryMgr (最小实现) ----
     fn handle_category_mgr(&mut self, key: KeyEvent) -> Result<Action> {
         // TODO(SA5+):实现增删改分类。当前仅支持 Esc 返回。
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Normal;
-            }
-            _ => {}
+        if key.code == KeyCode::Esc {
+            self.mode = Mode::Normal;
         }
         Ok(Action::Continue)
     }
@@ -564,11 +596,8 @@ impl App {
     // ---- TagMgr (最小实现) ----
     fn handle_tag_mgr(&mut self, key: KeyEvent) -> Result<Action> {
         // TODO(SA5+):实现增删改标签。当前仅支持 Esc 返回。
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Normal;
-            }
-            _ => {}
+        if key.code == KeyCode::Esc {
+            self.mode = Mode::Normal;
         }
         Ok(Action::Continue)
     }
@@ -880,8 +909,9 @@ mod tests {
 
     #[test]
     fn create_item_increments_count() {
-        // 注意:保存路径会调用 save() -> vault::save -> 慢 KDF。
-        // 为保持测试快速,这里用临时文件 + 直接 vault::create_with_params 预建,
+        // 注意:保存路径会调用 save() -> vault::save_with_key,复用 from_unlocked
+        // 缓存的 key(此处用 fast KDF 预建文件派生一次),故落盘仍是 AEAD、很快。
+        // 这里用临时文件 + vault::create_with_params 预建,
         // 然后 from_unlocked 一个真实可保存的 path。
         let path = tmp_path("create_item");
         cleanup(&path);
@@ -953,7 +983,7 @@ mod tests {
         let mut app = app_with_items(2);
         app.handle_key(key('l')).unwrap();
         assert!(app.db.is_none());
-        assert!(app.passphrase.is_none());
+        assert!(app.master_key.is_none());
         assert!(app.items.is_empty());
         assert!(matches!(app.mode, Mode::Normal));
     }
