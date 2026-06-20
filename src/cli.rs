@@ -158,6 +158,49 @@ fn tag_id_by_name(conn: &rusqlite::Connection, name: &str) -> Result<Option<i64>
     Ok(tags.into_iter().find(|t| t.name == name).map(|t| t.id))
 }
 
+/// 按标题定位条目 id:**exact 命中优先**,否则**唯一前缀匹配**。
+///
+/// - 精确匹配某条标题 → 返回该 id。
+/// - 无精确匹配但有且仅有一条标题以 `query` 为前缀 → 返回该 id。
+/// - 多条前缀匹配 → `Error::Other("multiple items match '<T>' ...")`。
+/// - 无任何匹配 → `Error::Other("no item matches '<T>'")`。
+pub fn find_item_id_by_title(conn: &rusqlite::Connection, query: &str) -> Result<i64> {
+    let items = store::list_items(conn)?;
+    // exact 优先。
+    if let Some(it) = items.iter().find(|i| i.title == query) {
+        return Ok(it.id.unwrap_or(-1));
+    }
+    // 前缀匹配。
+    let prefix_matches: Vec<&Item> = items.iter().filter(|i| i.title.starts_with(query)).collect();
+    match prefix_matches.len() {
+        0 => Err(Error::Other(format!("no item matches '{query}'"))),
+        1 => Ok(prefix_matches[0].id.unwrap_or(-1)),
+        _ => {
+            let names: Vec<&str> = prefix_matches.iter().map(|i| i.title.as_str()).collect();
+            Err(Error::Other(format!(
+                "multiple items match '{query}': {}",
+                names.join(", ")
+            )))
+        }
+    }
+}
+
+/// 解析目标 id:位置参数 `id` 优先;否则用 `find` 按标题定位。
+/// 二者都缺 → `Error::Other`。用于 get/edit/rm/cp/otp 五处复用。
+pub fn resolve_id(
+    conn: &rusqlite::Connection,
+    id: Option<i64>,
+    find: Option<&str>,
+) -> Result<i64> {
+    if let Some(n) = id {
+        return Ok(n);
+    }
+    if let Some(q) = find {
+        return find_item_id_by_title(conn, q);
+    }
+    Err(Error::Other("need an <id> or --find <TITLE>".into()))
+}
+
 /// `ls`/`search` 公用:把条目列表格式化后写到 `out`。
 ///
 /// - `json = true`:`serde_json::to_string_pretty`(`Item` 已 derive `Serialize`)。
@@ -235,6 +278,221 @@ pub fn item_field(item: &Item, field: &str) -> Result<String> {
     Ok(val)
 }
 
+/// 解析 `otpauth://totp/<label>?secret=<BASE32>&...` URI,返回 secret(base32)。
+///
+/// 容错:
+/// - 不以 `otpauth://` 开头 → [`Error::Other`]。
+/// - 无 `secret=` 查询参数(或值为空)→ [`Error::Other`]。
+///
+/// 实现纯字符串解析(不引入新依赖):取 `?` 后的 query,按 `&` 分割找 `secret=...`;
+/// 对 secret 值做最小 percent-decode(把 `%XX` 还原),实际 base32 secret 一般无特殊字符,
+/// 但此处仍容忍 `%2B` 之类的转义。
+pub fn parse_otpauth(uri: &str) -> Result<String> {
+    let lower_prefix = "otpauth://";
+    let rest = uri
+        .strip_prefix(lower_prefix)
+        .ok_or_else(|| Error::Other("otpauth: uri must start with 'otpauth://'".into()))?;
+    // 取 query 段(`?` 之后);若无 `?` 则无 secret。
+    let query = match rest.split_once('?') {
+        Some((_, q)) => q,
+        None => {
+            return Err(Error::Other(
+                "otpauth: uri missing '?' (no query / no secret)".into(),
+            ));
+        }
+    };
+    // 查找 secret= 参数。query 可能含 `#fragment`,先裁掉。
+    let query = query.split('#').next().unwrap_or(query);
+    for pair in query.split('&') {
+        if let Some(val) = pair.strip_prefix("secret=") {
+            let decoded = percent_decode_minimal(val);
+            if decoded.is_empty() {
+                return Err(Error::Other("otpauth: empty secret".into()));
+            }
+            return Ok(decoded);
+        }
+    }
+    Err(Error::Other("otpauth: uri missing 'secret=' parameter".into()))
+}
+
+/// 最小 percent-decoding:把 `%XX`(十六进制)还原成对应字节;非法转义原样保留。
+fn percent_decode_minimal(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        // `+` 在 query 里通常表示空格,但 secret 中 `+` 非合法 base32,保留原样更安全。
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 把单个十六进制字符转成 0–15,非法返回 `None`。
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// `edit` 单字段覆盖集合:仅覆盖对应 data 子字段(免整块 `--data`)。
+///
+/// 任一字段为 `Some` → 在 `run_edit` 中按 (变体, 字段) 写入;所有字段 `None` 表示「不改」。
+/// 与 `--data`(整块替换)互斥:二者同传由调用方(run_edit)在进入前报错。
+#[derive(Debug, Default, Clone)]
+pub struct EditFields {
+    // password
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub url: Option<String>,
+    pub totp: Option<String>,
+    pub notes: Option<String>,
+    // note
+    pub content: Option<String>,
+    // card
+    pub holder: Option<String>,
+    pub number: Option<String>,
+    pub expiry: Option<String>,
+    pub cvv: Option<String>,
+    pub bank: Option<String>,
+}
+
+impl EditFields {
+    /// 是否提供了任一单字段。
+    pub fn any(&self) -> bool {
+        self.username.is_some()
+            || self.password.is_some()
+            || self.url.is_some()
+            || self.totp.is_some()
+            || self.notes.is_some()
+            || self.content.is_some()
+            || self.holder.is_some()
+            || self.number.is_some()
+            || self.expiry.is_some()
+            || self.cvv.is_some()
+            || self.bank.is_some()
+    }
+
+    /// 按 (变体, 字段) 写入。类型不匹配的字段直接忽略(该变体无此字段)。
+    /// 返回是否实际改动了任意字段(至少一个匹配成功)。
+    pub fn apply(&self, data: &mut ItemData) -> bool {
+        use crate::model::ItemData::*;
+        let mut changed = false;
+        match data {
+            Password {
+                username,
+                password,
+                url,
+                totp_secret,
+                notes,
+            } => {
+                if let Some(v) = &self.username {
+                    *username = v.clone();
+                    changed = true;
+                }
+                if let Some(v) = &self.password {
+                    *password = v.clone();
+                    changed = true;
+                }
+                if let Some(v) = &self.url {
+                    *url = v.clone();
+                    changed = true;
+                }
+                if let Some(v) = &self.totp {
+                    *totp_secret = v.clone();
+                    changed = true;
+                }
+                if let Some(v) = &self.notes {
+                    *notes = v.clone();
+                    changed = true;
+                }
+            }
+            Note { content, .. } => {
+                if let Some(v) = &self.content {
+                    *content = v.clone();
+                    changed = true;
+                }
+            }
+            Card {
+                holder,
+                number,
+                expiry,
+                cvv,
+                bank,
+                notes,
+            } => {
+                if let Some(v) = &self.holder {
+                    *holder = v.clone();
+                    changed = true;
+                }
+                if let Some(v) = &self.number {
+                    *number = v.clone();
+                    changed = true;
+                }
+                if let Some(v) = &self.expiry {
+                    *expiry = v.clone();
+                    changed = true;
+                }
+                if let Some(v) = &self.cvv {
+                    *cvv = v.clone();
+                    changed = true;
+                }
+                if let Some(v) = &self.bank {
+                    *bank = v.clone();
+                    changed = true;
+                }
+                if let Some(v) = &self.notes {
+                    *notes = v.clone();
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+}
+
+/// 标签增量编辑:`add` 末尾追加(去重),`remove` 移除匹配项。二者均可为空。
+#[derive(Debug, Default, Clone)]
+pub struct TagDelta {
+    /// 末尾追加的标签(已去重)。
+    pub add: Vec<String>,
+    /// 要移除的标签。
+    pub remove: Vec<String>,
+}
+
+impl TagDelta {
+    /// 是否提供了任一增删。
+    pub fn any(&self) -> bool {
+        !self.add.is_empty() || !self.remove.is_empty()
+    }
+
+    /// 应用到 tags:`add` 去重追加,`remove` 移除。返回新 tags。
+    pub fn apply(&self, tags: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = tags.to_vec();
+        // 先移除。
+        if !self.remove.is_empty() {
+            out.retain(|t| !self.remove.iter().any(|r| r == t));
+        }
+        // 再去重追加。
+        for t in &self.add {
+            if !out.iter().any(|e| e == t) {
+                out.push(t.clone());
+            }
+        }
+        out
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 写命令(add/edit/rm)
 // ---------------------------------------------------------------------------
@@ -264,6 +522,7 @@ pub fn run_add(
     tags: Vec<String>,
     favorite: bool,
     gen_password: Option<usize>,
+    otpauth: Option<&str>,
 ) -> Result<i64> {
     let mut data: ItemData = serde_json::from_str(data_json)?;
 
@@ -280,6 +539,18 @@ pub fn run_add(
     } else {
         None
     };
+
+    // 若指定 --otpauth:必须是 Password 条目,解析 secret 后覆盖 totp_secret。
+    // 与 --gen-password 可共存(分别填 password / totp_secret)。
+    if let Some(uri) = otpauth {
+        match &mut data {
+            ItemData::Password { totp_secret, .. } => {
+                let secret = parse_otpauth(uri)?;
+                *totp_secret = secret;
+            }
+            _ => return Err(Error::Other("--otpauth only applies to password items".into())),
+        }
+    }
 
     let item_type = item_type_of(&data);
     let mut item = Item {
@@ -378,10 +649,17 @@ pub fn run_gen(length: usize, symbols: bool, avoid_ambiguous: bool) -> Result<()
 
 /// `edit`:修改已存在条目的若干字段。每个参数为 `None` 表示「不改」。
 ///
-/// 至少要改一处(title/data/tags/favorite/category 之一);全 `None` 报错。
+/// 至少要改一处(title/data/tags/favorite/category/单字段/标签增删 之一);全 `None` 报错。
+///
+/// 互斥规则(调用方 `main.rs` 在分发前已校验并报错,这里仍兜底):
+/// - `data_json` 与 `fields`(单字段 flag)互斥:`Error::Other("--data conflicts with field flags")`。
+/// - `tags`(整体覆盖 `--tag`)与 `tag_delta`(--add-tag/--rm-tag)互斥:
+///   `Error::Other("--tag conflicts with --add-tag/--rm-tag")`。
+///
 /// `category = Some("name")` 按分类名解析成 id 并设置(找不到报错);
 /// `category = None` 表示「不动」(本期不支持清除,清除需后续 `--clear-cat`)。
 /// 替换 data 时同步 `item_type`,保持与 data tag 一致。成功打印 `updated item <id>`。
+#[allow(clippy::too_many_arguments)]
 pub fn run_edit(
     u: &Unlocked,
     id: i64,
@@ -390,7 +668,22 @@ pub fn run_edit(
     tags: Option<Vec<String>>,
     favorite: Option<bool>,
     category: Option<&str>,
+    fields: &EditFields,
+    tag_delta: &TagDelta,
+    otpauth: Option<&str>,
 ) -> Result<()> {
+    // 互斥校验(兜底;main.rs 已校验,但 run_edit 作为公开纯函数也应自洽)。
+    if data_json.is_some() && fields.any() {
+        return Err(Error::Other(
+            "--data conflicts with field flags".into(),
+        ));
+    }
+    if tags.is_some() && tag_delta.any() {
+        return Err(Error::Other(
+            "--tag conflicts with --add-tag/--rm-tag".into(),
+        ));
+    }
+
     let conn = u.db.conn();
     let mut item = store::get_item(conn, id)?
         .ok_or_else(|| Error::Other(format!("item {id} not found")))?;
@@ -410,6 +703,10 @@ pub fn run_edit(
         item.tags = tg;
         changed = true;
     }
+    if tag_delta.any() {
+        item.tags = tag_delta.apply(&item.tags);
+        changed = true;
+    }
     if let Some(f) = favorite {
         item.favorite = f;
         changed = true;
@@ -419,6 +716,25 @@ pub fn run_edit(
             .ok_or_else(|| Error::Other(format!("category '{cat}' not found")))?;
         item.category_id = Some(cid);
         changed = true;
+    }
+    // 单字段覆盖(仅对相应变体生效;`fields.apply` 返回是否实际改动)。
+    if fields.any() && fields.apply(&mut item.data) {
+        changed = true;
+    }
+    // --otpauth:必须是 Password,覆盖 totp_secret。
+    if let Some(uri) = otpauth {
+        match &mut item.data {
+            ItemData::Password { totp_secret, .. } => {
+                let secret = parse_otpauth(uri)?;
+                *totp_secret = secret;
+                changed = true;
+            }
+            _ => {
+                return Err(Error::Other(
+                    "--otpauth only applies to password items".into(),
+                ));
+            }
+        }
     }
     if !changed {
         return Err(Error::Other("edit: nothing to change".into()));
@@ -1793,7 +2109,7 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         let data = r#"{"type":"password","username":"bob","password":"pw1","url":"https://x","totp_secret":"","notes":""}"#;
-        let id = run_add(&u, "Server", data, vec!["ops".into()], true, None).unwrap();
+        let id = run_add(&u, "Server", data, vec!["ops".into()], true, None, None).unwrap();
         assert!(id > 0);
 
         // 内存中能取到正确字段。
@@ -1822,7 +2138,7 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // 缺 type tag → serde 报错(非 Error::Other,但仍是 Err)。
-        assert!(run_add(&u, "X", "{ not json", vec![], false, None).is_err());
+        assert!(run_add(&u, "X", "{ not json", vec![], false, None, None).is_err());
         cleanup(&p);
     }
 
@@ -1841,6 +2157,9 @@ mod tests {
             Some(new_data),
             Some(vec!["archive".into()]),
             Some(false),
+            None,
+            &EditFields::default(),
+            &TagDelta::default(),
             None,
         )
         .unwrap();
@@ -1867,7 +2186,7 @@ mod tests {
         let p = make_vault("edit2");
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
-        run_edit(&u, 1, Some("JustTitle"), None, None, None, None).unwrap();
+        run_edit(&u, 1, Some("JustTitle"), None, None, None, None, &EditFields::default(), &TagDelta::default(), None).unwrap();
         let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
         assert_eq!(got.title, "JustTitle");
         // data 未动,仍是 password。
@@ -1880,7 +2199,7 @@ mod tests {
         let p = make_vault("editnone");
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
-        let err = run_edit(&u, 1, None, None, None, None, None);
+        let err = run_edit(&u, 1, None, None, None, None, None, &EditFields::default(), &TagDelta::default(), None);
         assert!(matches!(err, Err(Error::Other(_))));
     }
 
@@ -1889,7 +2208,7 @@ mod tests {
         let p = make_vault("editmissing");
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
-        let err = run_edit(&u, 9999, Some("x"), None, None, None, None);
+        let err = run_edit(&u, 9999, Some("x"), None, None, None, None, &EditFields::default(), &TagDelta::default(), None);
         assert!(matches!(err, Err(Error::Other(_))));
     }
 
@@ -2019,13 +2338,13 @@ mod tests {
 
         // 先建一个分类,再把 id=1 的 item 设到该分类下。
         let cid = run_cat_add(&u, "Work", None).unwrap();
-        run_edit(&u, 1, None, None, None, None, Some("Work")).unwrap();
+        run_edit(&u, 1, None, None, None, None, Some("Work"), &EditFields::default(), &TagDelta::default(), None).unwrap();
 
         let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
         assert_eq!(got.category_id, Some(cid));
 
         // 未知分类名 → 报错。
-        assert!(run_edit(&u, 1, None, None, None, None, Some("Ghost")).is_err());
+        assert!(run_edit(&u, 1, None, None, None, None, Some("Ghost"), &EditFields::default(), &TagDelta::default(), None).is_err());
         cleanup(&p);
     }
 
@@ -2036,7 +2355,7 @@ mod tests {
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // make_vault 的两条 item 都不是收藏;add 一条收藏项。
         let data = r#"{"type":"password","username":"bob","password":"pw","url":"","totp_secret":"","notes":""}"#;
-        let _fav_id = run_add(&u, "Fav", data, vec![], true, None).unwrap();
+        let _fav_id = run_add(&u, "Fav", data, vec![], true, None, None).unwrap();
 
         let f = ListFilter::default();
         // favorite=false:返回全部 3 条。
@@ -2327,7 +2646,7 @@ mod tests {
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // --data 里 password 是占位 "old",--gen-password 12 应覆盖。
         let data = r#"{"type":"password","username":"bob","password":"old","url":"https://x","totp_secret":"","notes":""}"#;
-        let id = run_add(&u, "Gen", data, vec![], false, Some(12)).unwrap();
+        let id = run_add(&u, "Gen", data, vec![], false, Some(12), None).unwrap();
         assert!(id > 0);
 
         let got = store::get_item(u.db.conn(), id).unwrap().unwrap();
@@ -2347,7 +2666,7 @@ mod tests {
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // note 条目 + --gen-password → 报错。
         let data = r#"{"type":"note","format":"text","content":"hi"}"#;
-        let err = run_add(&u, "N", data, vec![], false, Some(20));
+        let err = run_add(&u, "N", data, vec![], false, Some(20), None);
         assert!(matches!(err, Err(Error::Other(m)) if m.contains("--gen-password")));
         cleanup(&p);
     }
@@ -2649,6 +2968,399 @@ mod tests {
         assert_eq!(dst.len(), 2);
         assert!(dst.iter().all(|i| i.title == "Dup"));
         cleanup(&inp);
+        cleanup(&p);
+    }
+
+    // ===========================================================================
+    // 增强:otpauth 解析 / 单字段 / 标签增删 / 标题定位
+    // ===========================================================================
+
+    // --- Task 1: parse_otpauth ---
+
+    #[test]
+    fn parse_otpauth_extracts_secret() {
+        let uri = "otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example&digits=6&period=30";
+        assert_eq!(parse_otpauth(uri).unwrap(), "JBSWY3DPEHPK3PXP");
+    }
+
+    #[test]
+    fn parse_otpauth_without_other_params() {
+        // 仅 secret 参数。
+        let uri = "otpauth://totp/Foo?secret=JBSWY3DPEHPK3PXP";
+        assert_eq!(parse_otpauth(uri).unwrap(), "JBSWY3DPEHPK3PXP");
+    }
+
+    #[test]
+    fn parse_otpauth_bad_prefix_errors() {
+        assert!(parse_otpauth("https://example.com?secret=x").is_err());
+        assert!(parse_otpauth("totp/Example?secret=x").is_err());
+    }
+
+    #[test]
+    fn parse_otpauth_no_secret_errors() {
+        // 无 secret= 参数。
+        assert!(parse_otpauth("otpauth://totp/Example?issuer=Example").is_err());
+        // 无 ? query。
+        assert!(parse_otpauth("otpauth://totp/Example").is_err());
+        // 空 secret 值。
+        assert!(parse_otpauth("otpauth://totp/Example?secret=").is_err());
+    }
+
+    #[test]
+    fn parse_otpauth_percent_decodes_secret() {
+        // %2F = '/',%3D = '=';解码后应还原。
+        let uri = "otpauth://totp/X?secret=AB%3DCD";
+        assert_eq!(parse_otpauth(uri).unwrap(), "AB=CD");
+    }
+
+    #[test]
+    fn run_add_otpauth_overrides_totp_secret() {
+        let p = make_vault("addotp");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // --data 里 totp_secret 占位为空,--otpauth 应覆盖。
+        let data = r#"{"type":"password","username":"bob","password":"pw","url":"https://x","totp_secret":"","notes":""}"#;
+        let uri = "otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example";
+        let id = run_add(&u, "Totp", data, vec![], false, None, Some(uri)).unwrap();
+        let got = store::get_item(u.db.conn(), id).unwrap().unwrap();
+        assert_eq!(item_field(&got, "totp").unwrap(), "JBSWY3DPEHPK3PXP");
+        // 覆盖的 secret 能直接生成 TOTP。
+        assert!(otp_of_item(&got).is_ok());
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_add_otpauth_non_password_errors() {
+        let p = make_vault("addotpnp");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let data = r#"{"type":"note","format":"text","content":"hi"}"#;
+        let uri = "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP";
+        let err = run_add(&u, "N", data, vec![], false, None, Some(uri));
+        assert!(matches!(err, Err(Error::Other(m)) if m.contains("--otpauth")));
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_add_otpauth_coexists_with_gen_password() {
+        // --gen-password 填 password,--otpauth 填 totp_secret,两者共存。
+        let p = make_vault("addotpgen");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let data = r#"{"type":"password","username":"bob","password":"old","url":"","totp_secret":"","notes":""}"#;
+        let uri = "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP";
+        let id = run_add(&u, "Both", data, vec![], false, Some(12), Some(uri)).unwrap();
+        let got = store::get_item(u.db.conn(), id).unwrap().unwrap();
+        let pw = item_field(&got, "password").unwrap();
+        assert_eq!(pw.len(), 12);
+        assert_ne!(pw, "old");
+        assert_eq!(item_field(&got, "totp").unwrap(), "JBSWY3DPEHPK3PXP");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_edit_otpauth_overrides_totp_secret() {
+        let p = make_vault("editotp");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // id=1 GitHub 原 totp_secret = JBSWY3DPEHPK3PXP;改成新的。
+        let uri = "otpauth://totp/X?secret=GEZDGNBVGY3TQOJQ";
+        run_edit(
+            &u,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &EditFields::default(),
+            &TagDelta::default(),
+            Some(uri),
+        )
+        .unwrap();
+        let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
+        assert_eq!(item_field(&got, "totp").unwrap(), "GEZDGNBVGY3TQOJQ");
+        cleanup(&p);
+    }
+
+    // --- Task 2: 单字段 flag(EditFields) ---
+
+    #[test]
+    fn edit_fields_apply_password() {
+        let mut data = ItemData::Password {
+            username: "u".into(),
+            password: "p".into(),
+            url: "".into(),
+            totp_secret: "".into(),
+            notes: "".into(),
+        };
+        let f = EditFields {
+            username: Some("bob".into()),
+            url: Some("https://y".into()),
+            ..Default::default()
+        };
+        assert!(f.apply(&mut data));
+        match data {
+            ItemData::Password {
+                username, url, ..
+            } => {
+                assert_eq!(username, "bob");
+                assert_eq!(url, "https://y");
+            }
+            _ => panic!("still password"),
+        }
+    }
+
+    #[test]
+    fn edit_fields_apply_note_content() {
+        let mut data = ItemData::Note {
+            format: "text".into(),
+            content: "old".into(),
+        };
+        let f = EditFields {
+            content: Some("new body".into()),
+            ..Default::default()
+        };
+        assert!(f.apply(&mut data));
+        match data {
+            ItemData::Note { content, .. } => assert_eq!(content, "new body"),
+            _ => panic!("still note"),
+        }
+    }
+
+    #[test]
+    fn edit_fields_apply_card_fields() {
+        let mut data = ItemData::Card {
+            holder: "h".into(),
+            number: "n".into(),
+            expiry: "e".into(),
+            cvv: "c".into(),
+            bank: "b".into(),
+            notes: "".into(),
+        };
+        let f = EditFields {
+            holder: Some("HH".into()),
+            cvv: Some("999".into()),
+            ..Default::default()
+        };
+        assert!(f.apply(&mut data));
+        match data {
+            ItemData::Card { holder, cvv, .. } => {
+                assert_eq!(holder, "HH");
+                assert_eq!(cvv, "999");
+            }
+            _ => panic!("still card"),
+        }
+    }
+
+    #[test]
+    fn run_edit_single_field_username() {
+        let p = make_vault("editfield");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let f = EditFields {
+            username: Some("bob".into()),
+            ..Default::default()
+        };
+        run_edit(
+            &u,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &f,
+            &TagDelta::default(),
+            None,
+        )
+        .unwrap();
+        let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
+        assert_eq!(item_field(&got, "username").unwrap(), "bob");
+        // 其余字段未动。
+        assert_eq!(item_field(&got, "password").unwrap(), "s3cret");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_edit_data_conflicts_with_field_flags() {
+        let p = make_vault("editconf");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let f = EditFields {
+            username: Some("bob".into()),
+            ..Default::default()
+        };
+        let err = run_edit(
+            &u,
+            1,
+            None,
+            Some(r#"{"type":"note","format":"text","content":"x"}"#),
+            None,
+            None,
+            None,
+            &f,
+            &TagDelta::default(),
+            None,
+        );
+        assert!(matches!(err, Err(Error::Other(m)) if m.contains("conflicts with field flags")));
+        cleanup(&p);
+    }
+
+    // --- Task 3: 单标签增删(TagDelta) ---
+
+    #[test]
+    fn tag_delta_add_dedup_and_remove() {
+        let d = TagDelta {
+            add: vec!["c".into()],
+            remove: vec![],
+        };
+        // 追加 c。
+        assert_eq!(d.apply(&["a".into(), "b".into()]), vec!["a", "b", "c"]);
+        // 已存在则跳过(去重)。
+        assert_eq!(d.apply(&["a".into(), "c".into()]), vec!["a", "c"]);
+
+        let d2 = TagDelta {
+            add: vec![],
+            remove: vec!["a".into()],
+        };
+        // 移除 a。
+        assert_eq!(d2.apply(&["a".into(), "b".into()]), vec!["b"]);
+    }
+
+    #[test]
+    fn run_edit_add_and_rm_tag() {
+        let p = make_vault("edittagdelta");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // id=1 GitHub tags=[work,vip];add c,rm a(不存在,无害)。
+        let d = TagDelta {
+            add: vec!["c".into()],
+            remove: vec!["a".into()],
+        };
+        run_edit(
+            &u,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &EditFields::default(),
+            &d,
+            None,
+        )
+        .unwrap();
+        let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
+        // store 按 tag 名升序回读:c < vip < work。
+        assert_eq!(got.tags, vec!["c".to_string(), "vip".to_string(), "work".into()]);
+
+        // 再 rm vip。
+        let d2 = TagDelta {
+            add: vec![],
+            remove: vec!["vip".into()],
+        };
+        run_edit(
+            &u,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &EditFields::default(),
+            &d2,
+            None,
+        )
+        .unwrap();
+        let got = store::get_item(u.db.conn(), 1).unwrap().unwrap();
+        assert_eq!(got.tags, vec!["c".to_string(), "work".into()]);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_edit_tag_conflicts_with_delta() {
+        let p = make_vault("edittagconf");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let d = TagDelta {
+            add: vec!["c".into()],
+            remove: vec![],
+        };
+        let err = run_edit(
+            &u,
+            1,
+            None,
+            None,
+            Some(vec!["x".into()]), // --tag 整体覆盖
+            None,
+            None,
+            &EditFields::default(),
+            &d,
+            None,
+        );
+        assert!(matches!(err, Err(Error::Other(m)) if m.contains("--tag conflicts")));
+        cleanup(&p);
+    }
+
+    // --- Task 4: 标题定位(find_item_id_by_title / resolve_id) ---
+
+    #[test]
+    fn find_item_id_exact_then_prefix() {
+        let p = make_vault("find");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let conn = u.db.conn();
+        // exact 命中 GitHub(id=1)。
+        assert_eq!(find_item_id_by_title(conn, "GitHub").unwrap(), 1);
+        // 前缀唯一:Git -> GitHub。
+        assert_eq!(find_item_id_by_title(conn, "Git").unwrap(), 1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn find_item_id_ambiguous_and_none() {
+        // 造两条同前缀的条目。
+        let p = make_vault("findamb");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let data = r#"{"type":"password","username":"x","password":"p","url":"","totp_secret":"","notes":""}"#;
+        let _id1 = run_add(&u, "GitLab", data, vec![], false, None, None).unwrap();
+        let conn = u.db.conn();
+        // 现在 Git* 有 GitHub + GitLab → 歧义。
+        let err = find_item_id_by_title(conn, "Git");
+        assert!(matches!(err, Err(Error::Other(m)) if m.contains("multiple items match 'Git'")));
+        // 无匹配。
+        let err2 = find_item_id_by_title(conn, "NopeXYZ");
+        assert!(matches!(err2, Err(Error::Other(m)) if m.contains("no item matches")));
+        cleanup(&p);
+    }
+
+    #[test]
+    fn resolve_id_prefers_positional_then_find() {
+        let p = make_vault("resolve");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let conn = u.db.conn();
+        // 位置 id 优先。
+        assert_eq!(resolve_id(conn, Some(2), Some("GitHub")).unwrap(), 2);
+        // 仅 find → 解析到 GitHub(1)。
+        assert_eq!(resolve_id(conn, None, Some("GitHub")).unwrap(), 1);
+        // 都缺 → 报错。
+        assert!(resolve_id(conn, None, None).is_err());
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_get_via_find_locates_item() {
+        // 端到端:get 经 resolve_id(--find) 定位,只验证 run_get 返回 Ok。
+        let p = make_vault("getfind");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let conn = u.db.conn();
+        let id = resolve_id(conn, None, Some("Git")).unwrap();
+        assert_eq!(id, 1);
+        assert!(run_get(&u, id, Some("username"), false).is_ok());
         cleanup(&p);
     }
 }

@@ -25,6 +25,9 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// Edit 变体字段众多导致与其它子命令体积差异较大;但 Command 仅在启动时解析一次、
+// 立即 destructure 分发,不会大量堆叠或移动,boxing 反而徒增复杂度,故允许。
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// 创建新的加密库(进入 TUI)。
     New {
@@ -74,14 +77,17 @@ enum Command {
     Get {
         /// 库文件路径。
         path: PathBuf,
-        /// 条目 id。
-        id: i64,
+        /// 条目 id(与 --find 至少给其一)。
+        id: Option<i64>,
         /// 仅打印该字段(title/username/password/url/totp/notes/format/content/holder/number/expiry/cvv/bank)。
         #[arg(short, long, value_name = "FIELD")]
         field: Option<String>,
         /// 以 JSON 输出整条条目(与 -f 互斥语义:--json 时忽略 -f)。
         #[arg(long)]
         json: bool,
+        /// 按标题定位条目(exact 优先,否则唯一前缀匹配)。
+        #[arg(long, value_name = "TITLE")]
+        find: Option<String>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -103,8 +109,11 @@ enum Command {
     Otp {
         /// 库文件路径。
         path: PathBuf,
-        /// 条目 id(须为 password 条目且含 totp_secret)。
-        id: i64,
+        /// 条目 id(须为 password 条目且含 totp_secret;与 --find 至少给其一)。
+        id: Option<i64>,
+        /// 按标题定位条目(exact 优先,否则唯一前缀匹配)。
+        #[arg(long, value_name = "TITLE")]
+        find: Option<String>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -113,14 +122,17 @@ enum Command {
     Cp {
         /// 库文件路径。
         path: PathBuf,
-        /// 条目 id。
-        id: i64,
+        /// 条目 id(与 --find 至少给其一)。
+        id: Option<i64>,
         /// 要复制的字段(默认 password)。
         #[arg(short, long, value_name = "FIELD")]
         field: Option<String>,
         /// 自动清空剪贴板的秒数(默认 20)。
         #[arg(long, value_name = "SECS", default_value_t = 20)]
         clear: u64,
+        /// 按标题定位条目(exact 优先,否则唯一前缀匹配)。
+        #[arg(long, value_name = "TITLE")]
+        find: Option<String>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -144,6 +156,9 @@ enum Command {
         /// 自动生成 password 条目的密码字段(可带长度,如 --gen-password 24)。仅 password 类型生效。
         #[arg(long, value_name = "LEN", num_args = 0..=1, default_missing_value = "20")]
         gen_password: Option<usize>,
+        /// otpauth:// URI:解析出 secret,覆盖 password 条目的 totp_secret(仅 password 类型生效)。与 --gen-password 可共存。
+        #[arg(long, value_name = "URI")]
+        otpauth: Option<String>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -160,19 +175,19 @@ enum Command {
         #[arg(long = "no-ambiguous")]
         no_ambiguous: bool,
     },
-    /// 修改已有条目的字段(无头)。至少提供 --title/--data/--tag/--favorite/--no-favorite 之一。
+    /// 修改已有条目的字段(无头)。至少提供 --title/--data/--tag/--favorite/--no-favorite/单字段/--add-tag/--rm-tag/--otpauth 之一。
     Edit {
         /// 库文件路径。
         path: PathBuf,
-        /// 条目 id。
-        id: i64,
+        /// 条目 id(与 --find 至少给其一)。
+        id: Option<i64>,
         /// 新标题。
         #[arg(long, value_name = "TITLE")]
         title: Option<String>,
-        /// 完整 ItemData JSON,含 `"type"` tag(替换整块 data)。
+        /// 完整 ItemData JSON,含 `"type"` tag(替换整块 data)。与单字段 flag 互斥。
         #[arg(long, value_name = "JSON")]
         data: Option<String>,
-        /// 标签(可重复;整体覆盖)。
+        /// 标签(可重复;整体覆盖)。与 --add-tag/--rm-tag 互斥。
         #[arg(long = "tag", value_name = "TAG")]
         tags: Option<Vec<String>>,
         /// 设为收藏。
@@ -184,6 +199,53 @@ enum Command {
         /// 设置分类(按名称;不存在则报错)。
         #[arg(long, value_name = "CATEGORY")]
         cat: Option<String>,
+        // --- 单字段覆盖(仅对相应类型生效;与 --data 互斥)---
+        /// password: 用户名。
+        #[arg(long, value_name = "S")]
+        username: Option<String>,
+        /// password: 密码。
+        #[arg(long, value_name = "S")]
+        password: Option<String>,
+        /// password: URL。
+        #[arg(long, value_name = "S")]
+        url: Option<String>,
+        /// password: TOTP secret(base32)。
+        #[arg(long, value_name = "S")]
+        totp: Option<String>,
+        /// password/card: 备注。
+        #[arg(long, value_name = "S")]
+        notes: Option<String>,
+        /// note: 正文。
+        #[arg(long, value_name = "S")]
+        content: Option<String>,
+        /// card: 持卡人。
+        #[arg(long, value_name = "S")]
+        holder: Option<String>,
+        /// card: 卡号。
+        #[arg(long, value_name = "S")]
+        number: Option<String>,
+        /// card: 有效期。
+        #[arg(long, value_name = "S")]
+        expiry: Option<String>,
+        /// card: CVV。
+        #[arg(long, value_name = "S")]
+        cvv: Option<String>,
+        /// card: 发卡行。
+        #[arg(long, value_name = "S")]
+        bank: Option<String>,
+        // --- 标签增删(与 --tag 整体覆盖互斥)---
+        /// 追加标签(可重复;去重)。
+        #[arg(long = "add-tag", value_name = "TAG")]
+        add_tags: Vec<String>,
+        /// 移除标签(可重复)。
+        #[arg(long = "rm-tag", value_name = "TAG")]
+        rm_tags: Vec<String>,
+        /// otpauth:// URI:解析出 secret,覆盖 password 条目的 totp_secret(仅 password 类型生效)。
+        #[arg(long, value_name = "URI")]
+        otpauth: Option<String>,
+        /// 按标题定位条目(exact 优先,否则唯一前缀匹配)。
+        #[arg(long, value_name = "TITLE")]
+        find: Option<String>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -192,11 +254,14 @@ enum Command {
     Rm {
         /// 库文件路径。
         path: PathBuf,
-        /// 条目 id。
-        id: i64,
+        /// 条目 id(与 --find 至少给其一)。
+        id: Option<i64>,
         /// 跳过确认提示。
         #[arg(short = 'y', long)]
         yes: bool,
+        /// 按标题定位条目(exact 优先,否则唯一前缀匹配)。
+        #[arg(long, value_name = "TITLE")]
+        find: Option<String>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -449,9 +514,11 @@ fn run() -> color_eyre::Result<()> {
             id,
             field,
             json,
+            find,
             passfile,
         } => {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_get(&u, id, field.as_deref(), json)?;
         }
         Command::Search {
@@ -466,9 +533,11 @@ fn run() -> color_eyre::Result<()> {
         Command::Otp {
             path,
             id,
+            find,
             passfile,
         } => {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_otp(&u, id)?;
         }
         Command::Cp {
@@ -476,9 +545,11 @@ fn run() -> color_eyre::Result<()> {
             id,
             field,
             clear,
+            find,
             passfile,
         } => {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_cp(&u, id, field.as_deref(), clear)?;
         }
         Command::Add {
@@ -488,10 +559,19 @@ fn run() -> color_eyre::Result<()> {
             tags,
             favorite,
             gen_password,
+            otpauth,
             passfile,
         } => {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
-            zkv::cli::run_add(&u, &title, &data, tags, favorite, gen_password)?;
+            zkv::cli::run_add(
+                &u,
+                &title,
+                &data,
+                tags,
+                favorite,
+                gen_password,
+                otpauth.as_deref(),
+            )?;
         }
         // gen:纯生成,不解锁库、不需要口令。
         Command::Gen {
@@ -510,6 +590,21 @@ fn run() -> color_eyre::Result<()> {
             favorite,
             no_favorite,
             cat,
+            username,
+            password,
+            url,
+            totp,
+            notes,
+            content,
+            holder,
+            number,
+            expiry,
+            cvv,
+            bank,
+            add_tags,
+            rm_tags,
+            otpauth,
+            find,
             passfile,
         } => {
             // 两个独立 bool flag 合成 Option<bool>:--favorite → Some(true),
@@ -521,7 +616,26 @@ fn run() -> color_eyre::Result<()> {
             } else {
                 None
             };
+            let fields = zkv::cli::EditFields {
+                username,
+                password,
+                url,
+                totp,
+                notes,
+                content,
+                holder,
+                number,
+                expiry,
+                cvv,
+                bank,
+            };
+            // 单字段 flag 集合(收集到 fields 后,main 层不单独校验互斥;run_edit 兜底)。
+            let tag_delta = zkv::cli::TagDelta {
+                add: add_tags,
+                remove: rm_tags,
+            };
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_edit(
                 &u,
                 id,
@@ -530,15 +644,20 @@ fn run() -> color_eyre::Result<()> {
                 tags,
                 fav,
                 cat.as_deref(),
+                &fields,
+                &tag_delta,
+                otpauth.as_deref(),
             )?;
         }
         Command::Rm {
             path,
             id,
             yes,
+            find,
             passfile,
         } => {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_rm(&u, id, yes)?;
         }
         // 嵌套子命令:先从 action 中取出 path + passfile → unlock → 交给 cli 层的
