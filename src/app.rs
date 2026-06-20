@@ -341,20 +341,23 @@ impl App {
         vault::save_with_key(path, key, &kdf, salt, db)
     }
 
-    /// 锁定:清空 db/passphrase,切回 Normal,清空 items/categories/tags。
+    /// 锁定:清空 db/master_key/salt/kdf 与 items/categories/tags,切回口令输入态
+    /// (`PromptPassphrase(Open)`)——保留 `self.path`,以便用户在 TUI 内原地重新输口令
+    /// 解锁(Enter 走 `handle_passphrase(Open)` → `vault::unlock`)。手动 `l` 键与
+    /// 自动锁定共用此路径。
     pub fn lock(&mut self) {
         self.db = None;
         self.master_key = None;
         self.salt = None;
         self.kdf = None;
-        self.mode = Mode::Normal;
+        self.mode = Mode::PromptPassphrase(PassKind::Open);
         self.items.clear();
         self.categories.clear();
         self.tags.clear();
         self.selected = 0;
         self.filter = Filter::default();
         self.input.clear();
-        self.input_mask = false;
+        self.input_mask = true;
         self.editor = None;
         self.message = Some("locked".into());
     }
@@ -1585,7 +1588,20 @@ mod tests {
         assert!(app.db.is_none());
         assert!(app.master_key.is_none());
         assert!(app.items.is_empty());
-        assert!(matches!(app.mode, Mode::Normal));
+        assert!(matches!(app.mode, Mode::PromptPassphrase(PassKind::Open)));
+    }
+
+    #[test]
+    fn lock_keeps_path_and_enters_prompt_for_reunlock() {
+        // lock() 后:path 保留(可原地重解锁)、mode 为 PromptPassphrase(Open)、
+        // db 为 None、口令输入掩码开启。
+        let mut app = app_with_items(1);
+        let kept_path = app.path.clone();
+        app.lock();
+        assert_eq!(app.path, kept_path, "lock must not clear path");
+        assert!(matches!(app.mode, Mode::PromptPassphrase(PassKind::Open)));
+        assert!(app.db.is_none());
+        assert!(app.input_mask, "lock should enable passphrase masking");
     }
 
     #[test]

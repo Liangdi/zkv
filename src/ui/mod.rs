@@ -11,6 +11,7 @@ pub mod list;
 pub mod theme;
 
 use std::io::{self, Stdout};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
 use crossterm::terminal::{
@@ -62,14 +63,22 @@ pub fn run(mut app: App) -> Result<()> {
 }
 
 fn main_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
+    let lock_secs = lock_timeout_secs();
+    let mut last_activity = Instant::now();
     loop {
+        // 每轮循环都检查自动锁定(而非只在 poll 超时分支):PTY / 终端下可能
+        // 持续到达非按键事件(Resize/Focus/Mouse 等),使 event::poll 总返回
+        // true、永不走超时分支;把检查放在循环顶部可保证超时后必触发锁定,
+        // 且锁定后随后的 draw 会渲染口令面板。
+        maybe_auto_lock(app, lock_secs, &last_activity);
+
         if terminal.draw(|f| draw(f, app)).is_err() {
             // draw 失败(终端消失等):直接退出循环,由 guard 恢复。
             break;
         }
 
-        // 阻塞等待事件;poll 返回 false(超时)时重绘即可。
-        let Ok(true) = event::poll(std::time::Duration::from_millis(250)) else {
+        // 阻塞等待事件;poll 返回 false(超时)时直接进入下一轮(顶部再检查)。
+        let Ok(true) = event::poll(Duration::from_millis(250)) else {
             continue;
         };
         let ev = match event::read() {
@@ -78,6 +87,8 @@ fn main_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
         };
 
         if let Event::Key(key) = ev {
+            // 任意按键都算用户活动,刷新计时基准。
+            last_activity = Instant::now();
             let action = app.handle_key(key)?;
             if matches!(action, Action::Quit) || app.quit {
                 break;
@@ -85,6 +96,37 @@ fn main_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 自动锁定超时阈值(秒)。读环境变量 `ZKV_LOCK_SECS`:
+/// - 缺失 / 解析失败 / 非法 → 默认 **300**(5 分钟);
+/// - `0` → **禁用**自动锁定。
+///
+/// 本函数只**读** env,不写,故无需 unsafe。
+fn lock_timeout_secs() -> u64 {
+    const DEFAULT: u64 = 300;
+    let Some(raw) = std::env::var_os("ZKV_LOCK_SECS") else {
+        return DEFAULT;
+    };
+    // 借助 String 解析:可一并拒绝带 `+`/`-` 之外的非法值与负值(u64 不含负数)。
+    match raw.to_string_lossy().parse::<u64>() {
+        Ok(v) => v,
+        Err(_) => DEFAULT,
+    }
+}
+
+/// 在主循环里检查是否已超过闲置阈值;若是则调用 `app.lock()`。
+/// `lock_secs == 0` 禁用;`app.db.is_none()` 表示已锁/未解锁,不重复锁。
+fn maybe_auto_lock(app: &mut App, lock_secs: u64, last_activity: &Instant) {
+    if lock_secs == 0 {
+        return;
+    }
+    if app.db.is_none() {
+        return;
+    }
+    if last_activity.elapsed() >= Duration::from_secs(lock_secs) {
+        app.lock();
+    }
 }
 
 /// 单帧渲染:按 `app.mode` 分发。
@@ -501,5 +543,55 @@ impl Drop for TerminalGuard {
         let mut out = io::stdout();
         let _ = execute!(out, LeaveAlternateScreen);
         let _ = disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 串行化所有读写 `ZKV_LOCK_SECS` 的测试:env 非线程隔离,
+    /// 默认并行测试运行器下多个测试并发 set/remove 同一 env 会产生竞态。
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap()
+    }
+
+    #[test]
+    fn lock_timeout_secs_reads_env() {
+        let _g = env_lock();
+
+        // 0 = 禁用。
+        // SAFETY: 持 env_lock,本函数内串行 set/remove,无并发竞态。
+        unsafe {
+            std::env::set_var("ZKV_LOCK_SECS", "0");
+        }
+        assert_eq!(lock_timeout_secs(), 0);
+
+        // 正常值。
+        // SAFETY: 同上。
+        unsafe {
+            std::env::set_var("ZKV_LOCK_SECS", "60");
+        }
+        assert_eq!(lock_timeout_secs(), 60);
+
+        // 非法 / 负值 → 默认 300。
+        // SAFETY: 同上。
+        unsafe {
+            std::env::set_var("ZKV_LOCK_SECS", "not-a-number");
+        }
+        assert_eq!(lock_timeout_secs(), 300);
+        unsafe {
+            std::env::set_var("ZKV_LOCK_SECS", "-5");
+        }
+        assert_eq!(lock_timeout_secs(), 300);
+
+        // 缺失 env → 默认 300。
+        // SAFETY: 同上。
+        unsafe {
+            std::env::remove_var("ZKV_LOCK_SECS");
+        }
+        assert_eq!(lock_timeout_secs(), 300);
     }
 }
