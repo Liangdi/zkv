@@ -216,6 +216,36 @@ enum Command {
         #[command(subcommand)]
         action: AttachCmd,
     },
+    /// 导出全部条目(明文!stdout 或 -o 文件)。json 无损;csv 仅 password。
+    Export {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 导出格式(json 无损;csv 仅 password)。
+        #[arg(long, value_enum, default_value_t = zkv::cli::Format::Json)]
+        format: zkv::cli::Format,
+        /// 输出文件路径(省略则写 stdout)。**输出为明文,文件建议 0600**。
+        #[arg(short = 'o', long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+    /// 从文件或 stdin 导入条目(--format,默认 json)。
+    ///
+    /// 总是新建 id(不覆盖);重复导入会创建重复条目。
+    Import {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 输入文件路径(省略则读 stdin)。
+        #[arg(short = 'i', long, value_name = "PATH")]
+        input: Option<PathBuf>,
+        /// 导入格式(同 export)。
+        #[arg(long, value_enum, default_value_t = zkv::cli::Format::Json)]
+        format: zkv::cli::Format,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
 }
 
 /// `cat` 子命令组(分类管理)。
@@ -527,6 +557,24 @@ fn run() -> color_eyre::Result<()> {
             let (path, passfile) = attach_path_passfile(&action);
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             run_attach(&u, &action)?;
+        }
+        Command::Export {
+            path,
+            format,
+            output,
+            passfile,
+        } => {
+            let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            zkv::cli::run_export(&u, format, output.as_deref())?;
+        }
+        Command::Import {
+            path,
+            input,
+            format,
+            passfile,
+        } => {
+            let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            zkv::cli::run_import(&u, format, input.as_deref())?;
         }
     }
     Ok(())

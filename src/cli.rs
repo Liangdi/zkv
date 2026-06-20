@@ -765,6 +765,330 @@ pub fn run_attach_rm(u: &Unlocked, item: i64, att: i64) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// 导入/导出(import/export)
+// ---------------------------------------------------------------------------
+
+/// 导入结果:成功条数与失败条数(逐条容错,失败不中断)。
+pub struct ImportResult {
+    /// 成功插入的条数。
+    pub ok: usize,
+    /// 解析/插入失败的条数。
+    pub fail: usize,
+}
+
+/// 导出格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum Format {
+    /// JSON(完整、无损,推荐迁移/备份)。
+    Json,
+    /// CSV(扁平,仅 password 类型,人可读/表格)。
+    Csv,
+}
+
+// --- 纯函数(便于单测) ---
+
+/// 把条目列表序列化为紧凑 JSON 字符串(无损往返)。
+pub fn export_json(items: &[Item]) -> Result<String> {
+    Ok(serde_json::to_string(items)?)
+}
+
+/// 解析 JSON 字符串为条目列表。整体解析失败返回 Err。
+pub fn import_json(s: &str) -> Result<Vec<Item>> {
+    Ok(serde_json::from_str::<Vec<Item>>(s)?)
+}
+
+/// 把 password 类型的条目序列化为 CSV 字符串。
+///
+/// 首行 header:`title,username,password,url,totp_secret,notes,tags`。
+/// 非 password 条目被跳过(返回跳过计数,供调用方提示)。
+/// 字段用 CSV 双引号转义:含逗号/引号/换行 → 引号包裹,内部引号翻倍。
+/// tags 列用 `;` 分隔。
+///
+/// 返回 `(csv, skipped)`:skipped 为被跳过的非 password 条目数。
+pub fn export_csv(items: &[Item]) -> (String, usize) {
+    let mut out = String::from("title,username,password,url,totp_secret,notes,tags\n");
+    let mut skipped = 0usize;
+    for it in items {
+        let (username, password, url, totp_secret, notes) = match &it.data {
+            ItemData::Password {
+                username,
+                password,
+                url,
+                totp_secret,
+                notes,
+            } => (username, password, url, totp_secret, notes),
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+        out.push_str(&csv_join(&[
+            &it.title,
+            username,
+            password,
+            url,
+            totp_secret,
+            notes,
+            &it.tags.join(";"),
+        ]));
+        out.push('\n');
+    }
+    (out, skipped)
+}
+
+/// 解析 CSV 字符串为 password 条目列表。
+///
+/// 第一行须为 header(顺序无关,按列名取 title/username/password/url/totp_secret/notes/tags)。
+/// 缺失的列按空串处理。tags 列按 `;` 分割。逐行容错:坏行计入失败。
+///
+/// 返回 `Result<(items, fail)>`:整体(无数据行/空输入)返回 ok+fail=0;
+/// 头部完全缺失列名结构时返回 `(items, fail)`。
+pub fn import_csv(s: &str) -> Result<(Vec<Item>, usize)> {
+    let rows = csv_split(s);
+    if rows.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let header = &rows[0];
+    // 列名 → 列索引。
+    let idx = |name: &str| -> Option<usize> {
+        header.iter().position(|h| h == name)
+    };
+    let Some(i_title) = idx("title") else {
+        return Err(Error::Other(
+            "csv header missing 'title' column".into(),
+        ));
+    };
+
+    let get = |row: &[String], i: Option<usize>| -> String {
+        i.and_then(|n| row.get(n).cloned()).unwrap_or_default()
+    };
+
+    let mut items = Vec::new();
+    let mut fail = 0usize;
+    for row in &rows[1..] {
+        // 空行(全空字段)或无 title 数据 → 跳过并计入失败。
+        if row.is_empty() || row.iter().all(|f| f.is_empty()) {
+            fail += 1;
+            continue;
+        }
+        // 行太短(缺 title 列)容错跳过。
+        if row.len() <= i_title {
+            fail += 1;
+            continue;
+        }
+        let title = row[i_title].clone();
+        let username = get(row, idx("username"));
+        let password = get(row, idx("password"));
+        let url = get(row, idx("url"));
+        let totp_secret = get(row, idx("totp_secret"));
+        let notes = get(row, idx("notes"));
+        let tags_raw = get(row, idx("tags"));
+        let tags: Vec<String> = tags_raw
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let item = Item {
+            id: None,
+            item_type: ItemType::Password,
+            title,
+            category_id: None,
+            data: ItemData::Password {
+                username,
+                password,
+                url,
+                totp_secret,
+                notes,
+            },
+            favorite: false,
+            tags,
+            created_at: 0,
+            updated_at: 0,
+        };
+        items.push(item);
+    }
+    Ok((items, fail))
+}
+
+/// CSV 字段转义:含逗号/双引号/换行/回车 → 用双引号包裹,内部双引号翻倍。
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
+    }
+}
+
+/// 把若干字段用逗号连接为一行(每个字段先转义)。
+fn csv_join(fields: &[&str]) -> String {
+    fields
+        .iter()
+        .map(|f| csv_field(f))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 把 CSV 文本按行解析成二维 `Vec<String>`(正确处理引号包裹与换行)。
+///
+/// 简易状态机:`in_quotes` 时逗号/换行视作字段内容;`""` 翻译为单个 `"`。
+/// 行尾无内容(空行)仍产出一个空行向量。
+fn csv_split(s: &str) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                // 前瞻:连续两个引号 → 字面引号,否则结束引号段。
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == ',' {
+            row.push(std::mem::take(&mut field));
+        } else if c == '\n' {
+            // CRLF:去掉已压入的 \r。
+            if field.ends_with('\r') {
+                field.pop();
+            }
+            row.push(std::mem::take(&mut field));
+            rows.push(std::mem::take(&mut row));
+        } else {
+            field.push(c);
+        }
+    }
+    // 末尾残留(无换行结尾,或文件结尾)。
+    if !field.is_empty() || !row.is_empty() {
+        if field.ends_with('\r') {
+            field.pop();
+        }
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
+/// `export`:把全库条目按 `format` 导出。
+///
+/// - JSON:完整 `Vec<Item>`(含 type/data/tags),无损。
+/// - CSV:仅 password 类型,扁平 7 列。
+///
+/// `output = Some(p)` → 写文件(0600);`None` → stdout。
+/// **输出为明文**(命令已解锁,用户主动导出)。CSV 模式下非 password 条目被跳过,
+/// 向 stderr 提示 `skipped N non-password items`。
+pub fn run_export(
+    u: &Unlocked,
+    format: Format,
+    output: Option<&Path>,
+) -> Result<()> {
+    let conn = u.db.conn();
+    let items = store::list_items(conn)?;
+    let content = match format {
+        Format::Json => export_json(&items)?,
+        Format::Csv => {
+            let (csv, skipped) = export_csv(&items);
+            if skipped > 0 {
+                eprintln!("skipped {skipped} non-password items");
+            }
+            csv
+        }
+    };
+    match output {
+        Some(p) => {
+            write_secret_file(p, content.as_bytes())?;
+            eprintln!("exported {} items to {}", items.len(), p.display());
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(content.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// `import`:从文件或 stdin 读入,按 `format` 解析并逐条 insert。
+///
+/// - `input = Some(p)` → 读文件;`None` → stdin。
+/// - 逐条容错:解析/插入失败计入 failed,不中断其余。
+/// - 每条 `id` 强制置 None(总是新建,从不覆盖;重复导入会创建重复条目)。
+/// - `created_at/updated_at` 为 0 时由 `insert_item` 填当前时间;否则保留原值。
+/// - 成功后 `save` 落盘。打印 `imported N items` 或 `imported N items (K failed)`。
+pub fn run_import(u: &Unlocked, format: Format, input: Option<&Path>) -> Result<ImportResult> {
+    let raw = match input {
+        Some(p) => std::fs::read_to_string(p)?,
+        None => {
+            use std::io::Read;
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        }
+    };
+
+    // 解析为候选条目列表(JSON 整体解析;CSV 逐行已在内部容错)。
+    let (candidates, parse_fail): (Vec<Item>, usize) = match format {
+        Format::Json => match import_json(&raw) {
+            Ok(v) => (v, 0),
+            Err(_) => (Vec::new(), 1), // 整体 JSON 坏掉:1 次失败。
+        },
+        Format::Csv => {
+            let (items, fail) = import_csv(&raw)?;
+            (items, fail)
+        }
+    };
+
+    let conn = u.db.conn();
+    let mut ok = 0usize;
+    let mut fail = parse_fail;
+    for mut item in candidates {
+        item.id = None; // 强制新 id。
+        // created/updated 为 0 由 insert_item 填当前时间;否则保留原值。
+        match store::insert_item(conn, &mut item) {
+            Ok(_) => ok += 1,
+            Err(_) => fail += 1,
+        }
+    }
+
+    if ok > 0 {
+        u.save()?;
+    }
+
+    if fail == 0 {
+        println!("imported {ok} items");
+    } else {
+        println!("imported {ok} items ({fail} failed)");
+    }
+    Ok(ImportResult { ok, fail })
+}
+
+/// 写文件并以 0600 权限收紧(导出明文落盘时降低泄漏面)。
+///
+/// 先 `write` 再 `set_permissions`,避免创建时被 umask 放宽。
+fn write_secret_file(path: &Path, data: &[u8]) -> Result<()> {
+    std::fs::write(path, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(path)?.permissions();
+        let mut perms = perms;
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 只读命令
 // ---------------------------------------------------------------------------
 
@@ -2025,6 +2349,306 @@ mod tests {
         let data = r#"{"type":"note","format":"text","content":"hi"}"#;
         let err = run_add(&u, "N", data, vec![], false, Some(20));
         assert!(matches!(err, Err(Error::Other(m)) if m.contains("--gen-password")));
+        cleanup(&p);
+    }
+
+    // --- 导入/导出(export/import) ---
+
+    /// 构造一组混合类型条目(含特殊字符用于 CSV 转义测试)。
+    fn sample_items() -> Vec<Item> {
+        vec![
+            Item {
+                id: Some(1),
+                item_type: ItemType::Password,
+                title: "GitHub".into(),
+                category_id: None,
+                data: ItemData::Password {
+                    username: "alice".into(),
+                    password: "p,ass\"word".into(), // 含逗号 + 引号
+                    url: "https://github.com".into(),
+                    totp_secret: "JBSWY3DPEHPK3PXP".into(),
+                    notes: "main\nline2".into(), // 含换行
+                },
+                favorite: true,
+                tags: vec!["work".into(), "vip".into()],
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_100,
+            },
+            Item {
+                id: Some(2),
+                item_type: ItemType::Note,
+                title: "Ideas".into(),
+                category_id: None,
+                data: ItemData::Note {
+                    format: "markdown".into(),
+                    content: "hello".into(),
+                },
+                favorite: false,
+                tags: vec![],
+                created_at: 0,
+                updated_at: 0,
+            },
+            Item {
+                id: Some(3),
+                item_type: ItemType::Password,
+                title: "Bank".into(),
+                category_id: None,
+                data: ItemData::Password {
+                    username: "bob".into(),
+                    password: "plain".into(),
+                    url: "".into(),
+                    totp_secret: "".into(),
+                    notes: "".into(),
+                },
+                favorite: false,
+                tags: vec!["finance".into()],
+                created_at: 0,
+                updated_at: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn json_roundtrip_lossless() {
+        let items = sample_items();
+        let json = export_json(&items).unwrap();
+        let back = import_json(&json).unwrap();
+        assert_eq!(back.len(), items.len());
+        // 字段逐一对比(id 也保留)。
+        for (a, b) in items.iter().zip(back.iter()) {
+            assert_eq!(a.title, b.title);
+            assert_eq!(a.item_type, b.item_type);
+            assert_eq!(a.data, b.data);
+            assert_eq!(a.tags, b.tags);
+            assert_eq!(a.favorite, b.favorite);
+        }
+    }
+
+    #[test]
+    fn import_json_bad_overall_errors() {
+        // 非 JSON 数组 → Err。
+        assert!(import_json("{ not json").is_err());
+        assert!(import_json("not an array").is_err());
+        // 空数组 → Ok 空。
+        assert!(import_json("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn csv_export_passwords_only_and_escapes() {
+        let items = sample_items();
+        let (csv, skipped) = export_csv(&items);
+        // note 条目被跳过。
+        assert_eq!(skipped, 1);
+        // header 行存在。
+        assert!(csv.starts_with("title,username,password"));
+        // 引号包裹的字段:含逗号/引号/换行 → 被引号包裹,内部引号翻倍。
+        assert!(csv.contains("\"p,ass\"\"word\""));
+        assert!(csv.contains("\"main\nline2\""));
+        // tags 用 ; 分隔。
+        assert!(csv.contains("work;vip"));
+        // 往返解析:恰好 header + 2 个 password 记录。
+        let (back, fail) = import_csv(&csv).unwrap();
+        assert_eq!(fail, 0);
+        assert_eq!(back.len(), 2);
+    }
+
+    #[test]
+    fn csv_roundtrip_password_fields() {
+        let items = sample_items();
+        let (csv, _) = export_csv(&items);
+        let (back, fail) = import_csv(&csv).unwrap();
+        assert_eq!(fail, 0);
+        // 只导出了 2 个 password。
+        assert_eq!(back.len(), 2);
+        assert!(back.iter().all(|i| i.item_type == ItemType::Password));
+
+        // GitHub 行字段一致(含特殊字符)。
+        let gh = back.iter().find(|i| i.title == "GitHub").unwrap();
+        assert_eq!(item_field(gh, "username").unwrap(), "alice");
+        assert_eq!(item_field(gh, "password").unwrap(), "p,ass\"word");
+        assert_eq!(item_field(gh, "notes").unwrap(), "main\nline2");
+        assert_eq!(gh.tags, vec!["work".to_string(), "vip".to_string()]);
+    }
+
+    #[test]
+    fn csv_import_skips_bad_rows() {
+        // header + 1 好行 + 1 坏行(title 列索引越界 → 计入 fail)。
+        let csv = "title,username,password\nok,u,p\n\n";
+        let (items, fail) = import_csv(csv).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "ok");
+        // 空行计为 fail(无 title 列数据)。
+        assert_eq!(fail, 1);
+    }
+
+    #[test]
+    fn csv_import_missing_title_header_errors() {
+        let csv = "username,password\nu,p\n";
+        assert!(import_csv(csv).is_err());
+        // 空输入 → Ok 空,不报错。
+        let (items, fail) = import_csv("").unwrap();
+        assert!(items.is_empty());
+        assert_eq!(fail, 0);
+    }
+
+    #[test]
+    fn csv_import_missing_columns_default_empty() {
+        // 只给 title 列,其余缺列按空串处理。
+        let csv = "title\nOnly\n";
+        let (items, fail) = import_csv(csv).unwrap();
+        assert_eq!(fail, 0);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Only");
+        assert_eq!(item_field(&items[0], "password").unwrap(), "");
+        assert!(items[0].tags.is_empty());
+    }
+
+    /// 端到端:导出 JSON 到新库导入,条数/字段一致。
+    #[test]
+    fn export_import_json_end_to_end() {
+        let p = make_vault("exp_json");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // 原库 2 条(make_vault)。
+        let src = store::list_items(u.db.conn()).unwrap();
+        assert_eq!(src.len(), 2);
+        let json = export_json(&src).unwrap();
+        drop(u);
+
+        // 新库 + 导入。
+        let p2 = tmp_path("exp_json_dst");
+        cleanup(&p2);
+        vault::create_with_params(&p2, "pw", &fast_kdf()).unwrap();
+        let pf2 = write_passfile("u2");
+        let u2 = Unlocked::unlock(&p2, Some(&pf2)).unwrap();
+        // 写到临时输入文件,经 run_import 文件路径。
+        let inp = tmp_path("exp_json_in");
+        std::fs::write(&inp, json).unwrap();
+        let res = run_import(&u2, Format::Json, Some(&inp)).unwrap();
+        assert_eq!(res.ok, 2);
+        assert_eq!(res.fail, 0);
+        cleanup(&inp);
+
+        // 验证导入后字段一致(按标题找)。
+        let dst = store::list_items(u2.db.conn()).unwrap();
+        assert_eq!(dst.len(), 2);
+        let gh = dst.iter().find(|i| i.title == "GitHub").unwrap();
+        assert_eq!(gh.item_type, ItemType::Password);
+        assert_eq!(item_field(gh, "username").unwrap(), "alice");
+        assert_eq!(gh.tags, vec!["vip".to_string(), "work".to_string()]);
+
+        // 导入的 id 应是新建(不等于导出源 id 的 None→被填)。
+        assert!(gh.id.is_some());
+        cleanup(&p);
+        cleanup(&p2);
+    }
+
+    /// 端到端:CSV 导入到库,password 条目字段一致。
+    #[test]
+    fn export_import_csv_end_to_end() {
+        let p = make_vault("exp_csv");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // 原库含 1 个 password(GitHub)+ 1 个 note(被跳过)。
+        let src = store::list_items(u.db.conn()).unwrap();
+        let (csv, skipped) = export_csv(&src);
+        assert_eq!(skipped, 1); // note 跳过
+        drop(u);
+
+        let p2 = tmp_path("exp_csv_dst");
+        cleanup(&p2);
+        vault::create_with_params(&p2, "pw", &fast_kdf()).unwrap();
+        let pf2 = write_passfile("u2");
+        let u2 = Unlocked::unlock(&p2, Some(&pf2)).unwrap();
+        let inp = tmp_path("exp_csv_in");
+        std::fs::write(&inp, csv).unwrap();
+        let res = run_import(&u2, Format::Csv, Some(&inp)).unwrap();
+        assert_eq!(res.ok, 1);
+        assert_eq!(res.fail, 0);
+        cleanup(&inp);
+
+        let dst = store::list_items(u2.db.conn()).unwrap();
+        assert_eq!(dst.len(), 1);
+        assert_eq!(dst[0].title, "GitHub");
+        assert_eq!(item_field(&dst[0], "username").unwrap(), "alice");
+        cleanup(&p);
+        cleanup(&p2);
+    }
+
+    /// 容错:JSON 含一条坏数据,整体解析失败(计入 fail)。
+    #[test]
+    fn run_import_json_bad_data_counts_failed() {
+        let p = make_vault("imp_bad");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // 整体坏 JSON → 解析失败,fail=1,ok=0,不 panic。
+        let inp = tmp_path("imp_bad_in");
+        std::fs::write(&inp, "{ not valid json array").unwrap();
+        let res = run_import(&u, Format::Json, Some(&inp)).unwrap();
+        assert_eq!(res.ok, 0);
+        assert_eq!(res.fail, 1);
+        cleanup(&inp);
+        cleanup(&p);
+    }
+
+    /// 容错:CSV 含坏行,好行仍导入。
+    #[test]
+    fn run_import_csv_partial_success() {
+        let p = make_vault("imp_csv_partial");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let inp = tmp_path("imp_csv_in");
+        // 1 好 + 1 空(fail)。
+        std::fs::write(&inp, "title,username,password\nGood,u,p\n\n").unwrap();
+        let res = run_import(&u, Format::Csv, Some(&inp)).unwrap();
+        assert_eq!(res.ok, 1);
+        assert_eq!(res.fail, 1);
+        cleanup(&inp);
+
+        // make_vault 已含 2 条,导入新增 1 条 → 共 3 条,含 Good。
+        let dst = store::list_items(u.db.conn()).unwrap();
+        assert_eq!(dst.len(), 3);
+        assert!(dst.iter().any(|i| i.title == "Good"));
+        cleanup(&p);
+    }
+
+    /// export -o 写文件;空库导出不报错。
+    #[test]
+    fn run_export_to_file_empty_vault() {
+        let p = tmp_path("exp_empty");
+        cleanup(&p);
+        vault::create_with_params(&p, "pw", &fast_kdf()).unwrap();
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let out = tmp_path("exp_empty_out");
+        // JSON 空数组导出。
+        run_export(&u, Format::Json, Some(&out)).unwrap();
+        let body = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(body.trim(), "[]");
+        cleanup(&out);
+        cleanup(&p);
+    }
+
+    /// import 不覆盖:重复导入创建重复条目。
+    #[test]
+    fn run_import_creates_duplicates() {
+        let p = tmp_path("imp_dup");
+        cleanup(&p);
+        vault::create_with_params(&p, "pw", &fast_kdf()).unwrap();
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+
+        let inp = tmp_path("imp_dup_in");
+        std::fs::write(&inp, "title,username,password\nDup,u,p\n").unwrap();
+
+        run_import(&u, Format::Csv, Some(&inp)).unwrap();
+        run_import(&u, Format::Csv, Some(&inp)).unwrap();
+
+        let dst = store::list_items(u.db.conn()).unwrap();
+        // 两次导入 → 两条重复。
+        assert_eq!(dst.len(), 2);
+        assert!(dst.iter().all(|i| i.title == "Dup"));
+        cleanup(&inp);
         cleanup(&p);
     }
 }
