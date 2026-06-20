@@ -5,18 +5,32 @@
 
 ## 当前状态
 
-- **阶段**:✅ **MVP 完成**(SA1–SA6 全部交付,端到端验证通过)
+- **阶段**:✅ **MVP 完成**(SA1–SA6 全部交付,端到端验证通过)+ 无头 CLI / TOTP 扩展
 - **最后更新**:2026-06-20
-- **验证**:`cargo build` / `cargo test`(59 passed, +1 ignored)/ `cargo build --release` / `cargo clippy --all-targets` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过。
+- **验证**:`cargo build` / `cargo test`(**98 passed**, +1 ignored)/ `cargo build --release` / `cargo clippy --all-targets` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过;无头 CLI 与 TOTP 经真二进制端到端冒烟验证(含 `otp` 与独立实现交叉比对)。
 
 ## 使用方法
 
 ```bash
-cargo run --release -- new   ~/my.zkv   # 创建新库(TUI 内设口令)
-cargo run --release -- open  ~/my.zkv   # 打开已有库(TUI 内输口令)
+zkv new   ~/my.zkv   # 创建新库(进入 TUI 设口令)
+zkv open  ~/my.zkv   # 打开已有库(进入 TUI 输口令)
 ```
 
-TUI 快捷键:`n` 新建 · `e` 编辑 · `x` 删除 · `/` 搜索 · `y` 复制密码(20s 自动清空) · `l` 锁定 · `c/t` 分类/标签管理 · `q` 退出。三类条目:密码 / 笔记 / 卡片。
+**无头 CLI**(可脚本化,无需 TTY;口令取自 `ZKV_PASSPHRASE` / `--passfile` / 交互):
+
+```bash
+zkv init   ~/my.zkv                              # 非交互建库(不进 TUI;已存在则报错)
+zkv ls     ~/my.zkv [-t password] [--tag T] [-q github] [--json]
+zkv get    ~/my.zkv <id> [-f password]           # -f 打印原始字段,便于管道
+zkv search ~/my.zkv <query>
+zkv otp    ~/my.zkv <id>                         # 打印当前 TOTP 6 位码到 stdout
+zkv cp     ~/my.zkv <id> [-f otp] [--clear 20]   # 复制字段(或实时 TOTP 码)到剪贴板
+zkv add    ~/my.zkv --title T --data '<ItemData JSON>' [--tag T] [--favorite]
+zkv edit   ~/my.zkv <id> [--title T] [--data '<json>'] [--tag T] [--favorite|--no-favorite]
+zkv rm     ~/my.zkv <id> [-y]                    # 默认交互确认,-y 跳过
+```
+
+TUI 快捷键:`n` 新建 · `e` 编辑 · `x` 删除 · `/` 搜索 · `y` 复制密码(20s 自动清空) · **`o` 复制 TOTP 验证码** · `l` 锁定 · `c/t` 分类/标签管理 · `q` 退出。三类条目:密码 / 笔记 / 卡片。
 
 ## 关键决策记录
 
@@ -26,11 +40,13 @@ TUI 快捷键:`n` 新建 · `e` 编辑 · `x` 删除 · `/` 搜索 · `y` 复制
 4. UI 主题:`ratatui-sci-fi` 0.2.0(默认 Cyberpunk;8 主题 Palette),作者即 Liangdi。
 5. MVC:App(L4)= Model+Controller;UI(L5)= View(只读 App pub 状态 + 转发 `KeyEvent`)。
 6. 安全:忘口令不可恢复;复制密码 20s 清空;`from_bytes` 用 backup 灌入真 `:memory:`(明文不落盘);`.zkv` 与临时文件均 0600,临时文件名取自 CSPRNG(不可预测);`MasterKey` 以 `ZeroizeOnDrop` 缓存于 App,`lock()` 即清零,App 不再驻留明文口令。
+7. **无头 CLI 架构**:新增 `cli.rs` 作为与 TUI 平行的前端,直接调 L2/L3(`vault`/`store`/`search`/`clipboard`),**不复用 `App`**(它和 TUI 的 `Mode`/`handle_key` 强耦合)。`Unlocked` 封装 `unlock_full` + `save_with_key`,读写共用;口令来源 `env ZKV_PASSPHRASE` → `--passfile` → rpassword,全程 `Zeroizing` 包裹。
+8. **TOTP**:新增 `totp.rs`(L1 纯计算,RFC 6238:HMAC-SHA1 + base32,依赖 `hmac`/`sha1`/`data-encoding`)。CLI `otp` 打印实时码、`cp -f otp` 复制码;TUI 详情页 password 条目显示**实时 6 位码 + 倒计时**而非掩码密钥,`o` 键复制。经 RFC 6238 官方测试向量 + Python 独立实现交叉验证。
 
 ## 模块架构与分层依赖
 
 ```
-error(L0✅) → crypto/model(L1✅) → db/vault(L2✅) → store/search/clipboard(L3✅) → app(L4✅) → ui(L5✅) → main(L6✅)
+error(L0✅) → crypto/model/totp(L1✅) → db/vault(L2✅) → store/search/clipboard(L3✅) → app(L4✅) → ui(L5✅) → main(L6✅)
 ```
 
 ```
@@ -38,14 +54,16 @@ src/
 ├── lib.rs · main.rs(clap CLI + color-eyre panic hook 恢复终端)
 ├── error.rs   L0 ✅  统一 Error/Result
 ├── crypto.rs  L1 ✅  Argon2id + XChaCha20-Poly1305, MasterKey(ZeroizeOnDrop)
+├── totp.rs    L1 ✅  RFC 6238(HMAC-SHA1 + base32),totp_at/current_totp
 ├── model.rs   L1 ✅  Item/ItemData/Category/Tag/Attachment
 ├── db.rs      L2 ✅  内存 SQLite + schema + FTS5 触发器 + dump/backup-to-memory
-├── vault.rs   L2 ✅  .zkv 容器(58B 头)+ create/unlock/save(原子写,0600)
+├── vault.rs   L2 ✅  .zkv 容器(58B 头)+ create/unlock_full/save_with_key(原子写,0600)
 ├── store.rs   L3 ✅  CRUD + search_text 自动刷新 + 标签挂载
 ├── search.rs  L3 ✅  FTS5 MATCH + sanitize_fts + 组合过滤
 ├── clipboard.rs L3 ✅ 系统命令后端(pbcopy/wl-copy/xclip/xsel)+ 定时清空
 ├── app.rs     L4 ✅  App/Mode/EditorState/handle_key 全状态机
-└── ui/        L5 ✅  mod(主循环+TerminalGuard)/theme(sci-fi)/list/detail/input
+├── ui/        L5 ✅  mod(主循环+TerminalGuard)/theme(sci-fi)/list/detail/input
+└── cli.rs     · ✅  无头 CLI 前端:init/ls/get/search/cp/otp/add/edit/rm(不依赖 App)
 ```
 
 ## 里程碑与任务进度(全部完成)
@@ -57,14 +75,20 @@ src/
 - ✅ **SA4 应用层** — app 状态机(+13 单测)
 - ✅ **SA5 UI 层** — ratatui-sci-fi 主题 + 三栏 + 主循环(+2 单测)
 - ✅ **SA6 集成层** — main.rs(clap new/open)+ panic hook + 端到端 build/test/release
+- ✅ **SA7 性能与加固** — MasterKey 缓存 / N+1 修复 / 剪贴板缓存 / 临时文件加固 / clippy 全清
+- ✅ **SA8 无头 CLI + TOTP** — init/ls/get/search/cp/add/edit/rm/otp + RFC 6238 + TUI 实时码
 
-## 最终端到端验证(2026-06-18)
+## 最终端到端验证(2026-06-20)
 
 - `cargo build` → exit 0,0 warning
-- `cargo test` → **59 passed; 0 failed; 1 ignored**
+- `cargo test` → **98 passed; 0 failed; 1 ignored**
 - `cargo build --release` → exit 0,0 warning
-- `zkv --help` → 正确显示 `new`/`open` 子命令,exit 0
-- **TUI 冒烟**(python pty,80×24):启动 → 渲染「Create New Vault」口令屏(标题 + file: 路径 + 科幻边框)→ Esc 正常退出 → 终端恢复,**全程无 panic**。
+- `cargo clippy --all-targets` → 0 warning
+- `zkv --help` → 显示 `new`/`open`/`init`/`ls`/`get`/`search`/`otp`/`cp`/`add`/`edit`/`rm`,exit 0
+- **TUI PTY e2e**(`just e2e`,6 用例):CLI/启动屏/解锁(对错口令)/建库+建条目+落盘重开;6/6。
+- **无头 CLI 真二进制冒烟**:`init`→`ls`(空)→`add`→`ls`→`get -f password`→`edit`→`rm` 全链路无需 TTY。
+- **TOTP 交叉验证**:`zkv otp`(经典密钥 `JBSWY3DPEHPK3PXP`)与 Python 标准库独立 TOTP 同窗输出一致。
+- **TUI 实时 TOTP**:PTY 驱动 `zkv open`,详情页渲染 `TOTP: <6位码> (~Ns)` 实时倒计时,`o` 键 `totp copied`,退出码 0。
 
 ## 已知限制 / 后续(非 MVP)
 
@@ -94,3 +118,8 @@ src/
   - **临时文件加固 + 写入持久性**:[db.rs](../src/db.rs) 临时文件名改用 `getrandom` CSPRNG(原为可预测的纳秒+计数器);[vault.rs](../src/vault.rs) 原子 `rename` 后 fsync 父目录(Unix,best-effort;崩溃不丢重命名)。
   - **clippy 清扫(8→0)**:`single_match` ×3、`map_identity`、`op_ref`、`doc_nested_refdefs` ×2、`should_implement_trait`(`ItemType::from_str` 固有方法 → `std::str::FromStr` trait;UFCS 调用点不变)。
   - 验证:`cargo build` / `cargo test`(59 passed)/ `cargo clippy --all-targets` 全绿、0 warning。
+- **2026-06-20** 无头 CLI + TOTP(可脚本化,无需 TTY;`cargo test` 98 passed):
+  - **无头 CLI 命令面**(新增 [cli.rs](../src/cli.rs),与 TUI 解耦、直接调 L2/L3,不复用 `App`):`init`(非交互建库,口令取自 `ZKV_PASSPHRASE`/`--passfile`/交互,已存在则报错)、`ls`(过滤 + `--json`)、`get`(整条或 `-f <字段>` 原始值,便于管道)、`search`、`cp`(复制字段,`-f otp` 复制实时码,20s 清空)、`add`/`edit`/`rm`(写后 `save_with_key`,不重跑 Argon2)。口令全程 `Zeroizing` 包裹;`Unlocked` 封装 `unlock_full` + `save`。
+  - **TOTP 验证码生成**(新增 [totp.rs](../src/totp.rs),RFC 6238:HMAC-SHA1 + base32,依赖 `hmac`/`sha1`/`data-encoding`):`otp <id>` 打印当前 6 位码到 stdout;`cp <id> -f otp` 复制实时码。经 RFC 6238 官方测试向量 + Python 独立实现交叉验证一致。
+  - **TUI 实时 TOTP**([ui/detail.rs](../src/ui/detail.rs)):详情页 password 条目的 TOTP 行由掩码密钥改为**实时 6 位码 + `~Ns` 倒计时**(空 `—`、非法 base32 `(invalid)`);[app.rs](../src/app.rs) 加 `o` 键复制当前码(复用 `totp::current_totp` + 剪贴板);footer 加 `o:otp`。经 PTY 驱动真二进制确认 `TOTP: <6位码>` 实时渲染。
+  - 验证:`cargo build` / `cargo clippy --all-targets` 0 warning;`cargo test` 98 passed;`just e2e` 6/6;无头命令 + TOTP 经真二进制端到端冒烟(含 `otp` 与 Python 交叉比对)。
