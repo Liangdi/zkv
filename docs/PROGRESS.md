@@ -7,7 +7,7 @@
 
 - **阶段**:✅ **MVP 完成**(SA1–SA6 全部交付,端到端验证通过)+ 无头 CLI / TOTP 扩展
 - **最后更新**:2026-06-20
-- **验证**:`cargo build` / `cargo test`(**98 passed**, +1 ignored)/ `cargo build --release` / `cargo clippy --all-targets` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过;无头 CLI 与 TOTP 经真二进制端到端冒烟验证(含 `otp` 与独立实现交叉比对)。
+- **验证**:`cargo build` / `cargo test`(**156 passed**, +1 ignored)/ `cargo build --release` / `cargo clippy --all-targets` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过;完整无头 CLI(22 子命令)+ TOTP 经真二进制端到端冒烟验证。
 
 ## 使用方法
 
@@ -20,14 +20,25 @@ zkv open  ~/my.zkv   # 打开已有库(进入 TUI 输口令)
 
 ```bash
 zkv init   ~/my.zkv                              # 非交互建库(不进 TUI;已存在则报错)
-zkv ls     ~/my.zkv [-t password] [--tag T] [-q github] [--json]
+zkv gen    [24] [--no-symbols] [--no-ambiguous]  # 生成强随机密码(无需库)
+# 条目 CRUD(<id> 可换成 --find <标题前缀> 定位):
+zkv ls     ~/my.zkv [-t password] [--tag T] [--cat C] [-q github] [-F|--favorite] [--json]
 zkv get    ~/my.zkv <id> [-f password]           # -f 打印原始字段,便于管道
 zkv search ~/my.zkv <query>
 zkv otp    ~/my.zkv <id>                         # 打印当前 TOTP 6 位码到 stdout
 zkv cp     ~/my.zkv <id> [-f otp] [--clear 20]   # 复制字段(或实时 TOTP 码)到剪贴板
-zkv add    ~/my.zkv --title T --data '<ItemData JSON>' [--tag T] [--favorite]
-zkv edit   ~/my.zkv <id> [--title T] [--data '<json>'] [--tag T] [--favorite|--no-favorite]
+zkv add    ~/my.zkv --title T --data '<ItemData JSON>' [--tag T] [--favorite] [--cat C]
+           [--gen-password[=LEN]] [--otpauth 'otpauth://...']
+zkv edit   ~/my.zkv <id> [--title T] [--data '<json>'|单字段:--username/--password/--url/--totp/--notes/--content/--holder/--number/--expiry/--cvv/--bank]
+           [--tag T | --add-tag T | --rm-tag T] [--cat C] [--favorite|--no-favorite] [--otpauth 'otpauth://...']
 zkv rm     ~/my.zkv <id> [-y]                    # 默认交互确认,-y 跳过
+# 分类 / 标签 / 附件管理:
+zkv cat add ~/my.zkv <name> [--parent P]  ·  zkv cat ls ~/my.zkv  ·  zkv cat rm ~/my.zkv <id|name>
+zkv tag ls ~/my.zkv  ·  zkv tag mv ~/my.zkv <old> <new>  ·  zkv tag rm ~/my.zkv <name>
+zkv attach add ~/my.zkv <id> <file> [--mime M]  ·  zkv attach ls ~/my.zkv <id>
+zkv attach get ~/my.zkv <id> <att> [-o file|>file]  ·  zkv attach rm ~/my.zkv <id> <att>
+# 导入 / 导出(明文;JSON 无损,CSV 仅 password):
+zkv export ~/my.zkv --format json|csv [-o file]  ·  zkv import ~/my.zkv --format json|csv [-i file]
 ```
 
 TUI 快捷键:`n` 新建 · `e` 编辑 · `x` 删除 · `/` 搜索 · `y` 复制密码(20s 自动清空) · **`o` 复制 TOTP 验证码** · `l` 锁定 · `c/t` 分类/标签管理 · `q` 退出。三类条目:密码 / 笔记 / 卡片。
@@ -63,7 +74,7 @@ src/
 ├── clipboard.rs L3 ✅ 系统命令后端(pbcopy/wl-copy/xclip/xsel)+ 定时清空
 ├── app.rs     L4 ✅  App/Mode/EditorState/handle_key 全状态机
 ├── ui/        L5 ✅  mod(主循环+TerminalGuard)/theme(sci-fi)/list/detail/input
-└── cli.rs     · ✅  无头 CLI 前端:init/ls/get/search/cp/otp/add/edit/rm(不依赖 App)
+└── cli.rs     · ✅  无头 CLI 前端(不依赖 App):init/ls/get/search/cp/otp/add/edit/rm + cat/tag/attach 管理 + gen + export/import
 ```
 
 ## 里程碑与任务进度(全部完成)
@@ -77,14 +88,15 @@ src/
 - ✅ **SA6 集成层** — main.rs(clap new/open)+ panic hook + 端到端 build/test/release
 - ✅ **SA7 性能与加固** — MasterKey 缓存 / N+1 修复 / 剪贴板缓存 / 临时文件加固 / clippy 全清
 - ✅ **SA8 无头 CLI + TOTP** — init/ls/get/search/cp/add/edit/rm/otp + RFC 6238 + TUI 实时码
+- ✅ **SA9 无头 CLI 全功能** — cat/tag/attach 管理 · gen 密码生成 · export/import · edit 单字段 + 标签增删 + --otpauth · --find 标题定位
 
 ## 最终端到端验证(2026-06-20)
 
 - `cargo build` → exit 0,0 warning
-- `cargo test` → **98 passed; 0 failed; 1 ignored**
+- `cargo test` → **156 passed; 0 failed; 1 ignored**
 - `cargo build --release` → exit 0,0 warning
 - `cargo clippy --all-targets` → 0 warning
-- `zkv --help` → 显示 `new`/`open`/`init`/`ls`/`get`/`search`/`otp`/`cp`/`add`/`edit`/`rm`,exit 0
+- `zkv --help` → 显示全部子命令(`new`/`open`/`init`/`gen`/`ls`/`get`/`search`/`otp`/`cp`/`add`/`edit`/`rm`/`cat`/`tag`/`attach`/`export`/`import`),exit 0
 - **TUI PTY e2e**(`just e2e`,6 用例):CLI/启动屏/解锁(对错口令)/建库+建条目+落盘重开;6/6。
 - **无头 CLI 真二进制冒烟**:`init`→`ls`(空)→`add`→`ls`→`get -f password`→`edit`→`rm` 全链路无需 TTY。
 - **TOTP 交叉验证**:`zkv otp`(经典密钥 `JBSWY3DPEHPK3PXP`)与 Python 标准库独立 TOTP 同窗输出一致。
@@ -92,11 +104,11 @@ src/
 
 ## 已知限制 / 后续(非 MVP)
 
-- 分类/标签管理(`c`/`t`)目前是最小实现(仅展示 + Esc 返回),增删交互留待后续。
+- 分类/标签管理:TUI 的 `c`/`t` 仍是最小实现(仅展示 + Esc 返回);**无头 CLI 已全功能**(`cat`/`tag` 增删改查)。TUI 增删交互留待后续。
 - 自定义数据结构(字段模板)未做;`data` 已是 JSON,扩展天然兼容。
 - 大库优化:`dump_bytes` 仍用瞬时 VACUUM INTO 临时文件(SQLite 固有),超大库可考虑 per-page 加密。
 - 跨平台:主开发 Linux;剪贴板后端已含 macOS/Wayland/X11 探测,Windows 暂无 CLI 后端。
-- 无导入/导出、无同步(纯本地,符合当前定位)。
+- 导入/导出:无头 CLI 已支持(JSON 无损 / CSV 仅 password);**无同步**(纯本地,符合当前定位)。
 
 ## 变更日志
 
@@ -123,3 +135,10 @@ src/
   - **TOTP 验证码生成**(新增 [totp.rs](../src/totp.rs),RFC 6238:HMAC-SHA1 + base32,依赖 `hmac`/`sha1`/`data-encoding`):`otp <id>` 打印当前 6 位码到 stdout;`cp <id> -f otp` 复制实时码。经 RFC 6238 官方测试向量 + Python 独立实现交叉验证一致。
   - **TUI 实时 TOTP**([ui/detail.rs](../src/ui/detail.rs)):详情页 password 条目的 TOTP 行由掩码密钥改为**实时 6 位码 + `~Ns` 倒计时**(空 `—`、非法 base32 `(invalid)`);[app.rs](../src/app.rs) 加 `o` 键复制当前码(复用 `totp::current_totp` + 剪贴板);footer 加 `o:otp`。经 PTY 驱动真二进制确认 `TOTP: <6位码>` 实时渲染。
   - 验证:`cargo build` / `cargo clippy --all-targets` 0 warning;`cargo test` 98 passed;`just e2e` 6/6;无头命令 + TOTP 经真二进制端到端冒烟(含 `otp` 与 Python 交叉比对)。
+- **2026-06-20** 无头 CLI 全功能补全(SA9;`cargo test` 156 passed,5 批次串行 + 真二进制端到端冒烟):
+  - **分类/标签管理**(`cat add/rm/ls`、`tag ls/rm/mv`,nested subcommand):[store.rs](../src/store.rs) 补 `delete_tag`/`update_tag`;`cat rm` 按 id 或名解析,`tag rm` 级联清理 `item_tags`。
+  - **附件 CLI**(`attach add/ls/get/rm`):驱动既有 store 附件 CRUD;`add` 按扩展名推断 MIME(`--mime` 覆盖);`get` 二进制安全输出到 `-o` 文件或 stdout(blob 字节往返一致);`ls` 不碰 blob;Get/Rm 校验附件归属 item。
+  - **密码生成**(`gen` + `add --gen-password`):CSPRNG(getrandom)+ 拒绝采样(无模偏),`--no-symbols`/`--no-ambiguous`;`gen` 无需库;`--gen-password` 生成结果打到 stderr 不污染 stdout 的 id 行。
+  - **导入/导出**(`export`/`import`,`--format json|csv`):JSON 无损 `Vec<Item>` 往返;CSV 仅 password(手写转义,逗号/引号/换行正确;tags 用 `;`)。逐条容错(`imported N (K failed)`);`-o` 文件 0600;输出明文已在 help 提示。
+  - **增强**:`add`/`edit --otpauth <URI>` 从 otpauth:// 抽 secret 填 `totp_secret`;`edit` 单字段 flag(`--username`/`--password`/…,与 `--data` 互斥)+ 标签增删(`--add-tag`/`--rm-tag`,与 `--tag` 互斥);`get`/`edit`/`rm`/`cp`/`otp` 支持 `--find <标题>`(精确 → 唯一前缀)定位,`resolve_id` 复用。
+  - 验证:`cargo build` / `cargo clippy --all-targets` 0 warning;`cargo test` 156 passed;`just e2e` 6/6(无回归)。
