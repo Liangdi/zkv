@@ -27,7 +27,7 @@ use crate::clipboard;
 use crate::crypto::{KdfParams, MasterKey};
 use crate::db::Database;
 use crate::error::{Error, Result};
-use crate::model::{Category, Item, ItemData, ItemType};
+use crate::model::{Attachment, Category, Item, ItemData, ItemType};
 use crate::search::{self, Filter};
 use crate::store;
 use crate::vault;
@@ -477,6 +477,192 @@ pub fn run_tag_mv(u: &Unlocked, from: &str, to: &str) -> Result<()> {
     store::update_tag(conn, id, to)?;
     u.save()?;
     println!("renamed tag {from} -> {to}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 附件管理命令(attach add/ls/get/rm)
+// ---------------------------------------------------------------------------
+
+/// 按扩展名做轻量 MIME 推断。未知扩展名返回 `None`,由调用方决定是否给默认值。
+///
+/// 覆盖常见办公/图片/文本格式;不引入 mime_guess crate,保持依赖最小。
+fn guess_mime(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "txt" | "log" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "doc" => "application/msword",
+        "xls" => "application/vnd.ms-excel",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "bin" | "dat" => "application/octet-stream",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// 判断附件 `att` 是否属于条目 `item`。
+///
+/// 查 `SELECT item_id FROM attachments WHERE id=?1`;附件不存在返回 `Ok(false)`。
+fn attachment_belongs_to(conn: &rusqlite::Connection, att: i64, item: i64) -> Result<bool> {
+    let row: Option<i64> = conn
+        .query_row(
+            "SELECT item_id FROM attachments WHERE id = ?1",
+            rusqlite::params![att],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok();
+    Ok(row == Some(item))
+}
+
+/// `attach add`:把本地文件读入内存,作为加密内嵌附件挂到 `item` 上。
+///
+/// 校验 item 存在 → 读文件 → 推断 filename/mime → insert → save。
+/// 打印 `attached <id>: <filename> (<size> bytes)` 并返回新附件 id。
+pub fn run_attach_add(
+    u: &Unlocked,
+    item: i64,
+    file: &Path,
+    mime: Option<&str>,
+) -> Result<i64> {
+    let conn = u.db.conn();
+    // 校验 item 存在(不存在给清晰错误,而非依赖外键)。
+    if store::get_item(conn, item)?.is_none() {
+        return Err(Error::Other(format!("item {item} not found")));
+    }
+    let blob = std::fs::read(file)?;
+    let filename = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "attachment".to_string());
+    let mime_type = mime.map(|s| s.to_string()).or_else(|| guess_mime(file));
+
+    let mut att = Attachment {
+        id: None,
+        item_id: item,
+        filename,
+        mime_type,
+        size: 0, // insert_attachment 会用 blob.len() 回填
+        blob,
+    };
+    let id = store::insert_attachment(conn, &mut att)?;
+    u.save()?;
+    println!(
+        "attached {}: {} ({} bytes)",
+        id,
+        att.filename,
+        att.size
+    );
+    Ok(id)
+}
+
+/// `attach ls`:列出 item 的附件元数据(**不读 blob**)。每行
+/// `id\tfilename\tmime\tsize`,无附件时打印 `(no attachments)`。
+pub fn run_attach_ls(u: &Unlocked, item: i64) -> Result<()> {
+    let conn = u.db.conn();
+    // 自己写查询,避免 list_attachments 把 blob 也读出来。
+    let mut stmt = conn.prepare(
+        "SELECT id, filename, mime_type, size FROM attachments
+         WHERE item_id = ?1 ORDER BY id ASC",
+    )?;
+    let rows: Vec<(i64, String, Option<String>, i64)> = stmt
+        .query_map(rusqlite::params![item], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if rows.is_empty() {
+        writeln!(out, "(no attachments)")?;
+        return Ok(());
+    }
+    for (id, filename, mime, size) in rows {
+        let mime = mime.unwrap_or_else(|| "-".into());
+        writeln!(out, "{id}\t{filename}\t{mime}\t{size}")?;
+    }
+    Ok(())
+}
+
+/// `attach get`:导出附件 blob 到文件(`-o`)或 stdout。
+///
+/// - `output = Some(p)`:写文件(`std::fs::write`)。
+/// - `output = None`:二进制安全地 `write_all` 到 stdout。
+///
+/// 元信息(filename/mime/size)打到 stderr,stdout 只出 blob。
+/// 校验附件存在且归属 `item`,否则 `Error::Other`。
+pub fn run_attach_get(
+    u: &Unlocked,
+    item: i64,
+    att: i64,
+    output: Option<&Path>,
+) -> Result<()> {
+    let conn = u.db.conn();
+    let attachment = store::get_attachment(conn, att)?
+        .ok_or_else(|| Error::Other(format!("attachment {att} not found")))?;
+    if !attachment_belongs_to(conn, att, item)? {
+        return Err(Error::Other(format!(
+            "attachment {att} does not belong to item {item}"
+        )));
+    }
+
+    let mime = attachment.mime_type.clone().unwrap_or_else(|| "-".into());
+    eprintln!(
+        "{}\t{}\t{} bytes",
+        attachment.filename, mime, attachment.size
+    );
+
+    match output {
+        Some(p) => {
+            std::fs::write(p, &attachment.blob)?;
+            eprintln!("wrote {}", p.display());
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(&attachment.blob)?;
+        }
+    }
+    Ok(())
+}
+
+/// `attach rm`:删除附件(校验归属后)。打印 `deleted attachment <att>`。
+pub fn run_attach_rm(u: &Unlocked, item: i64, att: i64) -> Result<()> {
+    let conn = u.db.conn();
+    // 先校验存在 + 归属,避免误删不相关附件。
+    if store::get_attachment(conn, att)?.is_none() {
+        return Err(Error::Other(format!("attachment {att} not found")));
+    }
+    if !attachment_belongs_to(conn, att, item)? {
+        return Err(Error::Other(format!(
+            "attachment {att} does not belong to item {item}"
+        )));
+    }
+    store::delete_attachment(conn, att)?;
+    u.save()?;
+    println!("deleted attachment {att}");
     Ok(())
 }
 
@@ -1444,6 +1630,192 @@ mod tests {
         let favs = search::search(u.db.conn(), &sf_fav).unwrap();
         assert_eq!(favs.len(), 1);
         assert!(favs.iter().all(|i| i.favorite));
+        cleanup(&p);
+    }
+
+    // --- 附件管理(attach add/ls/get/rm) ---
+
+    /// 构造一个临时附件文件,内容 = `bytes`,**文件名保持 `name`**(含扩展名),
+    /// 放在临时目录下。文件名决定了 filename/mime 推断,故不能用带计数器的 tmp_path。
+    fn write_att_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("zkv_att_{}_{}", std::process::id(), name));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// 直接查 attachments 表行数(不含 blob 列),用于断言。
+    fn count_attachments(conn: &rusqlite::Connection, item_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM attachments WHERE item_id = ?1",
+            rusqlite::params![item_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn guess_mime_known_and_unknown() {
+        // 已知扩展名。
+        assert_eq!(
+            guess_mime(Path::new("a.pdf")).as_deref(),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            guess_mime(Path::new("b.PNG")).as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            guess_mime(Path::new("c.jpeg")).as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            guess_mime(Path::new("d.json")).as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            guess_mime(Path::new("e.docx")).as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
+        // 未知扩展 / 无扩展 → None。
+        assert_eq!(guess_mime(Path::new("f.xyz")), None);
+        assert_eq!(guess_mime(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn attachment_belongs_to_logic() {
+        let p = make_vault("att_belongs");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let conn = u.db.conn();
+        // 插一个附件到 item 1。
+        let mut att = Attachment {
+            id: None,
+            item_id: 1,
+            filename: "x.bin".into(),
+            mime_type: None,
+            size: 0,
+            blob: vec![1, 2, 3],
+        };
+        let aid = store::insert_attachment(conn, &mut att).unwrap();
+        // 归属正确 / 不归属其它 item / 不存在。
+        assert!(attachment_belongs_to(conn, aid, 1).unwrap());
+        assert!(!attachment_belongs_to(conn, aid, 2).unwrap());
+        assert!(!attachment_belongs_to(conn, 99999, 1).unwrap());
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_attach_add_ls_get_rm_roundtrip() {
+        let p = make_vault("att_flow");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+
+        // 1. add:把一个临时文件挂到 item 1。
+        let blob = b"\x00hello-attachment\xff".to_vec();
+        let att_file = write_att_file("src.txt", &blob);
+        let aid = run_attach_add(&u, 1, &att_file, Some("text/plain")).unwrap();
+        assert!(aid > 0);
+        assert_eq!(count_attachments(u.db.conn(), 1), 1);
+
+        // 验证落库的元数据(filename 保留 basename、size/mime/blob)。
+        let got = store::get_attachment(u.db.conn(), aid).unwrap().unwrap();
+        let basename = att_file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        assert_eq!(got.filename, basename);
+        assert_eq!(got.size, blob.len() as i64);
+        assert_eq!(got.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(got.blob, blob);
+        cleanup(&att_file);
+
+        // 2. ls:不报错,且 item 1 有 1 条;item 2 为空。
+        assert!(run_attach_ls(&u, 1).is_ok());
+        assert_eq!(count_attachments(u.db.conn(), 1), 1);
+        assert_eq!(count_attachments(u.db.conn(), 2), 0);
+
+        // 3. get -o <out>:读回对比 blob 一致。
+        let out = tmp_path("att_out");
+        run_attach_get(&u, 1, aid, Some(&out)).unwrap();
+        let read_back = std::fs::read(&out).unwrap();
+        assert_eq!(read_back, blob);
+        cleanup(&out);
+
+        // get 归属错误(item 不匹配)→ 报错。
+        assert!(matches!(
+            run_attach_get(&u, 2, aid, None),
+            Err(Error::Other(_))
+        ));
+        // get 不存在的附件 → 报错。
+        assert!(matches!(
+            run_attach_get(&u, 1, 99999, None),
+            Err(Error::Other(_))
+        ));
+
+        // 4. rm:删除后再 ls 为空。
+        run_attach_rm(&u, 1, aid).unwrap();
+        assert_eq!(count_attachments(u.db.conn(), 1), 0);
+        assert!(matches!(
+            run_attach_rm(&u, 1, aid),
+            Err(Error::Other(_))
+        ));
+
+        // 落盘读回:删除持久化。
+        drop(u);
+        let pf2 = write_passfile("u2");
+        let u2 = Unlocked::unlock(&p, Some(&pf2)).unwrap();
+        assert_eq!(count_attachments(u2.db.conn(), 1), 0);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_attach_add_missing_item_errors() {
+        let p = make_vault("att_baditem");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let f = write_att_file("x", b"data");
+        // item 不存在 → Error::Other。
+        let err = run_attach_add(&u, 9999, &f, None);
+        assert!(matches!(err, Err(Error::Other(_))));
+        cleanup(&f);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_attach_add_missing_file_errors() {
+        let p = make_vault("att_badfile");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // 源文件不存在 → 读文件失败(冒泡为 Err)。
+        let f = tmp_path("does_not_exist");
+        cleanup(&f);
+        assert!(run_attach_add(&u, 1, &f, None).is_err());
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_attach_ls_empty_prints_no_attachments() {
+        let p = make_vault("att_ls_empty");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // item 1 无附件 → Ok(打印 (no attachments))。
+        assert!(run_attach_ls(&u, 1).is_ok());
+        assert_eq!(count_attachments(u.db.conn(), 1), 0);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_attach_add_guesses_mime_from_extension() {
+        let p = make_vault("att_mime");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // 不传 --mime,由扩展名推断 .json。
+        let f = write_att_file("data.json", b"{}");
+        let aid = run_attach_add(&u, 1, &f, None).unwrap();
+        let got = store::get_attachment(u.db.conn(), aid).unwrap().unwrap();
+        assert_eq!(got.mime_type.as_deref(), Some("application/json"));
+        cleanup(&f);
         cleanup(&p);
     }
 }

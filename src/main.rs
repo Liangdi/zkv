@@ -196,6 +196,11 @@ enum Command {
         #[command(subcommand)]
         action: TagCmd,
     },
+    /// 附件管理。
+    Attach {
+        #[command(subcommand)]
+        action: AttachCmd,
+    },
 }
 
 /// `cat` 子命令组(分类管理)。
@@ -263,6 +268,63 @@ enum TagCmd {
         from: String,
         /// 新标签名。
         to: String,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+}
+
+/// `attach` 子命令组(附件管理)。
+#[derive(Subcommand, Debug)]
+enum AttachCmd {
+    /// 给条目挂一个文件附件(读取文件 → 加密内嵌)。
+    Add {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 条目 id。
+        item: i64,
+        /// 要挂载的本地文件路径。
+        file: PathBuf,
+        /// 覆盖 MIME 类型推断(可选)。
+        #[arg(long, value_name = "MIME")]
+        mime: Option<String>,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+    /// 列出条目的附件(不输出 blob)。
+    Ls {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 条目 id。
+        item: i64,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+    /// 导出附件 blob 到文件或 stdout。
+    Get {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 条目 id(用于校验附件归属)。
+        item: i64,
+        /// 附件 id。
+        att: i64,
+        /// 输出文件路径(缺省则写 stdout,二进制安全)。
+        #[arg(short = 'o', long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// 口令文件路径。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+    },
+    /// 删除附件。
+    Rm {
+        /// 库文件路径。
+        path: PathBuf,
+        /// 条目 id(用于校验附件归属)。
+        item: i64,
+        /// 附件 id。
+        att: i64,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -437,6 +499,11 @@ fn run() -> color_eyre::Result<()> {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             run_tag(&u, &action)?;
         }
+        Command::Attach { action } => {
+            let (path, passfile) = attach_path_passfile(&action);
+            let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            run_attach(&u, &action)?;
+        }
     }
     Ok(())
 }
@@ -500,6 +567,47 @@ fn run_tag(u: &zkv::cli::Unlocked, action: &TagCmd) -> color_eyre::Result<()> {
         }
         TagCmd::Mv { from, to, .. } => {
             zkv::cli::run_tag_mv(u, from, to)?;
+        }
+    }
+    Ok(())
+}
+
+/// 从 `AttachCmd` 提取 (path, passfile)。
+fn attach_path_passfile(action: &AttachCmd) -> (PathBuf, Option<PathBuf>) {
+    match action {
+        AttachCmd::Add {
+            path, passfile, ..
+        }
+        | AttachCmd::Ls {
+            path, passfile, ..
+        }
+        | AttachCmd::Get {
+            path, passfile, ..
+        }
+        | AttachCmd::Rm {
+            path, passfile, ..
+        } => (path.clone(), passfile.clone()),
+    }
+}
+
+/// 分发 `attach` 子命令(已解锁)。
+fn run_attach(u: &zkv::cli::Unlocked, action: &AttachCmd) -> color_eyre::Result<()> {
+    match action {
+        AttachCmd::Add {
+            item, file, mime, ..
+        } => {
+            zkv::cli::run_attach_add(u, *item, file, mime.as_deref())?;
+        }
+        AttachCmd::Ls { item, .. } => {
+            zkv::cli::run_attach_ls(u, *item)?;
+        }
+        AttachCmd::Get {
+            item, att, output, ..
+        } => {
+            zkv::cli::run_attach_get(u, *item, *att, output.as_deref())?;
+        }
+        AttachCmd::Rm { item, att, .. } => {
+            zkv::cli::run_attach_rm(u, *item, *att)?;
         }
     }
     Ok(())
