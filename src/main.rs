@@ -141,9 +141,24 @@ enum Command {
         /// 标记为收藏。
         #[arg(long)]
         favorite: bool,
+        /// 自动生成 password 条目的密码字段(可带长度,如 --gen-password 24)。仅 password 类型生效。
+        #[arg(long, value_name = "LEN", num_args = 0..=1, default_missing_value = "20")]
+        gen_password: Option<usize>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
+    },
+    /// 生成强随机密码(打印到 stdout)。不解锁库、不需要口令。
+    Gen {
+        /// 密码长度(默认 20)。
+        #[arg(default_value_t = 20)]
+        length: usize,
+        /// 关闭符号(默认含符号)。
+        #[arg(long = "no-symbols")]
+        no_symbols: bool,
+        /// 去除易混字符(0/O/o/1/l/I 等)。
+        #[arg(long = "no-ambiguous")]
+        no_ambiguous: bool,
     },
     /// 修改已有条目的字段(无头)。至少提供 --title/--data/--tag/--favorite/--no-favorite 之一。
     Edit {
@@ -442,10 +457,19 @@ fn run() -> color_eyre::Result<()> {
             data,
             tags,
             favorite,
+            gen_password,
             passfile,
         } => {
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
-            zkv::cli::run_add(&u, &title, &data, tags, favorite)?;
+            zkv::cli::run_add(&u, &title, &data, tags, favorite, gen_password)?;
+        }
+        // gen:纯生成,不解锁库、不需要口令。
+        Command::Gen {
+            length,
+            no_symbols,
+            no_ambiguous,
+        } => {
+            zkv::cli::run_gen(length, !no_symbols, !no_ambiguous)?;
         }
         Command::Edit {
             path,

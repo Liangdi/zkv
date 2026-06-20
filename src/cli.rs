@@ -251,15 +251,36 @@ fn item_type_of(data: &ItemData) -> ItemType {
 
 /// `add`:新增一条条目。`data_json` 是**完整** [`ItemData`] JSON(含 `"type"` tag)。
 ///
+/// `gen_password = Some(len)` 时,`data_json` 必须是 `ItemData::Password`,其 `password` 字段
+/// 会被 `generate_password(len, true, true)` 生成的强密码**覆盖**。
+///
 /// 成功后向 stdout 打印 `added item <id>: <title>` 并返回新 id。
+/// 若用了 `--gen-password`,生成的明文密码打到 **stderr**(`generated password for item <id>: <pw>`),
+/// 不污染 stdout 的 id 行,但用户能拿到。
 pub fn run_add(
     u: &Unlocked,
     title: &str,
     data_json: &str,
     tags: Vec<String>,
     favorite: bool,
+    gen_password: Option<usize>,
 ) -> Result<i64> {
-    let data: ItemData = serde_json::from_str(data_json)?;
+    let mut data: ItemData = serde_json::from_str(data_json)?;
+
+    // 若指定 --gen-password:必须是 Password 条目,覆盖其 password 字段。
+    let generated = if let Some(len) = gen_password {
+        match &mut data {
+            ItemData::Password { password, .. } => {
+                let pw = generate_password(len, true, true)?;
+                *password = pw.clone();
+                Some(pw)
+            }
+            _ => return Err(Error::Other("--gen-password only applies to password items".into())),
+        }
+    } else {
+        None
+    };
+
     let item_type = item_type_of(&data);
     let mut item = Item {
         id: None,
@@ -275,7 +296,84 @@ pub fn run_add(
     let id = store::insert_item(u.db.conn(), &mut item)?;
     u.save()?;
     println!("added item {id}: {title}");
+    // 生成密码打到 stderr:用户主动要生成,理应看到;又不污染 stdout 的 id 行。
+    if let Some(pw) = generated {
+        eprintln!("generated password for item {id}: {pw}");
+    }
     Ok(id)
+}
+
+// ---------------------------------------------------------------------------
+// 密码生成
+// ---------------------------------------------------------------------------
+
+/// 易混字符集(肉眼难分辨),`--no-ambiguous` 时从字符池剔除。
+const AMBIGUOUS_CHARS: &[u8] = b"0Oo1lI|5S2ZB8";
+
+/// 安全可见符号集(避免引号/反斜杠/空格,降低 shell/复制问题)。
+const SYMBOL_CHARS: &[u8] = b"!@#$%^&*()-_=+[]{};:,.?/";
+
+/// 用 CSPRNG(getrandom)生成强随机密码。
+///
+/// - `symbols = true` → 含 [`SYMBOL_CHARS`] 符号;`false` 仅字母 + 数字。
+/// - `avoid_ambiguous = true` → 从池中剔除 [`AMBIGUOUS_CHARS`] 中的易混字符。
+/// - 每个字符用**拒绝采样**(rejection sampling)从池中取,避免模偏:
+///   随机字节 `>= floor(256/pool.len())*pool.len()` 时丢弃、重取。
+/// - `length < 4` 或 `> 1024` 报 [`Error::Other`]。
+pub fn generate_password(length: usize, symbols: bool, avoid_ambiguous: bool) -> Result<String> {
+    if length < 4 {
+        return Err(Error::Other("password length too short (min 4)".into()));
+    }
+    if length > 1024 {
+        return Err(Error::Other("password length too long (max 1024)".into()));
+    }
+
+    // 构建字符池:a-z A-Z 0-9,(可选)符号。
+    let mut pool: Vec<u8> = Vec::with_capacity(26 * 2 + 10 + SYMBOL_CHARS.len());
+    pool.extend(b'a'..=b'z');
+    pool.extend(b'A'..=b'Z');
+    pool.extend(b'0'..=b'9');
+    if symbols {
+        pool.extend_from_slice(SYMBOL_CHARS);
+    }
+    if avoid_ambiguous {
+        pool.retain(|c| !AMBIGUOUS_CHARS.contains(c));
+    }
+
+    let pool_len = pool.len();
+    // 256 内能均匀覆盖的最大倍数:超过此阈值的字节丢弃,消除模偏。
+    let limit = 256 - (256 % pool_len);
+
+    let mut out: Vec<u8> = Vec::with_capacity(length);
+    // 缓冲区:一次取一小批随机字节,逐个消费(拒绝则跳过),耗尽则补取。
+    let mut buf = vec![0u8; 64];
+    let mut pos = buf.len(); // 起始即耗尽,触发首次 fill
+    while out.len() < length {
+        if pos >= buf.len() {
+            getrandom::fill(&mut buf)
+                .map_err(|e| Error::Other(format!("getrandom failed: {e}")))?;
+            pos = 0;
+        }
+        let byte = buf[pos] as usize;
+        pos += 1;
+        if byte < limit {
+            out.push(pool[byte % pool_len]);
+        }
+    }
+    // SAFETY: 池内均为 ASCII 字符,pool 字节即合法 UTF-8。
+    String::from_utf8(out)
+        .map_err(|e| Error::Other(format!("generated password not utf-8: {e}")))
+}
+
+/// `gen`:生成强随机密码并打印到 **stdout**(末尾换行),脚本友好:`pw=$(zkv gen)`。
+///
+/// 纯生成,不解锁库、不需要口令。
+pub fn run_gen(length: usize, symbols: bool, avoid_ambiguous: bool) -> Result<()> {
+    let pw = generate_password(length, symbols, avoid_ambiguous)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "{pw}")?;
+    Ok(())
 }
 
 /// `edit`:修改已存在条目的若干字段。每个参数为 `None` 表示「不改」。
@@ -1371,7 +1469,7 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         let data = r#"{"type":"password","username":"bob","password":"pw1","url":"https://x","totp_secret":"","notes":""}"#;
-        let id = run_add(&u, "Server", data, vec!["ops".into()], true).unwrap();
+        let id = run_add(&u, "Server", data, vec!["ops".into()], true, None).unwrap();
         assert!(id > 0);
 
         // 内存中能取到正确字段。
@@ -1400,7 +1498,7 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // 缺 type tag → serde 报错(非 Error::Other,但仍是 Err)。
-        assert!(run_add(&u, "X", "{ not json", vec![], false).is_err());
+        assert!(run_add(&u, "X", "{ not json", vec![], false, None).is_err());
         cleanup(&p);
     }
 
@@ -1614,7 +1712,7 @@ mod tests {
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         // make_vault 的两条 item 都不是收藏;add 一条收藏项。
         let data = r#"{"type":"password","username":"bob","password":"pw","url":"","totp_secret":"","notes":""}"#;
-        let _fav_id = run_add(&u, "Fav", data, vec![], true).unwrap();
+        let _fav_id = run_add(&u, "Fav", data, vec![], true, None).unwrap();
 
         let f = ListFilter::default();
         // favorite=false:返回全部 3 条。
@@ -1816,6 +1914,117 @@ mod tests {
         let got = store::get_attachment(u.db.conn(), aid).unwrap().unwrap();
         assert_eq!(got.mime_type.as_deref(), Some("application/json"));
         cleanup(&f);
+        cleanup(&p);
+    }
+
+    // --- 密码生成(generate_password / run_gen / add --gen-password) ---
+
+    /// 字符池基集(字母 + 数字)。
+    fn is_alnum(c: char) -> bool {
+        c.is_ascii_alphanumeric()
+    }
+    /// 是否属于符号集。
+    fn is_symbol(c: char) -> bool {
+        "!@#$%^&*()-_=+[]{};:,.?/".contains(c)
+    }
+    /// 是否属于易混集。
+    fn is_ambiguous(c: char) -> bool {
+        "0Oo1lI|5S2ZB8".contains(c)
+    }
+
+    #[test]
+    fn generate_password_default_length_and_charset() {
+        let pw = generate_password(20, true, false).unwrap();
+        assert_eq!(pw.len(), 20);
+        // 默认含符号 → 池里每个字符应来自 alnum 或符号集。
+        assert!(pw.chars().all(|c| is_alnum(c) || is_symbol(c)));
+    }
+
+    #[test]
+    fn generate_password_no_symbols() {
+        let pw = generate_password(40, false, false).unwrap();
+        assert_eq!(pw.len(), 40);
+        // 不含符号:全字母数字,且不含任何符号集字符。
+        assert!(pw.chars().all(is_alnum));
+        assert!(!pw.chars().any(is_symbol));
+    }
+
+    #[test]
+    fn generate_password_no_ambiguous() {
+        let pw = generate_password(40, true, true).unwrap();
+        assert_eq!(pw.len(), 40);
+        // 不含任何易混字符。
+        assert!(!pw.chars().any(is_ambiguous));
+    }
+
+    #[test]
+    fn generate_password_length_respected() {
+        for &len in &[4usize, 5, 16, 32, 100] {
+            let pw = generate_password(len, true, false).unwrap();
+            assert_eq!(pw.len(), len);
+        }
+    }
+
+    #[test]
+    fn generate_password_two_runs_differ() {
+        // 概率性:两次独立生成应(几乎必然)不同。
+        let a = generate_password(32, true, false).unwrap();
+        let b = generate_password(32, true, false).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn generate_password_too_short_errors() {
+        assert!(matches!(
+            generate_password(3, true, false),
+            Err(Error::Other(m)) if m.contains("too short")
+        ));
+    }
+
+    #[test]
+    fn generate_password_too_long_errors() {
+        assert!(matches!(
+            generate_password(2000, true, false),
+            Err(Error::Other(m)) if m.contains("too long")
+        ));
+    }
+
+    #[test]
+    fn run_gen_prints_password() {
+        // run_gen 写到 stdout;验证返回 Ok(不在此捕获 stdout,仅断言不报错)。
+        assert!(run_gen(16, true, false).is_ok());
+        assert!(run_gen(8, false, true).is_ok());
+    }
+
+    #[test]
+    fn run_add_gen_password_overrides_field() {
+        let p = make_vault("addgen");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // --data 里 password 是占位 "old",--gen-password 12 应覆盖。
+        let data = r#"{"type":"password","username":"bob","password":"old","url":"https://x","totp_secret":"","notes":""}"#;
+        let id = run_add(&u, "Gen", data, vec![], false, Some(12)).unwrap();
+        assert!(id > 0);
+
+        let got = store::get_item(u.db.conn(), id).unwrap().unwrap();
+        let pw = item_field(&got, "password").unwrap();
+        assert_eq!(pw.len(), 12);
+        assert_ne!(pw, "old");
+        // 默认 generate_password(len, true, true) → 含符号、去易混。
+        assert!(pw.chars().all(|c| is_alnum(c) || is_symbol(c)));
+        assert!(!pw.chars().any(is_ambiguous));
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_add_gen_password_non_password_errors() {
+        let p = make_vault("addgennp");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // note 条目 + --gen-password → 报错。
+        let data = r#"{"type":"note","format":"text","content":"hi"}"#;
+        let err = run_add(&u, "N", data, vec![], false, Some(20));
+        assert!(matches!(err, Err(Error::Other(m)) if m.contains("--gen-password")));
         cleanup(&p);
     }
 }
