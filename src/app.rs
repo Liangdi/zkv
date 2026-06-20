@@ -63,10 +63,26 @@ pub enum Mode {
     EditItem,
     /// 确认删除。
     ConfirmDelete,
-    /// 分类管理(最小实现)。
+    /// 分类管理。
     CategoryMgr,
-    /// 标签管理(最小实现)。
+    /// 标签管理。
     TagMgr,
+}
+
+/// 管理模式(CategoryMgr/TagMgr)中,当前是否处于文本输入态及语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MgrEdit {
+    /// 新增。
+    Add,
+    /// 改名。
+    Rename,
+}
+
+/// 管理模式所操作的实体种类(供 `mgr_handle` 复用分发)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MgrEntity {
+    Category,
+    Tag,
 }
 
 /// 编辑器中当前正在编辑的字段。
@@ -138,6 +154,10 @@ pub struct App {
     pub input: String,
     /// 是否掩码输入(口令=true,搜索/编辑器字段=false)。
     pub input_mask: bool,
+    /// 管理模式(CategoryMgr/TagMgr)中的列表选中索引。
+    pub mgr_selected: usize,
+    /// 管理模式当前是否在文本输入(新增/改名),及语义。
+    pub mgr_edit: Option<MgrEdit>,
     /// 是否请求退出。
     pub quit: bool,
 }
@@ -165,6 +185,8 @@ impl App {
             editor: None,
             input: String::new(),
             input_mask: true,
+            mgr_selected: 0,
+            mgr_edit: None,
             quit: false,
         }
     }
@@ -187,6 +209,8 @@ impl App {
             editor: None,
             input: String::new(),
             input_mask: true,
+            mgr_selected: 0,
+            mgr_edit: None,
             quit: false,
         }
     }
@@ -223,6 +247,8 @@ impl App {
             editor: None,
             input: String::new(),
             input_mask: false,
+            mgr_selected: 0,
+            mgr_edit: None,
             quit: false,
         };
         app.reload()?;
@@ -486,12 +512,10 @@ impl App {
                 self.lock();
             }
             KeyCode::Char('c') => {
-                self.mode = Mode::CategoryMgr;
-                self.message = Some("category manager (Esc to return)".into());
+                self.enter_mgr(MgrEntity::Category);
             }
             KeyCode::Char('t') => {
-                self.mode = Mode::TagMgr;
-                self.message = Some("tag manager (Esc to return)".into());
+                self.enter_mgr(MgrEntity::Tag);
             }
             KeyCode::Char('q') => {
                 self.quit = true;
@@ -614,22 +638,264 @@ impl App {
         Ok(Action::Continue)
     }
 
-    // ---- CategoryMgr (最小实现) ----
+    // ---- CategoryMgr ----
     fn handle_category_mgr(&mut self, key: KeyEvent) -> Result<Action> {
-        // TODO(SA5+):实现增删改分类。当前仅支持 Esc 返回。
-        if key.code == KeyCode::Esc {
-            self.mode = Mode::Normal;
+        self.mgr_handle(key, MgrEntity::Category)
+    }
+
+    // ---- TagMgr ----
+    fn handle_tag_mgr(&mut self, key: KeyEvent) -> Result<Action> {
+        self.mgr_handle(key, MgrEntity::Tag)
+    }
+
+    // -----------------------------------------------------------------------
+    // 管理模式(CategoryMgr / TagMgr)
+    // -----------------------------------------------------------------------
+
+    /// 进入管理模式:重置选中/编辑态/输入缓冲,设操作提示。
+    fn enter_mgr(&mut self, entity: MgrEntity) {
+        self.mgr_selected = 0;
+        self.mgr_edit = None;
+        self.input.clear();
+        self.mode = match entity {
+            MgrEntity::Category => Mode::CategoryMgr,
+            MgrEntity::Tag => Mode::TagMgr,
+        };
+        self.message = Some("a:add  r:rename  x:del  Esc:back".into());
+    }
+
+    /// 当前列表条目数(分类用 categories,标签用 tags)。
+    fn mgr_list_len(&self, entity: MgrEntity) -> usize {
+        match entity {
+            MgrEntity::Category => self.categories.len(),
+            MgrEntity::Tag => self.tags.len(),
+        }
+    }
+
+    /// 夹紧 `mgr_selected` 到 [0, len)。
+    fn mgr_clamp(&mut self, entity: MgrEntity) {
+        let len = self.mgr_list_len(entity);
+        if len == 0 {
+            self.mgr_selected = 0;
+        } else if self.mgr_selected >= len {
+            self.mgr_selected = len - 1;
+        }
+    }
+
+    /// 管理模式统一键处理(分类/标签共用)。
+    fn mgr_handle(&mut self, key: KeyEvent, entity: MgrEntity) -> Result<Action> {
+        match self.mgr_edit {
+            Some(_) => self.mgr_handle_edit(key, entity),
+            None => self.mgr_handle_browse(key, entity),
+        }
+    }
+
+    /// 浏览态:移动 / 进入新增 / 改名 / 删除 / 返回。
+    fn mgr_handle_browse(&mut self, key: KeyEvent, entity: MgrEntity) -> Result<Action> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                let len = self.mgr_list_len(entity);
+                if len > 0 && self.mgr_selected + 1 < len {
+                    self.mgr_selected += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.mgr_selected > 0 {
+                    self.mgr_selected -= 1;
+                }
+            }
+            KeyCode::Char('a') => {
+                self.mgr_edit = Some(MgrEdit::Add);
+                self.input.clear();
+                self.message = Some("add: type name, Enter to confirm".into());
+            }
+            KeyCode::Char('r') => {
+                if self.mgr_list_len(entity) > 0 {
+                    // 预填当前选中条目的 name。
+                    let name = match entity {
+                        MgrEntity::Category => self
+                            .categories
+                            .get(self.mgr_selected)
+                            .map(|c| c.name.clone()),
+                        MgrEntity::Tag => self.tags.get(self.mgr_selected).cloned(),
+                    };
+                    if let Some(n) = name {
+                        self.input = n;
+                        self.mgr_edit = Some(MgrEdit::Rename);
+                        self.message = Some("rename: edit, Enter to confirm".into());
+                    }
+                } else {
+                    self.message = Some("nothing to rename".into());
+                }
+            }
+            KeyCode::Char('x') => {
+                self.mgr_delete(entity)?;
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.input.clear();
+            }
+            _ => {}
         }
         Ok(Action::Continue)
     }
 
-    // ---- TagMgr (最小实现) ----
-    fn handle_tag_mgr(&mut self, key: KeyEvent) -> Result<Action> {
-        // TODO(SA5+):实现增删改标签。当前仅支持 Esc 返回。
-        if key.code == KeyCode::Esc {
-            self.mode = Mode::Normal;
+    /// 编辑态(新增/改名):字符 / 退格 / 提交 / 取消。
+    fn mgr_handle_edit(&mut self, key: KeyEvent, entity: MgrEntity) -> Result<Action> {
+        match key.code {
+            KeyCode::Char(c) => {
+                // Ctrl 组合不作为普通字符。
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(Action::Continue);
+                }
+                self.input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => {
+                let edit = self.mgr_edit;
+                self.mgr_commit(edit, entity)?;
+            }
+            KeyCode::Esc => {
+                // 取消,留在管理模式浏览态。
+                self.mgr_edit = None;
+                self.input.clear();
+                self.message = Some("a:add  r:rename  x:del  Esc:back".into());
+            }
+            _ => {}
         }
         Ok(Action::Continue)
+    }
+
+    /// 提交新增/改名。空名报错不提交。
+    fn mgr_commit(&mut self, edit: Option<MgrEdit>, entity: MgrEntity) -> Result<()> {
+        let name = self.input.trim().to_string();
+        if name.is_empty() {
+            self.message = Some("name cannot be empty".into());
+            return Ok(());
+        }
+        let res = (|| -> Result<String> {
+            let db = self
+                .db
+                .as_ref()
+                .ok_or_else(|| Error::Other("mgr: no database".into()))?;
+            let conn = db.conn();
+            match (edit, entity) {
+                (Some(MgrEdit::Add), MgrEntity::Category) => {
+                    let mut cat = crate::model::Category {
+                        id: None,
+                        name: name.clone(),
+                        parent_id: None,
+                        sort_order: 0,
+                    };
+                    store::insert_category(conn, &mut cat)?;
+                }
+                (Some(MgrEdit::Add), MgrEntity::Tag) => {
+                    store::ensure_tag(conn, &name)?;
+                }
+                (Some(MgrEdit::Rename), MgrEntity::Category) => {
+                    let cur = self
+                        .categories
+                        .get(self.mgr_selected)
+                        .ok_or_else(|| Error::Other("rename: no category selected".into()))?;
+                    let mut updated = cur.clone();
+                    updated.name = name.clone();
+                    store::update_category(conn, &updated)?;
+                }
+                (Some(MgrEdit::Rename), MgrEntity::Tag) => {
+                    let id = self.tag_id_at(self.mgr_selected)?;
+                    store::update_tag(conn, id, &name)?;
+                }
+                // 无 edit 不应进入此函数;防御性返回。
+                _ => return Ok(name),
+            }
+            Ok(name)
+        })();
+        match res {
+            Ok(n) => {
+                self.save()?;
+                self.reload()?;
+                self.mgr_clamp(entity);
+                self.mgr_edit = None;
+                self.input.clear();
+                let verb = match edit {
+                    Some(MgrEdit::Add) => "added",
+                    Some(MgrEdit::Rename) => "renamed",
+                    None => "added",
+                };
+                self.message = Some(format!("{verb} \"{n}\""));
+                self.mgr_clamp(entity);
+            }
+            Err(e) => {
+                self.message = Some(format!("mgr failed: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 删除当前选中条目(分类/标签)。
+    fn mgr_delete(&mut self, entity: MgrEntity) -> Result<()> {
+        let res = (|| -> Result<String> {
+            let db = self
+                .db
+                .as_ref()
+                .ok_or_else(|| Error::Other("delete: no database".into()))?;
+            let conn = db.conn();
+            match entity {
+                MgrEntity::Category => {
+                    let cur = self
+                        .categories
+                        .get(self.mgr_selected)
+                        .ok_or_else(|| Error::Other("delete: no category selected".into()))?;
+                    let name = cur.name.clone();
+                    let id = cur
+                        .id
+                        .ok_or_else(|| Error::Other("delete: category has no id".into()))?;
+                    store::delete_category(conn, id)?;
+                    Ok(name)
+                }
+                MgrEntity::Tag => {
+                    let name = self
+                        .tags
+                        .get(self.mgr_selected)
+                        .cloned()
+                        .ok_or_else(|| Error::Other("delete: no tag selected".into()))?;
+                    let id = self.tag_id_at(self.mgr_selected)?;
+                    store::delete_tag(conn, id)?;
+                    Ok(name)
+                }
+            }
+        })();
+        match res {
+            Ok(n) => {
+                self.save()?;
+                self.reload()?;
+                self.mgr_clamp(entity);
+                self.message = Some(format!("deleted \"{n}\""));
+            }
+            Err(e) => {
+                self.message = Some(format!("delete failed: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 查 `tags` 列表中第 `idx` 项对应的标签 id(需从 db 查 name→id)。
+    fn tag_id_at(&self, idx: usize) -> Result<i64> {
+        let name = self
+            .tags
+            .get(idx)
+            .ok_or_else(|| Error::Other("tag: index out of range".into()))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| Error::Other("tag: no database".into()))?;
+        let tags = store::list_tags(db.conn())?;
+        tags.into_iter()
+            .find(|t| &t.name == name)
+            .map(|t| t.id)
+            .ok_or_else(|| Error::Other("tag: not found".into()))
     }
 
     // -----------------------------------------------------------------------
@@ -1210,6 +1476,225 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal));
         assert!(app.db.is_some());
         cleanup(&path);
+    }
+
+    // ---- 管理模式(CategoryMgr / TagMgr)测试 ----
+
+    /// 构造一个真实可保存的 App(fast KDF 预建文件 + from_unlocked)。
+    fn app_with_path(tag: &str) -> (App, std::path::PathBuf) {
+        let path = tmp_path(tag);
+        cleanup(&path);
+        let kdf = KdfParams { m_kib: 4096, t_cost: 1, p_cost: 1 };
+        crate::vault::create_with_params(&path, "pw", &kdf).unwrap();
+        let db = crate::vault::unlock(&path, "pw").unwrap();
+        let app = App::from_unlocked(db, path.clone(), "pw".into()).unwrap();
+        (app, path)
+    }
+
+    #[test]
+    fn mgr_enter_resets_state() {
+        let (mut app, _p) = app_with_path("mgr_enter");
+        // 预置脏状态。
+        app.mgr_selected = 9;
+        app.mgr_edit = Some(MgrEdit::Add);
+        app.input = "junk".into();
+        app.handle_key(key('c')).unwrap();
+        assert!(matches!(app.mode, Mode::CategoryMgr));
+        assert_eq!(app.mgr_selected, 0);
+        assert_eq!(app.mgr_edit, None);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn category_mgr_add_works() {
+        let (mut app, path) = app_with_path("cat_add");
+        // c 进入
+        app.handle_key(key('c')).unwrap();
+        assert!(matches!(app.mode, Mode::CategoryMgr));
+        // a 新增
+        app.handle_key(key('a')).unwrap();
+        assert_eq!(app.mgr_edit, Some(MgrEdit::Add));
+        // 输入 "Work"
+        for c in "Work".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        // Enter 提交
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(app.categories.iter().any(|c| c.name == "Work"));
+        assert!(matches!(app.mode, Mode::CategoryMgr));
+        assert_eq!(app.mgr_edit, None);
+        // 落盘后仍可查到。
+        let db2 = crate::vault::unlock(&path, "pw").unwrap();
+        let cats = store::list_categories(db2.conn()).unwrap();
+        assert!(cats.iter().any(|c| c.name == "Work"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn category_mgr_add_empty_name_aborts() {
+        let (mut app, path) = app_with_path("cat_add_empty");
+        app.handle_key(key('c')).unwrap();
+        app.handle_key(key('a')).unwrap();
+        // 不输入,直接 Enter → 报错,未新增。
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(app.categories.is_empty());
+        assert!(app.message.as_deref().unwrap_or("").contains("empty"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn category_mgr_rename_works() {
+        let (mut app, path) = app_with_path("cat_rename");
+        // 先插一条分类。
+        {
+            let conn = app.db.as_ref().unwrap().conn();
+            let mut cat = crate::model::Category {
+                id: None,
+                name: "Old".into(),
+                parent_id: None,
+                sort_order: 0,
+            };
+            store::insert_category(conn, &mut cat).unwrap();
+        }
+        app.reload().unwrap();
+        app.mgr_clamp(MgrEntity::Category);
+        // 但 reload 会刷新 categories;手动进入管理模式后,选中需要再次校验。
+        app.handle_key(key('c')).unwrap();
+        app.mgr_selected = 0;
+        app.handle_key(key('r')).unwrap();
+        assert_eq!(app.mgr_edit, Some(MgrEdit::Rename));
+        assert_eq!(app.input, "Old");
+        // 清空后输入新名。
+        app.input.clear();
+        for c in "New".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(app.categories.iter().any(|c| c.name == "New"));
+        assert!(!app.categories.iter().any(|c| c.name == "Old"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn category_mgr_delete_works() {
+        let (mut app, path) = app_with_path("cat_del");
+        {
+            let conn = app.db.as_ref().unwrap().conn();
+            let mut cat = crate::model::Category {
+                id: None,
+                name: "Tmp".into(),
+                parent_id: None,
+                sort_order: 0,
+            };
+            store::insert_category(conn, &mut cat).unwrap();
+        }
+        app.reload().unwrap();
+        app.handle_key(key('c')).unwrap();
+        app.mgr_selected = 0;
+        app.handle_key(key('x')).unwrap();
+        assert!(app.categories.is_empty());
+        assert!(app.message.as_deref().unwrap_or("").contains("deleted"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tag_mgr_add_works() {
+        let (mut app, path) = app_with_path("tag_add");
+        app.handle_key(key('t')).unwrap();
+        assert!(matches!(app.mode, Mode::TagMgr));
+        app.handle_key(key('a')).unwrap();
+        for c in "vip".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(app.tags.iter().any(|t| t == "vip"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tag_mgr_rename_works() {
+        let (mut app, path) = app_with_path("tag_rename");
+        {
+            let conn = app.db.as_ref().unwrap().conn();
+            store::ensure_tag(conn, "old").unwrap();
+        }
+        app.reload().unwrap();
+        app.handle_key(key('t')).unwrap();
+        app.mgr_selected = 0;
+        app.handle_key(key('r')).unwrap();
+        assert_eq!(app.input, "old");
+        app.input.clear();
+        for c in "fresh".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(app.tags.iter().any(|t| t == "fresh"));
+        assert!(!app.tags.iter().any(|t| t == "old"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tag_mgr_delete_works() {
+        let (mut app, path) = app_with_path("tag_del");
+        {
+            let conn = app.db.as_ref().unwrap().conn();
+            store::ensure_tag(conn, "gone").unwrap();
+        }
+        app.reload().unwrap();
+        app.handle_key(key('t')).unwrap();
+        app.mgr_selected = 0;
+        app.handle_key(key('x')).unwrap();
+        assert!(app.tags.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mgr_edit_esc_cancels() {
+        let (mut app, path) = app_with_path("mgr_esc");
+        // 分类新增中途 Esc 取消。
+        app.handle_key(key('c')).unwrap();
+        app.handle_key(key('a')).unwrap();
+        for c in "Z".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Esc)).unwrap();
+        assert_eq!(app.mgr_edit, None);
+        assert!(app.input.is_empty());
+        // 仍在管理模式,未提交。
+        assert!(matches!(app.mode, Mode::CategoryMgr));
+        assert!(app.categories.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mgr_browse_esc_returns_normal() {
+        let (mut app, _p) = app_with_path("mgr_back");
+        app.handle_key(key('t')).unwrap();
+        app.handle_key(key_code(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn mgr_browse_jk_moves_selection() {
+        let (mut app, _p) = app_with_path("mgr_jk");
+        {
+            let conn = app.db.as_ref().unwrap().conn();
+            for n in ["a", "b", "c"] {
+                store::ensure_tag(conn, n).unwrap();
+            }
+        }
+        app.reload().unwrap();
+        app.handle_key(key('t')).unwrap();
+        assert_eq!(app.mgr_selected, 0);
+        app.handle_key(key('j')).unwrap();
+        assert_eq!(app.mgr_selected, 1);
+        app.handle_key(key('j')).unwrap();
+        assert_eq!(app.mgr_selected, 2);
+        // 末位不再下移。
+        app.handle_key(key('j')).unwrap();
+        assert_eq!(app.mgr_selected, 2);
+        app.handle_key(key('k')).unwrap();
+        assert_eq!(app.mgr_selected, 1);
     }
 
     // ---- 测试辅助:临时文件 ----

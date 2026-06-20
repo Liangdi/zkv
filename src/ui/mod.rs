@@ -130,8 +130,8 @@ fn draw(frame: &mut Frame, app: &App) {
     // 叠加模态
     match app.mode {
         Mode::ConfirmDelete => draw_confirm_delete(frame, app),
-        Mode::CategoryMgr => draw_simple_modal(frame, "Category Manager", "Esc to return"),
-        Mode::TagMgr => draw_simple_modal(frame, "Tag Manager", "Esc to return"),
+        Mode::CategoryMgr => draw_category_mgr(frame, app),
+        Mode::TagMgr => draw_tag_mgr(frame, app),
         _ => {}
     }
 }
@@ -187,10 +187,128 @@ fn draw_confirm_delete(frame: &mut Frame, app: &App) {
     input::render_modal(frame, area, " Confirm Delete ", &lines);
 }
 
-/// 通用简单模态(分类/标签管理最小实现)。
-fn draw_simple_modal(frame: &mut Frame, title: &str, body: &str) {
-    let area = centered_rect(50, 25, frame.area());
-    input::render_modal(frame, area, title, &[body]);
+/// 分类管理面板。
+fn draw_category_mgr(frame: &mut Frame, app: &App) {
+    let entries: Vec<String> = app
+        .categories
+        .iter()
+        .map(|c| {
+            if let Some(pid) = c.parent_id {
+                // 尽量把 parent 名标出;找不到则只标 id。
+                let pname = app
+                    .categories
+                    .iter()
+                    .find(|p| p.id == Some(pid))
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| format!("#{pid}"));
+                format!("{} (parent: {})", c.name, pname)
+            } else {
+                c.name.clone()
+            }
+        })
+        .collect();
+    draw_mgr(
+        frame,
+        app,
+        "Categories",
+        &entries,
+        app.mgr_selected,
+        "a:add  r:rename  x:del  Esc:back",
+        "(none, press a to add)",
+    );
+}
+
+/// 标签管理面板。
+fn draw_tag_mgr(frame: &mut Frame, app: &App) {
+    let entries: Vec<String> = app.tags.to_vec();
+    draw_mgr(
+        frame,
+        app,
+        "Tags",
+        &entries,
+        app.mgr_selected,
+        "a:add  r:rename  x:del  Esc:back",
+        "(none, press a to add)",
+    );
+}
+
+/// 管理面板通用渲染:列表 + (编辑态)输入框 + 提示行。
+fn draw_mgr(
+    frame: &mut Frame,
+    app: &App,
+    title: &str,
+    entries: &[String],
+    selected: usize,
+    browse_hint: &str,
+    empty_hint: &str,
+) {
+    let area = centered_rect(56, 56, frame.area());
+    frame.render_widget(Clear, area);
+
+    let editing = app.mgr_edit.is_some();
+    let inner = theme::panel_frame(frame, area, Some(title));
+
+    // inner 内部:列表 / [输入框] / 提示行。
+    let constraints = if editing {
+        vec![
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![Constraint::Min(1), Constraint::Length(1)]
+    };
+    let chunks = Layout::vertical(constraints).split(inner);
+    let list_area = chunks[0];
+
+    // 输入框(编辑态)。
+    if editing {
+        let field = input::InputField {
+            value: app.input.clone(),
+            mask: false,
+        };
+        let label = match app.mgr_edit {
+            Some(crate::app::MgrEdit::Add) => " add ",
+            Some(crate::app::MgrEdit::Rename) => " rename ",
+            None => " ",
+        };
+        input::render_input(frame, chunks[1], &field, label);
+    }
+
+    // 列表区。
+    if entries.is_empty() {
+        let empty = ratatui::widgets::Paragraph::new(empty_hint).style(theme::muted());
+        frame.render_widget(empty, list_area);
+    } else {
+        let items: Vec<ratatui::widgets::ListItem> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let style = if i == selected {
+                    theme::selected_bar()
+                } else {
+                    theme::fg()
+                };
+                let mark = if i == selected { "▸ " } else { "  " };
+                ratatui::widgets::ListItem::new(ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw(mark),
+                    ratatui::text::Span::styled(name.clone(), style),
+                ]))
+            })
+            .collect();
+        let list = ratatui::widgets::List::new(items);
+        frame.render_widget(list, list_area);
+    }
+
+    // 提示行。
+    let hint = if editing {
+        "Enter:confirm  Esc:cancel"
+    } else {
+        browse_hint
+    };
+    let hint_idx = if editing { 2 } else { 1 };
+    let hint_p = ratatui::widgets::Paragraph::new(hint).style(theme::muted());
+    frame.render_widget(hint_p, chunks[hint_idx]);
 }
 
 /// 顶部状态栏:品牌 · 消息(或库路径) · 条目/锁定状态。
