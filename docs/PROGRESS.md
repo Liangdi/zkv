@@ -7,7 +7,7 @@
 
 - **阶段**:✅ **MVP 完成**(SA1–SA6 全部交付,端到端验证通过)+ 无头 CLI / TOTP 扩展
 - **最后更新**:2026-06-20
-- **验证**:`cargo build` / `cargo test`(**174 passed**, +1 ignored)/ `cargo build --release` / `cargo clippy --all-targets` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过;完整无头 CLI(22 子命令)+ TOTP + TUI 管理(分类/标签/附件)经真二进制端到端冒烟验证。
+- **验证**:`cargo build` / `cargo test`(**176 passed**, +1 ignored)/ `cargo build --release` / `cargo clippy --all-targets` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过;完整无头 CLI(22 子命令)+ TOTP + TUI 管理(分类/标签/附件)+ 闲置自动锁定经真二进制端到端冒烟验证。
 
 ## 使用方法
 
@@ -41,7 +41,7 @@ zkv attach get ~/my.zkv <id> <att> [-o file|>file]  ·  zkv attach rm ~/my.zkv <
 zkv export ~/my.zkv --format json|csv [-o file]  ·  zkv import ~/my.zkv --format json|csv [-i file]
 ```
 
-TUI 快捷键:`n` 新建 · `e` 编辑 · `x` 删除 · `/` 搜索 · `y` 复制密码(20s 自动清空) · **`o` 复制 TOTP 验证码** · **`a` 附件管理** · `l` 锁定 · **`c`/`t` 分类/标签管理(增删改)** · `q` 退出。三类条目:密码 / 笔记 / 卡片。
+TUI 快捷键:`n` 新建 · `e` 编辑 · `x` 删除 · `/` 搜索 · `y` 复制密码(20s 自动清空) · **`o` 复制 TOTP 验证码** · **`a` 附件管理** · `l` 锁定 · **`c`/`t` 分类/标签管理(增删改)** · `q` 退出。三类条目:密码 / 笔记 / 卡片。**闲置自动锁定**:TUI 无操作超过 `ZKV_LOCK_SECS`(默认 300 秒,`0` 禁用)自动上锁,可原地重输口令恢复。
 
 ## 关键决策记录
 
@@ -90,11 +90,12 @@ src/
 - ✅ **SA8 无头 CLI + TOTP** — init/ls/get/search/cp/add/edit/rm/otp + RFC 6238 + TUI 实时码
 - ✅ **SA9 无头 CLI 全功能** — cat/tag/attach 管理 · gen 密码生成 · export/import · edit 单字段 + 标签增删 + --otpauth · --find 标题定位
 - ✅ **SA10 TUI 管理补全** — CategoryMgr/TagMgr 增删改面板 · Mode::Attachments 附件管理 · detail 附件摘要
+- ✅ **SA11 闲置自动锁定** — `ZKV_LOCK_SECS`(默认 300s,0 禁用)无操作自动锁;锁定后回口令态可原地重解锁(手动 `l` 同样受益)
 
 ## 最终端到端验证(2026-06-20)
 
 - `cargo build` → exit 0,0 warning
-- `cargo test` → **174 passed; 0 failed; 1 ignored**
+- `cargo test` → **176 passed; 0 failed; 1 ignored**
 - `cargo build --release` → exit 0,0 warning
 - `cargo clippy --all-targets` → 0 warning
 - `zkv --help` → 显示全部子命令(`new`/`open`/`init`/`gen`/`ls`/`get`/`search`/`otp`/`cp`/`add`/`edit`/`rm`/`cat`/`tag`/`attach`/`export`/`import`),exit 0
@@ -147,3 +148,8 @@ src/
   - **分类/标签管理面板**(`Mode::CategoryMgr`/`TagMgr` 从 stub 补全):[app.rs](../src/app.rs) 加 `mgr_selected`/`mgr_edit` 状态(复用 `input` 做名称输入);浏览态 `j/k` 选择、`a` 新增、`r` 改名(预填)、`x` 删除、`Esc` 返回;编辑态 `Enter` 提交 / `Esc` 取消。[ui/mod.rs](../src/ui/mod.rs) `draw_mgr` 居中面板(列表+选中高亮+输入行+footer 提示)。复用 store cat/tag CRUD,写后 save+reload。
   - **附件管理**(`Mode::Attachments`):Normal 下 `a` 进入管理选中条目的附件;`a` 添加(路径输入→读文件→`guess_mime`→insert)、`e` 导出(路径→写 blob)、`x` 删除、`Esc` 返回;`att_list`/`att_edit` 状态。**列表/摘要一律不读 blob**(自写 SQL)。[ui/detail.rs](../src/ui/detail.rs) 只读视图末尾附 `📎 <filename> (<size>)` 摘要 + `press a to manage` 提示。`cli::guess_mime` 提为 `pub` 复用。
   - 验证:`cargo build` / `cargo clippy --all-targets` 0 warning;`cargo test` 174 passed;`just e2e` 6/6(无回归);PTY 驱动确认分类/附件管理面板真实渲染。
+- **2026-06-21** 闲置自动锁定(SA11;`cargo test` 176 passed):
+  - TUI 主循环([ui/mod.rs](../src/ui/mod.rs))记录上次按键时间,每轮检查 `ZKV_LOCK_SECS`(默认 **300s**,`0` 禁用,非法用默认)超时则 `app.lock()`(仅 db 非空时)。检查放在循环顶部每轮(真实终端 ~250ms poll 超时迭代;PTY 下非按键事件也唤醒循环)。
+  - `lock()`([app.rs](../src/app.rs))改为切到 `PromptPassphrase(Open)`(保留 path、`input_mask=true`)—— 自动锁与手动 `l` 后均可**原地重输口令解锁**,不必退出重开。
+  - 已知边界:`ZKV_LOCK_SECS` 设得比解锁 Argon2 耗时(默认 KDF ~0.8s)还短时,解锁刚完成可能立即再锁(病态配置, sane 值不受影响)。
+  - 验证:`cargo build` / `cargo clippy --all-targets` 0 warning;`cargo test` 176 passed;`just e2e` 6/6;PTY 驱动确认 `ZKV_LOCK_SECS=3` 闲置自动锁 + 原地重解锁成功。
