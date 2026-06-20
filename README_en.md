@@ -7,9 +7,9 @@ English | [中文](README.md)
 ![Rust](https://img.shields.io/badge/Rust-edition%202024-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-green)
-![Tests](https://img.shields.io/badge/tests-59%20passed-success)
+![Tests](https://img.shields.io/badge/tests-176%20passed-success)
 
-A terminal-based manager for passwords / notes / cards with a sci-fi TUI ([ratatui-sci-fi](https://crates.io/crates/ratatui-sci-fi) Cyberpunk theme). All data is encrypted at rest with **Argon2id + XChaCha20-Poly1305**.
+A terminal-based manager for passwords / notes / cards with a sci-fi TUI ([ratatui-sci-fi](https://crates.io/crates/ratatui-sci-fi) Cyberpunk theme). All data is encrypted at rest with **Argon2id + XChaCha20-Poly1305**; ships with a fully **scriptable, TTY-free headless CLI**.
 
 ---
 
@@ -21,21 +21,26 @@ A terminal-based manager for passwords / notes / cards with a sci-fi TUI ([ratat
 - 🔎 **Full-text search** — Powered by SQLite FTS5 over titles and content.
 - 🏷️ **Categories & tags** — Hierarchical categories + many-to-many tags + favorites, freely combinable.
 - 🖼️ **Embedded attachments** — Images / documents are stored inside the database and encrypted with it.
-- 🎨 **Sci-fi TUI** — Three-pane layout, neon palette, fully keyboard-driven.
-- ⏱️ **Security details** — Clipboard auto-clears 20s after copying a password; atomic writes prevent corruption; files are `0600`.
+- 🔢 **TOTP codes** — Store 2FA secrets and generate live 6-digit codes (RFC 6238).
+- 🎲 **Password generation** — CSPRNG strong passwords (configurable length / symbols / ambiguous chars).
+- 💻 **Headless CLI** — Fully scriptable, no TTY required; passphrase from env var / file / prompt.
+- 🔁 **Import / export** — Lossless JSON round-trip, or flat CSV (passwords), for migration and backup.
+- 🎨 **Sci-fi TUI** — header status bar + list/detail panes + footer keybar, neon rounded panels, fully keyboard-driven.
+- ⏱️ **Security details** — Clipboard auto-clears 20s after copying; idle auto-lock; atomic writes prevent corruption; files are `0600`.
 
 ## 🖥️ Preview
 
 ```
-┌ Categories / Tags ─┬─ Items ─────────────┬─ Detail ─────────────┐
-│ ▸ Work             │ ★ [PW] GitHub Login  │ Title:    GitHub Login│
-│   • Servers        │   [PW] GitLab Token  │ Type:     Password    │
-│ ▸ Personal         │ ★ [NO] Secret Diary  │ Username: alice       │
-│                    │   [CD] Visa ****     │ Password: •••••••••   │
-│ Tags               │                      │ URL:      github.com │
-│ work  vip  personal│                      │                       │
-└────────────────────┴──────────────────────┴───────────────────────┘
-[NORMAL]  n:new  e:edit  x:del  /:search  y:copy  l:lock  q:quit
+┌ Items ─────────────┬─ Detail ──────────────────┐
+│ ★ [PW] GitHub Login│ Title:    GitHub Login    │
+│   [PW] GitLab Token│ Type:     Password        │
+│ ★ [NO] Secret Diary│ Username: alice           │
+│   [CD] Visa ****   │ Password: •••••••••  [y]  │
+│                    │ URL:      github.com      │
+│                    │ TOTP:     586148  (~14s)  │
+│                    │ 📎 report.pdf (12345)     │
+└────────────────────┴───────────────────────────┘
+[normal] n:new e:edit x:del /:search y:copy o:otp a:att l:lock c:cat t:tag q:quit
 ```
 
 ## 🚀 Quick Start
@@ -55,7 +60,34 @@ cargo install --path .
 zkv new ~/my.zkv
 ```
 
-## ⌨️ Keybindings
+## 💻 Headless CLI
+
+Parallel to the TUI, fully **scriptable and TTY-free** (passphrase from `ZKV_PASSPHRASE` env / `--passfile` / interactive prompt):
+
+```bash
+zkv init   ~/my.zkv                              # non-interactive create (refuses to overwrite)
+zkv gen    [24] [--no-symbols] [--no-ambiguous]  # strong random password (no vault needed)
+# Entry CRUD (<id> can be replaced by --find <title-prefix>):
+zkv ls     ~/my.zkv [-t password] [--tag T] [--cat C] [-q github] [-F|--favorite] [--json]
+zkv get    ~/my.zkv <id> [-f password]           # -f prints a raw field for piping
+zkv search ~/my.zkv <query>
+zkv otp    ~/my.zkv <id>                         # print the current TOTP 6-digit code
+zkv cp     ~/my.zkv <id> [-f otp] [--clear 20]   # copy a field (or live TOTP code) to clipboard
+zkv add    ~/my.zkv --title T --data '<ItemData JSON>' [--tag T] [--cat C] [--favorite] [--gen-password[=LEN]] [--otpauth 'otpauth://...']
+zkv edit   ~/my.zkv <id> [--title T | --username/--password/--url/--totp/--notes/...] [--add-tag T | --rm-tag T] [--cat C] [--otpauth 'otpauth://...']
+zkv rm     ~/my.zkv <id> [-y]
+# Category / tag / attachment management:
+zkv cat  add|rm|ls   ~/my.zkv ...
+zkv tag  ls|rm|mv    ~/my.zkv ...
+zkv attach add|ls|get|rm ~/my.zkv <id> ...       # get supports -o file or stdout (binary-safe)
+# Import / export (lossless JSON; CSV is passwords-only):
+zkv export ~/my.zkv --format json|csv [-o file]
+zkv import ~/my.zkv --format json|csv [-i file]
+```
+
+Examples: `ZKV_PASSPHRASE=secret zkv ls vault.zkv --type password --json` · `zkv otp vault.zkv 3` · `code=$(zkv gen 24)`.
+
+## ⌨️ TUI Keybindings
 
 | Key | Action |
 | --- | --- |
@@ -65,12 +97,16 @@ zkv new ~/my.zkv
 | `/` | Search |
 | `j` / `k`, `↑` / `↓` | Move up / down |
 | `y` | Copy password to clipboard (auto-clears after 20s) |
+| `o` | Copy the current TOTP code |
+| `a` | Attachment manager (add / export / delete) |
 | `l` | Lock now (clears keys and data from memory) |
-| `c` / `t` | Category / tag manager |
+| `c` / `t` | Category / tag manager (add / rename / delete) |
 | `Tab` / `↑` / `↓` | Cycle fields while editing |
 | `Enter` | Save / confirm / submit passphrase |
-| `Esc` | Cancel / back (quits the program when locked) |
+| `Esc` | Cancel / back |
 | `q` | Quit |
+
+> **Auto-lock**: the TUI locks itself after `ZKV_LOCK_SECS` (default 300s, `0` disables) of inactivity; re-enter the passphrase in place to resume.
 
 ## 🛡️ Security
 
@@ -80,11 +116,12 @@ zkv new ~/my.zkv
 | --- | --- | --- |
 | Key derivation (KDF) | Argon2id | m=64MiB, t=3, p=4, salt=16B, output 32B |
 | Symmetric encryption | XChaCha20-Poly1305 | key=32B, nonce=24B (fresh each save), tag=16B (AEAD) |
+| TOTP | RFC 6238 | HMAC-SHA1, 30s, 6 digits, base32 secret |
 
-**Granularity**: the entire SQLite database is encrypted as a single blob. On unlock it is decrypted into **memory** (`:memory:`); on exit/lock it is zeroized. On save it is re-encrypted (with a fresh nonce) and written back atomically. Plaintext is never persisted.
+**Granularity**: the entire SQLite database is encrypted as a single blob. On unlock it is decrypted into **memory** (`:memory:`); on exit/lock it is zeroized. On save it is re-encrypted with the cached derived key (a fresh nonce each time, **no Argon2 re-run**) and written back atomically. Plaintext is never persisted.
 
 **Threat model**
-- ✅ Defends against: offline theft of a `.zkv` file (only brute-forceable, made costly by Argon2id); plaintext on disk; metadata leakage (entry counts, tag names — all encrypted).
+- ✅ Defends against: offline theft of a `.zkv` file (only brute-forceable, made costly by Argon2id); plaintext on disk; temp files are `0600` with CSPRNG names; metadata leakage (entry counts, tag names — all encrypted); clipboard auto-clear; idle auto-lock.
 - ⚠️ Does **not** defend against: a fully compromised host (keyloggers, memory dumps, cold-boot attacks).
 - ⚠️ **A forgotten passphrase means unrecoverable data** — the price of zero knowledge. Back up your passphrase and `.zkv` file carefully.
 
@@ -94,14 +131,16 @@ zkv new ~/my.zkv
 - **TUI**: [ratatui](https://crates.io/crates/ratatui) · [crossterm](https://crates.io/crates/crossterm) · [ratatui-sci-fi](https://crates.io/crates/ratatui-sci-fi)
 - **Database**: [rusqlite](https://crates.io/crates/rusqlite) (bundled SQLite, with FTS5)
 - **Crypto**: [argon2](https://crates.io/crates/argon2) · [chacha20poly1305](https://crates.io/crates/chacha20poly1305) · [zeroize](https://crates.io/crates/zeroize) · [secrecy](https://crates.io/crates/secrecy)
-- **Other**: [clap](https://crates.io/crates/clap), [serde](https://crates.io/crates/serde), [thiserror](https://crates.io/crates/thiserror), [color-eyre](https://crates.io/crates/color-eyre)
+- **TOTP**: [hmac](https://crates.io/crates/hmac) · [sha1](https://crates.io/crates/sha1) · [data-encoding](https://crates.io/crates/data-encoding)
+- **Other**: [clap](https://crates.io/crates/clap), [serde](https://crates.io/crates/serde), [thiserror](https://crates.io/crates/thiserror), [color-eyre](https://crates.io/crates/color-eyre), [rpassword](https://crates.io/crates/rpassword), [getrandom](https://crates.io/crates/getrandom)
 
 ## 🏗️ Architecture
 
 Layered design with one-way dependencies (lower layers never reference upper ones), following MVC (`App` = Model + Controller, UI = View):
 
 ```
-error(L0) → crypto/model(L1) → db/vault(L2) → store/search/clipboard(L3) → app(L4) → ui(L5) → main
+error(L0) → crypto/model/totp(L1) → db/vault(L2) → store/search/clipboard(L3) → app(L4) → ui(L5) → main(L6)
+                                                                      ↘ cli (headless frontend, parallel to ui)
 ```
 
 See [docs/PROGRESS.md](docs/PROGRESS.md) and [docs/prd/zkv.md](docs/prd/zkv.md).
@@ -119,15 +158,19 @@ KDF parameters are stored in the file, so they can be tuned in the future while 
 ## 🛠️ Development
 
 ```bash
-cargo test             # unit / integration tests (59 passed)
+cargo test             # unit / integration tests (176 passed)
+cargo clippy --all-targets  # 0 warnings
+just e2e               # PTY end-to-end (drives the real binary, 6 cases)
 cargo build --release  # release build
 ```
 
 ## 🗺️ Roadmap
 
-- [ ] Add/remove interactions for category & tag managers (currently view-only)
+- [x] Category / tag add-rename-delete (CLI + TUI)
+- [x] Import / export (JSON / CSV)
+- [x] TOTP codes + headless CLI + idle auto-lock
 - [ ] Custom field templates
-- [ ] Import / export (CSV / JSON / KeePass)
+- [ ] KeePass import / export
 - [ ] Per-page encryption for very large vaults
 - [ ] Windows clipboard backend
 
