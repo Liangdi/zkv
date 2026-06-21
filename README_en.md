@@ -95,6 +95,23 @@ zkv agent status · zkv agent stop · zkv lock     # status / stop / clear cache
 
 Examples: `ZKV_PASSPHRASE=secret zkv ls vault.zkv --type password --json` · `zkv otp vault.zkv 3` · `code=$(zkv gen 24)`.
 
+### 🐚 Shell completions (bash / zsh / fish / elvish / powershell)
+
+`zkv completions <shell>` prints the completion script to stdout — source it or drop it in your completions directory:
+
+```bash
+# bash (apply now + persist in ~/.bashrc)
+eval "$(zkv completions bash)"
+echo 'eval "$(zkv completions bash)"' >> ~/.bashrc
+
+# or install system-wide (requires sudo):
+zkv completions bash | sudo tee /etc/bash_completion.d/zkv >/dev/null
+
+# other shells work the same: zkv completions zsh / fish / elvish / powershell
+```
+
+Completions cover every subcommand, field names (`-f password|otp|totp|...`), and flags like `--qr` / `--qr-url`.
+
 ## 🔄 Passphrase-caching agent
 
 Every command otherwise reads the passphrase and runs a full Argon2id derivation (64MiB/3/4, ~hundreds of ms). The agent is a **transparent** background process that caches the derived master key **in memory only**, so consecutive commands ask for the passphrase just once and skip the KDF:

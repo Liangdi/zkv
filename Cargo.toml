@@ -33,6 +33,7 @@ secrecy = "0.10"
 # 输入 / CLI
 rpassword = "7"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4"
 
 # 序列化 / 错误
 serde = { version = "1", features = ["derive"] }

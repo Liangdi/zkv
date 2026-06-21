@@ -41,3 +41,17 @@ publish:
 install:
     cargo install --path .
 
+# 安装 bash 补全到用户目录(无需 sudo;新开 shell 生效)。
+# 其它 shell:`just completions zsh`(或 fish/elvish),输出自行 source / 安装。
+completions SHELL="bash":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{SHELL}}" = "bash" ]; then
+        d="$HOME/.local/share/bash-completion/completions"
+        mkdir -p "$d"
+        cargo run --quiet -- completions bash > "$d/zkv"
+        echo "installed bash completion → $d/zkv (open a new shell)"
+    else
+        cargo run --quiet -- completions {{SHELL}}
+    fi
+

@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use zkv::app::App;
 use zkv::ui;
@@ -202,6 +202,11 @@ enum Command {
         /// 去除易混字符(0/O/o/1/l/I 等)。
         #[arg(long = "no-ambiguous")]
         no_ambiguous: bool,
+    },
+    /// 打印指定 shell 的补全脚本到 stdout(供 source 或安装到补全目录)。不解锁库、不需要口令。
+    Completions {
+        /// 目标 shell:bash / zsh / fish / elvish / powershell。
+        shell: clap_complete::Shell,
     },
     /// 修改已有条目的字段(无头)。至少提供 --title/--data/--tag/--favorite/--no-favorite/--set/--add-tag/--rm-tag/--otpauth 之一。
     Edit {
@@ -736,6 +741,12 @@ fn run() -> color_eyre::Result<()> {
             no_ambiguous,
         } => {
             zkv::cli::run_gen(length, !no_symbols, !no_ambiguous)?;
+        }
+        // completions:打印 shell 补全脚本到 stdout。不解锁库、不需要口令。
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let mut out = std::io::stdout();
+            clap_complete::generate(shell, &mut cmd, "zkv", &mut out);
         }
         Command::Edit {
             path,

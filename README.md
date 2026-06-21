@@ -94,6 +94,23 @@ zkv agent status · zkv agent stop · zkv lock     # 查看状态 / 停止 / 清
 
 例:`ZKV_PASSPHRASE=secret zkv ls vault.zkv --type password --json` · `zkv otp vault.zkv 3` · `code=$(zkv gen 24)`。
 
+### 🐚 Shell 补全(bash / zsh / fish / elvish / powershell)
+
+`zkv completions <shell>` 把补全脚本打到 stdout,自行 source 或安装到补全目录即可:
+
+```bash
+# bash(立即生效 + 写入 ~/.bashrc 持久化)
+eval "$(zkv completions bash)"
+echo 'eval "$(zkv completions bash)"' >> ~/.bashrc
+
+# 或安装到系统补全目录(需要 sudo):
+zkv completions bash | sudo tee /etc/bash_completion.d/zkv >/dev/null
+
+# 其它 shell 同理:zkv completions zsh / fish / elvish / powershell
+```
+
+补全覆盖所有子命令、字段名(`-f password|otp|totp|...`)及本次新增的 `--qr` / `--qr-url` 等 flag。
+
 ## 🔄 口令缓存 agent
 
 每条命令原本都要读口令 + 跑一次 Argon2id 派生(64MiB/3/4,百毫秒级)。agent 是一个**无感**的后台进程,**只在内存里**缓存已派生的主密钥,让你连续操作时只输一次口令、且跳过 KDF:
