@@ -7,7 +7,8 @@ English | [中文](README.md)
 ![Rust](https://img.shields.io/badge/Rust-edition%202024-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-green)
-![Tests](https://img.shields.io/badge/tests-215%20passed-success)
+![CI](https://github.com/Liangdi/zkv/actions/workflows/ci.yml/badge.svg)
+![crates.io](https://img.shields.io/crates/v/zkv.svg)
 
 A terminal-based manager for passwords / notes / cards with a sci-fi TUI ([ratatui-sci-fi](https://crates.io/crates/ratatui-sci-fi) Cyberpunk theme). All data is encrypted at rest with **Argon2id + XChaCha20-Poly1305**; ships with a fully **scriptable, TTY-free headless CLI**.
 

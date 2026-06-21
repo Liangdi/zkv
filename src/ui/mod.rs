@@ -182,8 +182,10 @@ fn draw(frame: &mut Frame, app: &App) {
 
 /// 口令输入:全屏模态(mask)。
 fn draw_passphrase(frame: &mut Frame, app: &App, kind: PassKind) {
-    // sci-fi Panel 自带 1 内边距 + 1 边框,故上下各占 2 行;内容需 7 行 → 至少 11 行。
-    // 50% 在 80×24 下得 12 行,内层 8 行,info(3)+input(3)+msg(1) 宽裕。
+    // sci-fi Panel 自带 1 内边距 + 1 边框,上下各占 2 行。
+    // info(1) + input(3) + msg(≥0):inner ≥ 4 行(面板 ≥ 8 行)即可保证 input 有 1 内容行,
+    // 不再把 input 压成无内容的纯边框。passphrase 标注交给 input 的 legend(" passphrase "),
+    // 避免与 info 内的标签重复占高。
     let area = centered_rect(60, 50, frame.area());
     frame.render_widget(Clear, area);
 
@@ -205,14 +207,12 @@ fn draw_passphrase(frame: &mut Frame, app: &App, kind: PassKind) {
     };
 
     let msg = app.message.as_deref().unwrap_or("");
-    let lines = vec![
+    let info = ratatui::widgets::Paragraph::new(
         ratatui::text::Line::from(format!("file: {path}")).style(theme::muted()),
-        ratatui::text::Line::from(""),
-        ratatui::text::Line::from("passphrase:").style(theme::title_style()),
-    ];
-    let info = ratatui::widgets::Paragraph::new(lines);
-    // 先把标题信息渲染到 inner 上半部分。
-    let sub = Layout::vertical([Constraint::Length(3), Constraint::Length(3), Constraint::Min(1)])
+    );
+    // input 固定 3 行(上边框 + 1 内容 + 下边框);info 压到 1 行,msg 用 Min(0) 不与 input
+    // 竞争高度——这样 inner ≥ 4 行时 input 必有 1 内容行,短终端不再塌成纯边框。
+    let sub = Layout::vertical([Constraint::Length(1), Constraint::Length(3), Constraint::Min(0)])
         .split(inner);
     frame.render_widget(info, sub[0]);
     input::render_input(frame, sub[1], &field, " passphrase ");
@@ -611,5 +611,29 @@ mod tests {
             std::env::remove_var("ZKV_LOCK_SECS");
         }
         assert_eq!(lock_timeout_secs(), 300);
+    }
+
+    /// 登录屏的 passphrase 输入框在任何 ≥ 16 行的终端下都必须保留 1 内容行
+    /// (不塌成无内容的纯边框)。回归保险:解析 TestBackend 缓冲,断言掩码圆点 `•`
+    /// 出现在画面中。
+    #[test]
+    fn passphrase_input_keeps_content_row_on_short_terminal() {
+        use ratatui::backend::TestBackend;
+        for h in [16u16, 20, 24] {
+            let mut app = App::for_open(std::path::PathBuf::from("/tmp/x.zkv"));
+            app.input = "mySecretPass".into();
+            app.input_mask = true;
+            let backend = TestBackend::new(80, h);
+            let mut term = ratatui::Terminal::new(backend).unwrap();
+            term.draw(|f| draw_passphrase(f, &app, PassKind::Open)).unwrap();
+            let buf = term.backend().buffer();
+            let rendered: String = (0..h)
+                .flat_map(|y| (0..80u16).map(move |x| buf[(x, y)].symbol().to_string()))
+                .collect();
+            assert!(
+                rendered.contains('•'),
+                "passphrase input lost its content row at height {h}"
+            );
+        }
     }
 }

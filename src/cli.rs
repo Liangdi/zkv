@@ -29,6 +29,7 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::model::{legacy_to_fields, Attachment, Category, Field, FieldKind, Item, LegacyItemData};
 use crate::search::{self, Filter};
+use crate::style;
 use crate::store;
 use crate::vault;
 
@@ -112,7 +113,7 @@ pub fn run_passwd(path: &Path, old_pf: Option<&Path>, new_pf: Option<&Path>) -> 
     vault::change_passphrase(path, old.as_str(), new.as_str())?;
     // 旧口令的派生密钥已随新 salt 失效,丢弃 agent 缓存,下次解锁重新派生种入。
     crate::agent::forget(path);
-    println!("passphrase changed");
+    println!("{}", style::ok("passphrase changed"));
     Ok(())
 }
 
@@ -167,7 +168,11 @@ pub fn run_init(path: &Path, passfile: Option<&Path>) -> Result<()> {
     let pass = read_passphrase(passfile)?;
     // 默认 KDF(Argon2id 64MiB/3/4),生产级强度;建空库。
     vault::create(path, pass.as_str())?;
-    println!("created vault at {}", path.display());
+    println!(
+        "{} {}",
+        style::ok("created vault at"),
+        path.display()
+    );
     Ok(())
 }
 
@@ -297,38 +302,229 @@ pub fn resolve_id(
     Err(Error::Other("need an <id> or --find <TITLE>".into()))
 }
 
+// ---------------------------------------------------------------------------
+// CLI 表格渲染器(零依赖)
+// ---------------------------------------------------------------------------
+// 一组把「表头 + 若干行单元格」渲染成对齐表格的小工具,供 ls/search/cat ls/tag ls/
+// attach ls 复用。设计要点:
+// - **ANSI 感知**:`style::paint` 包出的单元格含真彩色 SGR 转义(`\x1b[…m`),这些字节
+//   不占显示宽度,列宽计算时必须剥掉,否则带色列会比实际窄、错位。
+// - **宽字符感知**:标题/标签可能含 CJK 或全角字符(显示宽度为 2),用启发式区间判定。
+// - 无外部依赖(项目「零新增依赖」精神),仅依赖标准库。
+
+/// 单元格对齐方式。
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+}
+
+/// 把「表头 + 数据行」渲染成对齐表格,写到 `out`。
+///
+/// - `header`:`(列名, 对齐)`;`rows[i][j]` 是第 i 行第 j 列的文本(可含 ANSI 着色)。
+/// - 列宽 = 该列「表头 + 全部单元格」的最大**可见**宽度。
+/// - 输出形态:表头行(青色)→ 一行 `─` 分隔(弱化色)→ 各数据行;列间两空格、行首一空格。
+/// - 被管道/重定向时 `color = false`,单元格为纯文本,表格仍正确对齐(便于日志/复制)。
+fn render_table<W: Write>(
+    out: &mut W,
+    color: bool,
+    header: &[(&str, Align)],
+    rows: &[Vec<String>],
+) -> Result<()> {
+    let ncols = header.len();
+    // 1. 求各列可见宽度。
+    let mut widths = vec![0usize; ncols];
+    for (i, (label, _)) in header.iter().enumerate() {
+        widths[i] = widths[i].max(display_width(label));
+    }
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < ncols {
+                widths[i] = widths[i].max(display_width(cell));
+            }
+        }
+    }
+
+    // 2. 表头行(整体着色为 key/青)。
+    let mut header_line = String::from(" ");
+    for (i, (label, align)) in header.iter().enumerate() {
+        if i > 0 {
+            header_line.push_str("  ");
+        }
+        header_line.push_str(&pad(label, widths[i], *align));
+    }
+    writeln!(
+        out,
+        "{}",
+        style::paint(color, &["key"], header_line.trim_end())
+    )?;
+
+    // 3. 分隔线:每列一段 `─`(弱化色),宽度对齐表头。
+    let mut sep = String::from(" ");
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            sep.push_str("  ");
+        }
+        sep.push_str(&"─".repeat(*w));
+    }
+    writeln!(out, "{}", style::paint(color, &["muted"], &sep))?;
+
+    // 4. 数据行:单元格原样(含调用方着色),按列对齐补空格。
+    for row in rows {
+        let mut line = String::from(" ");
+        for (i, (w, (_, align))) in widths.iter().zip(header.iter()).enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            let cell = row.get(i).map(String::as_str).unwrap_or("");
+            line.push_str(&pad(cell, *w, *align));
+        }
+        writeln!(out, "{}", line.trim_end())?;
+    }
+    Ok(())
+}
+
+/// 把 `s` 补到可见宽度 `width`:`Left` 右补空格,`Right` 左补空格。
+fn pad(s: &str, width: usize, align: Align) -> String {
+    let gap = width.saturating_sub(display_width(s));
+    match align {
+        Align::Left => format!("{s}{}", " ".repeat(gap)),
+        Align::Right => format!("{}{s}", " ".repeat(gap)),
+    }
+}
+
+/// 字符串的**可见**宽度:剥掉 ANSI CSI 转义后,按字符宽度求和。
+///
+/// CSI 形如 `\x1b[38;2;r;g;bm` / `\x1b[0m`;其参数字节均为 ASCII(< 0x80),
+/// 故逐字节跳过不会落到多字节 UTF-8 中间,`i` 始终停在字符边界。
+fn display_width(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut width = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // ANSI CSI:ESC '[' ... <0x40..=0x7E 终止符>。
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // 跳过终止符。
+            }
+            continue;
+        }
+        // 解码一个 UTF-8 字符。SAFETY:`i` 在字符边界(见上),`s` 为合法 UTF-8。
+        let ch = s[i..].chars().next().unwrap();
+        width += char_width(ch);
+        i += ch.len_utf8();
+    }
+    width
+}
+
+/// 单个字符的显示宽度:控制符 0、ASCII 1、CJK/全角/emoji 启发式为 2、其余 1。
+fn char_width(c: char) -> usize {
+    if c.is_control() {
+        return 0;
+    }
+    let u = c as u32;
+    if u < 0x80 {
+        return 1;
+    }
+    if is_wide(u) {
+        2
+    } else {
+        1
+    }
+}
+
+/// 宽字符区间启发式(覆盖常见 CJK / 全角 / emoji,无需 unicode-width 依赖)。
+fn is_wide(u: u32) -> bool {
+    matches!(
+        u,
+        0x1100..=0x115F   // Hangul Jamo
+        | 0x2E80..=0x303E // CJK 部首 / 标点
+        | 0x3041..=0x33FF // 假名 / 谚文兼容 / CJK 符号
+        | 0x3400..=0x4DBF // CJK 扩展 A
+        | 0x4E00..=0x9FFF // CJK 统一表意文字
+        | 0xA000..=0xA4CF // 彝文
+        | 0xAC00..=0xD7A3 // 谚文音节
+        | 0xF900..=0xFAFF // CJK 兼容表意
+        | 0xFE30..=0xFE4F // CJK 兼容形式
+        | 0xFF00..=0xFF60 // 全角 ASCII
+        | 0xFFE0..=0xFFE6 // 全角符号
+        | 0x1F300..=0x1FAFF // emoji / 符号
+        | 0x20000..=0x3FFFD // CJK 扩展 B–F
+    )
+}
+
+/// Unix 日数 → (年, 月[1-12], 日[1-31])。Howard Hinnant 的 civil_from_days,
+/// 纯整数、无闰年查表、对负日数(epoch 之前)亦正确。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Unix 秒(UTC)→ `YYYY-MM-DD HH:MM`。UTC 无时区依赖、确定性;机器解析请用 `--json`。
+fn fmt_timestamp(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let tod = secs.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    let hh = tod / 3600;
+    let mm = (tod % 3600) / 60;
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
 /// `ls`/`search` 公用:把条目列表格式化后写到 `out`。
 ///
 /// - `json = true`:`serde_json::to_string_pretty`(`Item` 已 derive `Serialize`)。
-/// - 否则:人类可读,每行 `id\ttype\ttitle\t[tags]\tupdated`。
+/// - 否则:人类可读,渲染为对齐表格(ID/TYPE/TITLE/TAGS/UPDATED)。
 fn write_items<W: Write>(out: &mut W, items: &[Item], json: bool) -> Result<()> {
     if json {
         let s = serde_json::to_string_pretty(items)?;
         writeln!(out, "{s}")?;
         return Ok(());
     }
+    // 仅人类可读模式着色;json 仅供机器解析,保持纯净。被管道/重定向时 c=false 自动关闭。
+    let c = style::stdout_enabled();
     if items.is_empty() {
-        writeln!(out, "(no items)")?;
+        writeln!(out, "{}", style::paint(c, &["muted"], "(no items)"))?;
         return Ok(());
     }
-    for it in items {
-        let id = it.id.unwrap_or(-1);
-        let tags = if it.tags.is_empty() {
-            String::from("-")
-        } else {
-            it.tags.join(",")
-        };
-        writeln!(
-            out,
-            "{}\t{}\t{}\t[{}]\t{}",
-            id,
-            it.template_id,
-            it.title,
-            tags,
-            it.updated_at
-        )?;
-    }
-    Ok(())
+    let header = [
+        ("ID", Align::Right),
+        ("TYPE", Align::Left),
+        ("TITLE", Align::Left),
+        ("TAGS", Align::Left),
+        ("UPDATED", Align::Right),
+    ];
+    let rows: Vec<Vec<String>> = items
+        .iter()
+        .map(|it| {
+            let id = it.id.unwrap_or(-1);
+            let tags = if it.tags.is_empty() {
+                String::from("-")
+            } else {
+                it.tags.join(", ")
+            };
+            vec![
+                style::paint(c, &["id"], &id.to_string()),
+                style::paint(c, &["key"], &it.template_id),
+                it.title.clone(),
+                style::paint(c, &["muted"], &tags),
+                style::paint(c, &["muted"], &fmt_timestamp(it.updated_at)),
+            ]
+        })
+        .collect();
+    render_table(out, c, &header, &rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -741,9 +937,17 @@ pub fn run_add(
 
     let id = store::insert_item(u.db.conn(), &mut draft)?;
     u.save()?;
-    println!("added item {id}: {title}");
+    println!(
+        "{} {}: {}",
+        style::ok("added item"),
+        style::id_text(&id.to_string()),
+        title
+    );
     if let Some(pw) = generated {
-        eprintln!("generated password for item {id}: {pw}");
+        eprintln!(
+            "{}",
+            style::warn(&format!("generated password for item {id}: {pw}"))
+        );
     }
     // 提供了 TOTP 来源(--otpauth / --qr / --qr-url / --set totp=)时,向 stderr 打印实时码确认。
     if otpauth.is_some() || sets.sets.iter().any(|(n, _)| n == "totp") {
@@ -919,7 +1123,7 @@ pub fn run_edit(
 
     store::update_item(conn, &item)?;
     u.save()?;
-    println!("updated item {id}");
+    println!("{} {}", style::ok("updated item"), style::id_text(&id.to_string()));
     // 提供了 TOTP 来源(--otpauth / --qr / --qr-url / --set totp=)时,向 stderr 打印实时码确认。
     if otpauth.is_some() || fields.sets.iter().any(|(n, _)| n == "totp") {
         eprint_totp_hint(&item);
@@ -951,14 +1155,14 @@ pub fn run_rm(u: &Unlocked, id: i64, yes: bool) -> Result<()> {
             .unwrap_or_default();
         let first = confirm.trim_start().chars().next();
         if !matches!(first, Some('y' | 'Y')) {
-            println!("aborted");
+            println!("{}", style::muted("aborted"));
             return Ok(());
         }
     }
 
     store::delete_item(conn, id)?;
     u.save()?;
-    println!("deleted item {id}");
+    println!("{} {}", style::ok("deleted item"), style::id_text(&id.to_string()));
     Ok(())
 }
 
@@ -985,7 +1189,12 @@ pub fn run_cat_add(u: &Unlocked, name: &str, parent: Option<&str>) -> Result<i64
     };
     let id = store::insert_category(conn, &mut cat)?;
     u.save()?;
-    println!("added category {id}: {name}");
+    println!(
+        "{} {}: {}",
+        style::ok("added category"),
+        style::id_text(&id.to_string()),
+        name
+    );
     Ok(id)
 }
 
@@ -996,34 +1205,53 @@ pub fn run_cat_rm(u: &Unlocked, target: &str) -> Result<()> {
     let id = resolve_category(conn, target)?;
     store::delete_category(conn, id)?;
     u.save()?;
-    println!("deleted category {id}");
+    println!(
+        "{} {}",
+        style::ok("deleted category"),
+        style::id_text(&id.to_string())
+    );
     Ok(())
 }
 
-/// `cat ls`:列出全部分类。每行 `id\tname\tparent\tparent`(`—` 表示无父)。
+/// `cat ls`:列出全部分类。渲染为对齐表格(ID/NAME/PARENT/ORDER),无父用 `-`。
 pub fn run_cat_ls(u: &Unlocked) -> Result<()> {
     let conn = u.db.conn();
     let cats = store::list_categories(conn)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let c = style::stdout_enabled();
     if cats.is_empty() {
-        writeln!(out, "(no categories)")?;
+        writeln!(out, "{}", style::paint(c, &["muted"], "(no categories)"))?;
         return Ok(());
     }
     // 构一个 id→name 映射,便于把 parent_id 渲染成父分类名。
     let id_to_name: std::collections::HashMap<i64, String> = cats
         .iter()
-        .filter_map(|c| c.id.map(|i| (i, c.name.clone())))
+        .filter_map(|cat| cat.id.map(|i| (i, cat.name.clone())))
         .collect();
-    for c in &cats {
-        let id = c.id.unwrap_or(-1);
-        let parent = c
-            .parent_id
-            .and_then(|pid| id_to_name.get(&pid).cloned())
-            .unwrap_or_else(|| "-".into());
-        writeln!(out, "{id}\t{}\t{parent}\t{}", c.name, c.sort_order)?;
-    }
-    Ok(())
+    let header = [
+        ("ID", Align::Right),
+        ("NAME", Align::Left),
+        ("PARENT", Align::Left),
+        ("ORDER", Align::Right),
+    ];
+    let rows: Vec<Vec<String>> = cats
+        .iter()
+        .map(|cat| {
+            let id = cat.id.unwrap_or(-1);
+            let parent = cat
+                .parent_id
+                .and_then(|pid| id_to_name.get(&pid).cloned())
+                .unwrap_or_else(|| "-".into());
+            vec![
+                style::paint(c, &["id"], &id.to_string()),
+                cat.name.clone(),
+                parent,
+                cat.sort_order.to_string(),
+            ]
+        })
+        .collect();
+    render_table(&mut out, c, &header, &rows)
 }
 
 /// 把 target(数字 id 或分类名)解析成分类 id。两者都失败报错。
@@ -1037,20 +1265,23 @@ fn resolve_category(conn: &rusqlite::Connection, target: &str) -> Result<i64> {
         .ok_or_else(|| Error::Other(format!("category '{target}' not found")))
 }
 
-/// `tag ls`:列出全部标签。每行 `id\tname`。
+/// `tag ls`:列出全部标签。渲染为对齐表格(ID/NAME)。
 pub fn run_tag_ls(u: &Unlocked) -> Result<()> {
     let conn = u.db.conn();
     let tags = store::list_tags(conn)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let c = style::stdout_enabled();
     if tags.is_empty() {
-        writeln!(out, "(no tags)")?;
+        writeln!(out, "{}", style::paint(c, &["muted"], "(no tags)"))?;
         return Ok(());
     }
-    for t in tags {
-        writeln!(out, "{}\t{}", t.id, t.name)?;
-    }
-    Ok(())
+    let header = [("ID", Align::Right), ("NAME", Align::Left)];
+    let rows: Vec<Vec<String>> = tags
+        .iter()
+        .map(|t| vec![style::paint(c, &["id"], &t.id.to_string()), t.name.clone()])
+        .collect();
+    render_table(&mut out, c, &header, &rows)
 }
 
 /// `tag rm`:删除标签(by 名)。成功打印 `deleted tag <name>`。
@@ -1060,7 +1291,7 @@ pub fn run_tag_rm(u: &Unlocked, name: &str) -> Result<()> {
         .ok_or_else(|| Error::Other(format!("tag '{name}' not found")))?;
     store::delete_tag(conn, id)?;
     u.save()?;
-    println!("deleted tag {name}");
+    println!("{} {}", style::ok("deleted tag"), name);
     Ok(())
 }
 
@@ -1071,7 +1302,7 @@ pub fn run_tag_mv(u: &Unlocked, from: &str, to: &str) -> Result<()> {
         .ok_or_else(|| Error::Other(format!("tag '{from}' not found")))?;
     store::update_tag(conn, id, to)?;
     u.save()?;
-    println!("renamed tag {from} -> {to}");
+    println!("{} {} -> {}", style::ok("renamed tag"), from, to);
     Ok(())
 }
 
@@ -1159,8 +1390,9 @@ pub fn run_attach_add(
     let id = store::insert_attachment(conn, &mut att)?;
     u.save()?;
     println!(
-        "attached {}: {} ({} bytes)",
-        id,
+        "{} {}: {} ({} bytes)",
+        style::ok("attached"),
+        style::id_text(&id.to_string()),
         att.filename,
         att.size
     );
@@ -1190,15 +1422,29 @@ pub fn run_attach_ls(u: &Unlocked, item: i64) -> Result<()> {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let c = style::stdout_enabled();
     if rows.is_empty() {
-        writeln!(out, "(no attachments)")?;
+        writeln!(out, "{}", style::paint(c, &["muted"], "(no attachments)"))?;
         return Ok(());
     }
-    for (id, filename, mime, size) in rows {
-        let mime = mime.unwrap_or_else(|| "-".into());
-        writeln!(out, "{id}\t{filename}\t{mime}\t{size}")?;
-    }
-    Ok(())
+    let header = [
+        ("ID", Align::Right),
+        ("FILENAME", Align::Left),
+        ("MIME", Align::Left),
+        ("SIZE", Align::Right),
+    ];
+    let table_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|(id, filename, mime, size)| {
+            vec![
+                style::paint(c, &["id"], &id.to_string()),
+                filename.clone(),
+                mime.clone().unwrap_or_else(|| "-".into()),
+                size.to_string(),
+            ]
+        })
+        .collect();
+    render_table(&mut out, c, &header, &table_rows)
 }
 
 /// `attach get`:导出附件 blob 到文件(`-o`)或 stdout。
@@ -1225,14 +1471,25 @@ pub fn run_attach_get(
 
     let mime = attachment.mime_type.clone().unwrap_or_else(|| "-".into());
     eprintln!(
-        "{}\t{}\t{} bytes",
-        attachment.filename, mime, attachment.size
+        "{}",
+        style::paint(
+            style::stderr_enabled(),
+            &["muted"],
+            &format!("{}\t{}\t{} bytes", attachment.filename, mime, attachment.size)
+        )
     );
 
     match output {
         Some(p) => {
             std::fs::write(p, &attachment.blob)?;
-            eprintln!("wrote {}", p.display());
+            eprintln!(
+                "{}",
+                style::paint(
+                    style::stderr_enabled(),
+                    &["ok"],
+                    &format!("wrote {}", p.display())
+                )
+            );
         }
         None => {
             let stdout = std::io::stdout();
@@ -1257,7 +1514,11 @@ pub fn run_attach_rm(u: &Unlocked, item: i64, att: i64) -> Result<()> {
     }
     store::delete_attachment(conn, att)?;
     u.save()?;
-    println!("deleted attachment {att}");
+    println!(
+        "{} {}",
+        style::ok("deleted attachment"),
+        style::id_text(&att.to_string())
+    );
     Ok(())
 }
 
@@ -1583,7 +1844,10 @@ pub fn run_export(
         Format::Csv => {
             let (csv, skipped) = export_csv(&items);
             if skipped > 0 {
-                eprintln!("skipped {skipped} non-password items");
+                eprintln!(
+                    "{}",
+                    style::warn(&format!("skipped {skipped} non-password items"))
+                );
             }
             csv
         }
@@ -1591,7 +1855,14 @@ pub fn run_export(
     match output {
         Some(p) => {
             write_secret_file(p, content.as_bytes())?;
-            eprintln!("exported {} items to {}", items.len(), p.display());
+            eprintln!(
+                "{}",
+                style::paint(
+                    style::stderr_enabled(),
+                    &["ok"],
+                    &format!("exported {} items to {}", items.len(), p.display())
+                )
+            );
         }
         None => {
             let stdout = std::io::stdout();
@@ -1682,9 +1953,17 @@ pub fn run_import(u: &Unlocked, format: Format, input: Option<&Path>) -> Result<
     }
 
     if att_fail == 0 {
-        println!("imported {ok} items ({att_ok} attachments)");
+        println!(
+            "{}",
+            style::ok(&format!("imported {ok} items ({att_ok} attachments)"))
+        );
     } else {
-        println!("imported {ok} items ({att_ok} attachments, {att_fail} failed)");
+        println!(
+            "{}",
+            style::warn(&format!(
+                "imported {ok} items ({att_ok} attachments, {att_fail} failed)"
+            ))
+        );
     }
     // 聚合失败:item 失败 + 附件失败 + 整体解析失败。
     fail += att_fail;
@@ -1790,13 +2069,19 @@ pub fn run_cp(u: &Unlocked, id: i64, field: Option<&str>, clear_secs: u64) -> Re
     if name == "otp" {
         let code = otp_of_item(&item)?;
         clipboard::copy_and_clear_after(&code, clear_secs)?;
-        println!("copied otp code (clears in {clear_secs}s)");
+        println!(
+            "{}",
+            style::ok(&format!("copied otp code (clears in {clear_secs}s)"))
+        );
         return Ok(());
     }
 
     let val = item_field(&item, name)?;
     clipboard::copy_and_clear_after(&val, clear_secs)?;
-    println!("copied {name} (clears in {clear_secs}s)");
+    println!(
+        "{}",
+        style::ok(&format!("copied {name} (clears in {clear_secs}s)"))
+    );
     Ok(())
 }
 
@@ -1815,7 +2100,16 @@ fn eprint_totp_hint(item: &Item) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    eprintln!("totp: {code}  (valid ~{}s)", 30 - secs % 30);
+    eprintln!(
+        "{} {}  {}",
+        style::warn("totp:"),
+        code,
+        style::paint(
+            style::stderr_enabled(),
+            &["muted"],
+            &format!("(valid ~{}s)", 30 - secs % 30)
+        )
+    );
 }
 
 /// 计算单条条目的实时 TOTP 验证码(6 位)。供 `run_otp`/`run_cp` 复用。
@@ -1850,26 +2144,68 @@ pub fn run_otp(u: &Unlocked, id: i64) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    eprintln!("(valid ~{}s)", 30 - secs % 30);
+    eprintln!(
+        "{}",
+        style::paint(style::stderr_enabled(), &["muted"], &format!(
+            "(valid ~{}s)",
+            30 - secs % 30
+        ))
+    );
     Ok(())
 }
 
-/// 人类可读地打印单条条目(字段表)。按 fields 顺序逐字段列出。
+/// 人类可读地打印单条条目。
+///
+/// 布局:标题横幅 → 副标题(类型/收藏★/标签)→ 分隔线 → 对齐字段 KV → 时间戳。
+/// 多行字段(如 notes)的续行缩进对齐到值列;值保持终端默认色(浅色背景下不掉色);
+/// 时间戳格式化为 UTC `YYYY-MM-DD HH:MM`(机器解析请用 `-f`/`--json`)。
 fn write_item_human<W: Write>(out: &mut W, item: &Item) -> Result<()> {
+    let c = style::stdout_enabled();
     let id = item.id.unwrap_or(-1);
-    writeln!(out, "id:       {id}")?;
-    writeln!(out, "type:     {}", item.template_id)?;
-    writeln!(out, "title:    {}", item.title)?;
+
+    // —— 标题横幅(品牌色加粗)——
+    let title = style::paint(c, &["title"], &item.title);
+    writeln!(out, "{title}")?;
+
+    // —— 副标题:类型 / 收藏 / 标签(均弱化,仅作元信息)——
+    let mut sub = style::paint(c, &["muted"], &item.template_id);
     if item.favorite {
-        writeln!(out, "favorite: yes")?;
+        sub.push_str(&style::paint(c, &["muted"], " · "));
+        sub.push_str(&style::paint(c, &["warn"], "★ favorite"));
     }
     if !item.tags.is_empty() {
-        writeln!(out, "tags:     {}", item.tags.join(", "))?;
+        sub.push_str(&style::paint(c, &["muted"], &format!(" · {}", item.tags.join(", "))));
     }
+    writeln!(out, "{sub}")?;
+
+    // —— 分隔线:对齐到最宽行的可见宽度(至少 24)——
+    let rule_w = display_width(&item.title)
+        .max(display_width(&sub))
+        .max(24);
+    writeln!(out, "{}", style::paint(c, &["muted"], &"─".repeat(rule_w)))?;
+
+    // —— 字段 KV:先收集全部 (label, value),统一 label 列宽后对齐渲染 ——
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    rows.push(("id", id.to_string()));
+    rows.push(("type", item.template_id.clone()));
     for f in &item.fields {
-        writeln!(out, "{:<9}{}", f.name, f.value)?;
+        rows.push((f.name.as_str(), f.value.clone()));
     }
-    writeln!(out, "updated:  {}", item.updated_at)?;
+    rows.push(("created", fmt_timestamp(item.created_at)));
+    rows.push(("updated", fmt_timestamp(item.updated_at)));
+
+    let label_w = rows.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
+    let indent = " ".repeat(label_w + 2); // 值列起点 = 标签宽 + 两空格。
+    for (label, value) in &rows {
+        let head = style::paint(c, &["key"], &format!("{:width$}", label, width = label_w));
+        let mut lines = value.split('\n');
+        let first = lines.next().unwrap_or("");
+        writeln!(out, "{head}  {first}")?;
+        // 多行值:续行缩进到值列,保持对齐。
+        for ln in lines {
+            writeln!(out, "{indent}{ln}")?;
+        }
+    }
     Ok(())
 }
 
@@ -1985,6 +2321,93 @@ mod tests {
         assert_eq!(strip_trailing_newline("abc".into()), "abc");
         // 只去末尾单个换行,中间保留。
         assert_eq!(strip_trailing_newline("a\nb\n".into()), "a\nb");
+    }
+
+    #[test]
+    fn display_width_strips_ansi_and_counts_cjk() {
+        // 纯 ASCII。
+        assert_eq!(display_width("GitHub"), 6);
+        // CJK 每字宽度 2。
+        assert_eq!(display_width("微信"), 4);
+        // ANSI SGR 转义不计入宽度(着色后与纯文本同宽)。
+        let colored = style::paint(true, &["id"], "42");
+        assert_eq!(display_width(&colored), 2);
+        // 真彩色 + reset 也不影响宽度。
+        let ok = style::paint(true, &["ok"], "ok");
+        assert_eq!(display_width(&ok), 2);
+        // 混合:着色 id + 普通文本 + 着色 muted。
+        let mixed = format!(
+            "{}-{}",
+            style::paint(true, &["id"], "1"),
+            style::paint(true, &["muted"], "hi")
+        );
+        assert_eq!(display_width(&mixed), 4);
+        // 控制符宽度 0。
+        assert_eq!(display_width("\u{1}"), 0);
+    }
+
+    #[test]
+    fn render_table_plain_when_color_off() {
+        // color=false:无 ANSI、行首空格 + 列间两空格,末尾不留空格。
+        let mut buf = Vec::<u8>::new();
+        render_table(
+            &mut buf,
+            false,
+            &[("ID", Align::Right), ("NAME", Align::Left)],
+            &[
+                vec!["1".into(), "GitHub".into()],
+                vec!["12".into(), "Ideas".into()],
+            ],
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            out,
+            " ID  NAME\n ──  ──────\n  1  GitHub\n 12  Ideas\n"
+        );
+    }
+
+    #[test]
+    fn fmt_timestamp_known_epochs() {
+        // epoch + 现代日期(UTC),验证 civil_from_days 正确性。
+        assert_eq!(fmt_timestamp(0), "1970-01-01 00:00");
+        assert_eq!(fmt_timestamp(1_735_689_600), "2025-01-01 00:00");
+        // +1h 1m 1s → 时分正确(秒被截断)。
+        assert_eq!(fmt_timestamp(1_735_689_600 + 3661), "2025-01-01 01:01");
+    }
+
+    #[test]
+    fn write_item_human_renders_banner_dates_and_multiline() {
+        let item = Item {
+            id: Some(7),
+            template_id: "password".into(),
+            title: "GitHub".into(),
+            category_id: None,
+            fields: vec![
+                Field { name: "username".into(), value: "alice".into(), kind: FieldKind::Text, protected: false },
+                Field { name: "notes".into(), value: "a\nb".into(), kind: FieldKind::Multiline, protected: false },
+            ],
+            favorite: true,
+            tags: vec!["work".into()],
+            created_at: 1_735_689_600,
+            updated_at: 1_735_689_600,
+        };
+        let mut buf = Vec::<u8>::new();
+        write_item_human(&mut buf, &item).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        // 标题横幅 + 副标题(类型/收藏/标签)。
+        assert!(out.starts_with("GitHub\n"));
+        assert!(out.contains("password · ★ favorite · work"));
+        // 分隔线。
+        assert!(out.contains("────"));
+        // 字段 KV 对齐。
+        assert!(out.contains("username  alice"));
+        // 多行字段续行缩进到值列(10 空格)。
+        assert!(out.contains("          b"));
+        // 时间戳已格式化(非原始 epoch)。
+        assert!(out.contains("created   2025-01-01 00:00"));
+        assert!(out.contains("updated   2025-01-01 00:00"));
+        assert!(!out.contains("1735689600"));
     }
 
     #[test]

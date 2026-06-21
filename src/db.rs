@@ -252,8 +252,8 @@ impl Database {
     ///
     /// `VACUUM INTO` 生成一个完整、自包含、干净 VACUUM 过的副本文件,适合作为整库加密的明文输入。
     pub fn dump_bytes(&self) -> Result<Vec<u8>> {
-        let tmp = secure_tmp_path("zkv_dump");
-        // 注意:SQL 字符串字面量里用单引号转义路径。路径为系统临时目录下的随机名,
+        let tmp = secure_tmp_path("zkv_dump")?;
+        // 注意:SQL 字符串字面量里用单引号转义路径。路径为安全基目录下的随机名,
         // 不含单引号。
         let sql = format!("VACUUM INTO '{}'", tmp.display());
         // 即便后续读回失败也要删除临时文件。
@@ -272,7 +272,7 @@ impl Database {
     /// `:memory:` 连接 → 立即删除临时文件。`Database` 存活期间不持有明文文件
     /// (满足 PRD「明文只存在于运行内存」);临时文件仅瞬时存在(写 → backup → 删)。
     pub fn from_bytes(bytes: &[u8]) -> Result<Database> {
-        let tmp = secure_tmp_path("zkv_load");
+        let tmp = secure_tmp_path("zkv_load")?;
         {
             use std::io::Write;
             let mut f = open_secure(&tmp)?;
@@ -310,12 +310,32 @@ impl Drop for Database {
     }
 }
 
-/// 在系统临时目录下生成一个不可预测命名的路径(不带文件后缀,由调用方追加)。
+/// 返回明文临时文件应落入的**安全基目录**。
 ///
-/// 文件名后缀取自 CSPRNG(`getrandom`),避免可预测的时间戳/计数器(防御纵深):
+/// - Unix:系统临时目录(临时文件本身由 [`open_secure`] 设 `0600`)。
+/// - Windows:一个 **owner-only 私有子目录**([`win_security::secure_tmp_dir`]),
+///   使即便由 SQLite `VACUUM INTO` 自建的临时文件也受目录 ACL 兜底(继承 owner-only ACE)。
+fn secure_tmp_dir() -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        Ok(std::env::temp_dir())
+    }
+    #[cfg(windows)]
+    {
+        win_security::secure_tmp_dir()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(std::env::temp_dir())
+    }
+}
+
+/// 在安全基目录下生成一个不可预测命名的路径(不带文件后缀,由调用方追加)。
+///
+/// 文件名取自 CSPRNG(`getrandom`),避免可预测的时间戳/计数器(防御纵深):
 /// 这些临时文件瞬时持有**明文 SQLite**,名不可预测减少攻击面。唯一性由
-/// `open_secure` 的 `create_new(true)` 原子创建保证。
-fn secure_tmp_base(prefix: &str) -> PathBuf {
+/// [`open_secure`] 的 `create_new`/`CREATE_NEW` 原子创建保证。
+fn secure_tmp_base(prefix: &str) -> Result<PathBuf> {
     let mut buf = [0u8; 16];
     // CSPRNG;系统熵故障无合理恢复路径,直接 expect(与 crypto.rs 一致)。
     getrandom::fill(&mut buf).expect("getrandom::fill failed for temp name");
@@ -323,17 +343,21 @@ fn secure_tmp_base(prefix: &str) -> PathBuf {
     let mut name = String::from(prefix);
     name.push('-');
     name.push_str(&hex);
-    std::env::temp_dir().join(name)
+    Ok(secure_tmp_dir()?.join(name))
 }
 
-/// 生成一个 0600 临时文件路径(名随机,带 `.zkvtmp` 后缀,置于系统临时目录)。
-fn secure_tmp_path(prefix: &str) -> PathBuf {
-    let mut p = secure_tmp_base(prefix);
+/// 生成一个安全临时文件路径(名随机,带 `.zkvtmp` 后缀)。
+fn secure_tmp_path(prefix: &str) -> Result<PathBuf> {
+    let mut p = secure_tmp_base(prefix)?;
     p.set_extension(TMP_SUFFIX.trim_start_matches('.'));
-    p
+    Ok(p)
 }
 
-/// 以 0600 权限打开/创建文件(Unix)。
+/// 以 owner-only 权限打开/创建文件(已存在则报错,对齐 `create_new`)。
+///
+/// - Unix:`0600`。
+/// - Windows:`CreateFileW` + owner-only DACL(见 [`win_security::open_secure_file`])。
+/// - 其他平台:无文件权限语义,fallback 到默认打开。
 #[cfg(unix)]
 fn open_secure(path: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -345,13 +369,251 @@ fn open_secure(path: &Path) -> Result<std::fs::File> {
         .open(path)?)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_secure(path: &Path) -> Result<std::fs::File> {
+    win_security::open_secure_file(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_secure(path: &Path) -> Result<std::fs::File> {
     Ok(std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .truncate(true)
         .open(path)?)
+}
+
+/// Windows owner-only ACL:为明文临时文件/目录构造仅当前用户可访问的安全描述符。
+///
+/// 背景:`std::fs` 在 Windows 上无法设文件 ACL,默认继承的 DACL 可能让同机其他用户读到
+/// 明文临时文件。此处用 `windows-sys` 构造 owner-only DACL:文件用 [`open_secure_file`]
+/// 创建即带权限(无 TOCTOU);目录用 [`create_dir_owner_only`] 且带继承 ACE,使 SQLite
+/// `VACUUM INTO` 自建的文件也继承 owner-only —— 单文件 ACL 管不到 SQLite 自建文件,目录 ACL 兜底。
+#[cfg(windows)]
+pub(crate) mod win_security {
+    use std::ffi::c_void;
+    use std::path::{Path, PathBuf};
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_ALL, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+        TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        CONTAINER_INHERIT_ACE, GetTokenInformation, InitializeSecurityDescriptor, NO_INHERITANCE,
+        OBJECT_INHERIT_ACE, SetSecurityDescriptorDacl, ACL, SECURITY_ATTRIBUTES,
+        SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, CreateFileW, CREATE_NEW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use crate::error::{Error, Result};
+
+    /// per-process 缓存的安全临时目录(线程安全单例)。
+    static SECURE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+    /// 返回 owner-only 私有临时目录(惰性创建、同进程复用)。
+    ///
+    /// 目录名随机(`%TEMP%\zkv-<hex>`),置于世界可列的系统临时目录下而不暴露固定名;
+    /// 带继承 ACE,目录内任何文件(含 SQLite `VACUUM INTO` 自建的)均继承 owner-only。
+    pub(super) fn secure_tmp_dir() -> Result<PathBuf> {
+        if let Some(d) = SECURE_DIR.get() {
+            return Ok(d.clone());
+        }
+        let mut buf = [0u8; 16];
+        getrandom::fill(&mut buf).expect("getrandom::fill failed for tmp dir name");
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("zkv-{hex}"));
+        create_dir_owner_only(&dir)?;
+        // 并发:两线程各自建随机名目录(名字不同,无冲突);败者丢弃自己的,统一用胜者的。
+        let _ = SECURE_DIR.set(dir);
+        Ok(SECURE_DIR.get().expect("secure tmp dir set").clone())
+    }
+
+    /// owner-only ACL 的 RAII 持有者:`acl` 由 `SetEntriesInAclW` 经 `LocalAlloc` 分配,Drop 时 `LocalFree`。
+    ///
+    /// 仅持有 `acl`。`SetEntriesInAclW` 会把 trustee SID **复制**进新 ACL,故 token 与 token buffer
+    /// 在 [`build`](OwnerOnlyAcl::build) 内用完即释放。安全描述符(SD)/`SECURITY_ATTRIBUTES` 不在此
+    /// 持有 —— 它们由调用方作为局部变量构造并指向 `acl`(见 [`build_sa`]),避免返回后 SD 被 move
+    /// 导致 `SA.lpSecurityDescriptor` 悬垂(dangling pointer)。
+    struct OwnerOnlyAcl {
+        acl: *mut ACL,
+    }
+
+    impl OwnerOnlyAcl {
+        /// 构造 owner-only ACL。`inherit=true` 时 ACE 带 `CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE`
+        /// (供目录,让子文件继承 owner-only);`false` 时用 `NO_INHERITANCE`(单文件)。
+        fn build(inherit: bool) -> Result<Self> {
+            unsafe {
+                // 1. 当前进程 token
+                let mut token: HANDLE = ptr::null_mut();
+                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                    return Err(io_err("OpenProcessToken"));
+                }
+
+                // 2. 探测 TokenUser 所需大小,再取(失败即关闭句柄)
+                let mut len: u32 = 0;
+                GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut len);
+                let mut token_buf = vec![0u8; len as usize];
+                let token_ok = GetTokenInformation(
+                    token,
+                    TokenUser,
+                    token_buf.as_mut_ptr() as *mut c_void,
+                    len,
+                    &mut len,
+                ) != 0;
+                if !token_ok {
+                    CloseHandle(token);
+                    return Err(io_err("GetTokenInformation"));
+                }
+                let user_sid = (*(token_buf.as_ptr() as *const TOKEN_USER)).User.Sid;
+
+                // 3. EXPLICIT_ACCESS_W:grant 当前用户 GENERIC_ALL(以 SID 形式,免名字解析)。
+                //    SetEntriesInAclW 会**复制** SID 进新 ACL,故 token_buf 此后可释放。
+                let mut trustee: TRUSTEE_W = std::mem::zeroed();
+                trustee.TrusteeForm = TRUSTEE_IS_SID;
+                trustee.TrusteeType = TRUSTEE_IS_USER;
+                trustee.ptstrName = user_sid as *mut u16;
+
+                let mut ea: EXPLICIT_ACCESS_W = std::mem::zeroed();
+                ea.grfAccessPermissions = GENERIC_ALL;
+                ea.grfAccessMode = GRANT_ACCESS;
+                ea.grfInheritance = if inherit {
+                    CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+                } else {
+                    NO_INHERITANCE
+                };
+                ea.Trustee = trustee;
+
+                let mut acl: *mut ACL = ptr::null_mut();
+                let acl_ok = SetEntriesInAclW(1, &ea, ptr::null(), &mut acl) == 0;
+                CloseHandle(token); // token 用毕释放(SID 已复制进 acl)
+                if !acl_ok || acl.is_null() {
+                    if !acl.is_null() {
+                        LocalFree(acl as *mut c_void);
+                    }
+                    return Err(io_err("SetEntriesInAclW"));
+                }
+                Ok(OwnerOnlyAcl { acl })
+            }
+        }
+    }
+
+    impl Drop for OwnerOnlyAcl {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.acl.is_null() {
+                    LocalFree(self.acl as *mut c_void);
+                }
+            }
+        }
+    }
+
+    /// 以 owner-only DACL 创建文件(已存在报错,对齐 unix `create_new`)。
+    pub(crate) fn open_secure_file(path: &Path) -> Result<std::fs::File> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+
+        let owner = OwnerOnlyAcl::build(false)?;
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0); // CreateFileW 要求 NUL 终止
+        // SD 与 SA 均为本函数局部变量:SA.lpSecurityDescriptor 指向局部 SD,SD.DACL 指向 owner.acl
+        // (堆,存活到函数末 owner drop)。三者生命周期覆盖下面的 CreateFileW 调用,无悬垂指针。
+        let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let psec = core::ptr::addr_of_mut!(sd) as *mut c_void;
+        let sa = build_sa(psec, &owner)?;
+
+        let h = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE | DELETE,
+                FILE_SHARE_READ,
+                &sa,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(io_err("CreateFileW"));
+        }
+        Ok(unsafe { std::fs::File::from_raw_handle(h as _) })
+    }
+
+    /// 以 owner-only DACL(带继承 ACE)创建目录。
+    fn create_dir_owner_only(path: &Path) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+
+        let owner = OwnerOnlyAcl::build(true)?;
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let psec = core::ptr::addr_of_mut!(sd) as *mut c_void;
+        let sa = build_sa(psec, &owner)?;
+        if unsafe { CreateDirectoryW(wide.as_ptr(), &sa) } == 0 {
+            return Err(io_err("CreateDirectoryW"));
+        }
+        Ok(())
+    }
+
+    /// 在调用方提供的 SD 缓冲(`psec`)上初始化 owner-only DACL,返回指向它的 `SECURITY_ATTRIBUTES`。
+    ///
+    /// `psec` 必须指向调用方存活的 `SECURITY_DESCRIPTOR`(由调用方持有,保证 SA 有效);
+    /// SA 的 move 仅拷贝指针值,仍指向调用方局部 SD,故无悬垂。
+    fn build_sa(psec: *mut c_void, owner: &OwnerOnlyAcl) -> Result<SECURITY_ATTRIBUTES> {
+        unsafe {
+            if InitializeSecurityDescriptor(psec, 1 /* SECURITY_DESCRIPTOR_REVISION */) == 0
+                || SetSecurityDescriptorDacl(psec, 1, owner.acl, 0) == 0
+            {
+                return Err(io_err("security descriptor"));
+            }
+            Ok(SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psec,
+                bInheritHandle: 0,
+            })
+        }
+    }
+
+    /// 把上次 OS 错误包成 `Error::Io`(附带调用点便于排查)。
+    fn io_err(ctx: &str) -> Error {
+        let e = std::io::Error::last_os_error();
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("zkv win_security {ctx} failed: {e}"),
+        ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn secure_tmp_dir_exists() {
+            // owner-only 私有目录应被成功创建(惰性、同进程复用)。
+            let dir = secure_tmp_dir().expect("secure_tmp_dir");
+            assert!(dir.is_dir(), "owner-only secure tmp dir should exist");
+        }
+
+        #[test]
+        fn open_secure_file_existing_errors() {
+            // CREATE_NEW 语义:已存在文件应报错(对齐 unix create_new 的 EEXIST)。
+            let mut p = secure_tmp_dir().unwrap();
+            p.push("zkv_test_exists_err");
+            let _ = std::fs::remove_file(&p);
+            {
+                let _f = open_secure_file(&p).expect("first create should succeed");
+            } // 释放句柄后再试
+            let second = open_secure_file(&p);
+            assert!(second.is_err(), "second create must fail (file exists)");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 #[cfg(test)]

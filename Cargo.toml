@@ -51,6 +51,20 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 rqrr = "0.8"
 # blocking + rustls,无系统 OpenSSL 依赖,保持静态/bundled 构建纯净。
 ureq = { version = "2", default-features = false, features = ["tls"] }
+ratatui-style = "0.2.0"
+
+[target.'cfg(windows)'.dependencies]
+# Windows 明文临时文件的 owner-only ACL 保护(L2)。
+# windows-sys 是 rusqlite→libsqlite3-sys 链的传递依赖(Cargo.lock 已有 0.59),
+# 此处仅显式提升为直接依赖 + 启用所需 feature,不引入任何新的 crate 下载。
+# 微软官方、target-only、sys 级(零运行时开销),契合项目「零新增依赖」精神。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",            # HANDLE / CloseHandle / LocalFree / GENERIC_ALL / GENERIC_WRITE
+    "Win32_Security",              # SECURITY_ATTRIBUTES / SECURITY_DESCRIPTOR / ACL / token / GetTokenInformation / *_INHERIT_ACE
+    "Win32_Security_Authorization",# SetEntriesInAclW / EXPLICIT_ACCESS_W / TRUSTEE_W
+    "Win32_Storage_FileSystem",    # CreateFileW / CreateDirectoryW
+    "Win32_System_Threading",      # OpenProcessToken / GetCurrentProcess
+] }
 
 [dev-dependencies]
 # 测试用:生成二维码 PNG 做往返解码验证。

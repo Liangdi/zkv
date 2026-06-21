@@ -3097,6 +3097,7 @@ dependencies = [
  "qrcode",
  "ratatui",
  "ratatui-sci-fi",
+ "ratatui-style",
  "rpassword",
  "rqrr",
  "rusqlite",
@@ -3106,6 +3107,7 @@ dependencies = [
  "sha1",
  "thiserror 2.0.18",
  "ureq",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

@@ -11,6 +11,7 @@ pub mod db;
 pub mod error;
 pub mod model;
 pub mod search;
+pub mod style;
 pub mod store;
 #[cfg(test)]
 pub mod test_support;

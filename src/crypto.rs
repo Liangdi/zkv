@@ -63,6 +63,9 @@ impl MasterKey {
     ///
     /// 供 agent 客户端:从本地 socket 收到密钥字节后构造 [`MasterKey`],
     /// 跳过 Argon2id 派生直接解库。调用方应保证传入字节的来源可信(同 uid 本地 socket)。
+    ///
+    /// 注:仅 `agent`(Unix)调用;非 Unix agent 为 no-op,故该函数在非 Unix 上是 dead code。
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn from_bytes(arr: [u8; 32]) -> Self {
         MasterKey(SecretBox::new(Box::new(arr)))
     }

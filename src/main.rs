@@ -518,7 +518,8 @@ fn main() -> ExitCode {
             if std::env::var_os("RUST_BACKTRACE").is_some() {
                 eprintln!("{report:?}");
             } else {
-                eprintln!("error: {report}");
+                // 仅着色单行的 `error:` 标签;多行 report 正文保持纯净,避免每行 reset 掉色。
+                eprintln!("{} {report}", zkv::style::err("error:"));
             }
             ExitCode::FAILURE
         }

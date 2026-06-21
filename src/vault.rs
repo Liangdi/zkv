@@ -321,7 +321,13 @@ fn open_secure(path: &Path) -> Result<std::fs::File> {
         .open(path)?)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_secure(path: &Path) -> Result<std::fs::File> {
+    // 复用 db 的 owner-only DACL 实现(密文临时文件保持 owner-only,良好习惯)。
+    crate::db::win_security::open_secure_file(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_secure(path: &Path) -> Result<std::fs::File> {
     Ok(std::fs::OpenOptions::new()
         .write(true)
