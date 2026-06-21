@@ -110,6 +110,8 @@ pub fn run_passwd(path: &Path, old_pf: Option<&Path>, new_pf: Option<&Path>) -> 
     let old = read_passphrase(old_pf)?;
     let new = read_new_passphrase(new_pf)?;
     vault::change_passphrase(path, old.as_str(), new.as_str())?;
+    // 旧口令的派生密钥已随新 salt 失效,丢弃 agent 缓存,下次解锁重新派生种入。
+    crate::agent::forget(path);
     println!("passphrase changed");
     Ok(())
 }
@@ -171,9 +173,34 @@ pub fn run_init(path: &Path, passfile: Option<&Path>) -> Result<()> {
 
 impl Unlocked {
     /// 解锁 `path`,缓存 key/kdf/salt。
+    ///
+    /// **agent 快路径**:若 agent 启用且缓存了该库的派生密钥,直接用之解库(跳过 Argon2id)。
+    /// 命中且解密失败(库被外部用别的口令重加密过)→ 丢弃缓存,回退正常派生(fail-closed)。
+    /// 正常路径派生成功后,把密钥种进 agent 供后续命令复用。
     pub fn unlock(path: &Path, passfile: Option<&Path>) -> Result<Unlocked> {
+        // 1. agent 快路径。
+        if crate::agent::enabled() {
+            if let Some((key, ..)) = crate::agent::try_get_key(path) {
+                match vault::unlock_with_key(path, key) {
+                    Ok((db, key, kdf, salt)) => {
+                        return Ok(Unlocked {
+                            db,
+                            path: path.to_path_buf(),
+                            key,
+                            kdf,
+                            salt,
+                        });
+                    }
+                    // 缓存密钥解不开(AEAD 失败)→ 视为过期,丢弃后走正常派生。
+                    Err(_) => crate::agent::forget(path),
+                }
+            }
+        }
+        // 2. 正常路径:读口令 → Argon2id 派生 → 解库。
         let pass = read_passphrase(passfile)?;
         let (db, key, kdf, salt) = vault::unlock_full(path, pass.as_str())?;
+        // 3. 种入 agent(若启用),供后续命令跳过 KDF。
+        crate::agent::put_key(path, &key, &kdf, salt);
         Ok(Unlocked {
             db,
             path: path.to_path_buf(),

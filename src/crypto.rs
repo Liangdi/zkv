@@ -23,7 +23,10 @@ use zeroize::ZeroizeOnDrop;
 use crate::error::{Error, Result};
 
 /// Argon2id 参数。默认值遵循 PRD §3.1:m = 64 MiB(65536 KiB),t = 3,p = 4。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// derive `Serialize`/`Deserialize`:供 agent 守护进程经本地 socket 传输已派生密钥时,
+/// 把 KDF 参数一并发给客户端(写入回盘的文件头需要它)。不涉及口令/密钥序列化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KdfParams {
     /// 内存成本,单位 KiB(PRD §3.1 默认 65536 = 64 MiB)。
     pub m_kib: u32,
@@ -54,6 +57,14 @@ impl MasterKey {
     /// 以 32 字节数组引用形式暴露密钥(供 AEAD 初始化)。
     pub fn as_bytes(&self) -> &[u8; 32] {
         self.0.expose_secret()
+    }
+
+    /// 从 32 字节数组重建主密钥(同 crate 内使用)。
+    ///
+    /// 供 agent 客户端:从本地 socket 收到密钥字节后构造 [`MasterKey`],
+    /// 跳过 Argon2id 派生直接解库。调用方应保证传入字节的来源可信(同 uid 本地 socket)。
+    pub(crate) fn from_bytes(arr: [u8; 32]) -> Self {
+        MasterKey(SecretBox::new(Box::new(arr)))
     }
 }
 

@@ -140,13 +140,41 @@ pub fn unlock_full(
     let file = fs::read(path)?;
     let header = VaultHeader::parse(&file)?;
     let key = crypto::derive_key(passphrase.as_bytes(), &header.salt, &header.kdf)?;
+    let (db, kdf, salt) = decrypt_body(&file, &key)?;
+    Ok((db, key, kdf, salt))
+}
+
+/// 用**已派生**的 key 解锁 `.zkv` 库(**跳过 Argon2id 派生**)。
+///
+/// 供 agent 守护进程命中缓存时使用:客户端从 agent 拿到派生密钥后,直接现读文件、
+/// 解密、还原 `Database`,省去昂贵的 KDF(百毫秒级)。
+///
+/// 取值传递 key(因 [`MasterKey`] 非 `Clone`)并原样返回,供调用方继续 `save` 复用。
+///
+/// **注意**:若文件已被外部用别的口令(新 salt)重加密,AEAD 校验失败 ⇒ [`Error::BadPassphrase`],
+/// 调用方应据此回退到 [`unlock_full`] 重新派生(见 `cli::Unlocked::unlock` 的 fail-closed 路径)。
+pub fn unlock_with_key(
+    path: &Path,
+    key: MasterKey,
+) -> Result<(Database, MasterKey, KdfParams, [u8; 16])> {
+    let file = fs::read(path)?;
+    let (db, kdf, salt) = decrypt_body(&file, &key)?;
+    Ok((db, key, kdf, salt))
+}
+
+/// 内部:用已派生 key 解密「整文件字节」(含 58B 头)→ 还原 `Database` + 头里的 kdf/salt。
+///
+/// 被 [`unlock_full`](先派生后调用)与 [`unlock_with_key`](直接调用)共用,
+/// 确保两者解密路径完全一致。
+fn decrypt_body(file: &[u8], key: &MasterKey) -> Result<(Database, KdfParams, [u8; 16])> {
+    let header = VaultHeader::parse(file)?;
     let enc = Encrypted {
         nonce: header.nonce,
         ciphertext: file[HEADER_LEN..].to_vec(),
     };
-    let plaintext = crypto::decrypt(&key, &enc)?;
+    let plaintext = crypto::decrypt(key, &enc)?;
     let db = Database::from_bytes(&plaintext)?;
-    Ok((db, key, header.kdf, header.salt))
+    Ok((db, header.kdf, header.salt))
 }
 
 /// 解锁现有 `.zkv` 库,使用指定 KDF 参数。

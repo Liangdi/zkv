@@ -2,6 +2,7 @@
 //!
 //! 本地优先、端到端加密的个人数据保险箱。详见 `docs/prd/zkv.md`。
 
+pub mod agent;
 pub mod app;
 pub mod cli;
 pub mod clipboard;

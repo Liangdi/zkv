@@ -296,6 +296,58 @@ class E2E(unittest.TestCase):
         self.assertIn("new", r.stdout)
         self.assertIn("open", r.stdout)
 
+    def test_agent_caches_passphrase_seamless(self):
+        """1st command (with passphrase) seeds the agent; 2nd (NO passphrase)
+        still succeeds because the agent holds the derived key (skips Argon2id).
+        Also checks agent status + ZKV_NO_AGENT opt-out."""
+        import secrets as _secrets
+        sock = os.path.join(self.tmpdir, f"agent-{_secrets.token_hex(4)}.sock")
+        vault = os.path.join(self.tmpdir, f"agent-{_secrets.token_hex(4)}.zkv")
+        # Isolate from any real agent + keep TTL long so it survives the test.
+        base = {**os.environ, "ZKV_AGENT_SOCKET": sock, "ZKV_LOCK_SECS": "600"}
+        seeded = {**base, "ZKV_PASSPHRASE": "s3cret"}
+
+        # Create vault + an item headlessly.
+        r = subprocess.run([str(BIN), "init", vault], env=seeded,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run([str(BIN), "add", vault, "--title", "github",
+                            "--template", "password", "--set", "username=me"],
+                           env=seeded, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        # `add` unlocked via Unlocked::unlock → seeded the agent. ls with passphrase is fine.
+        r = subprocess.run([str(BIN), "ls", vault], env=seeded,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("github", r.stdout)
+
+        # agent status: running + has the vault cached.
+        r = subprocess.run([str(BIN), "agent", "status"], env=base,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("agent running", r.stdout)
+
+        # CRITICAL: ls with NO passphrase must still succeed (cached key, no prompt).
+        r = subprocess.run([str(BIN), "ls", vault], env=base,
+                           capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("github", r.stdout)
+
+        # opt-out: ZKV_NO_AGENT=1 + no passphrase → no agent, no TTY → fails cleanly.
+        r = subprocess.run([str(BIN), "ls", vault],
+                           env={**base, "ZKV_NO_AGENT": "1"},
+                           capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(r.returncode, 0)
+
+        # cleanup the lingering detached agent.
+        subprocess.run([str(BIN), "agent", "stop"], env=base,
+                       capture_output=True, text=True, timeout=5)
+        try:
+            os.remove(sock)
+        except OSError:
+            pass
+
     # --- startup smokes (Esc before passphrase => zero KDF) -------------- #
     def test_new_shows_create_screen_esc_exits(self):
         path = os.path.join(self.tmpdir, "new_smoke.zkv")

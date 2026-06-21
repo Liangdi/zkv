@@ -22,6 +22,10 @@ use zkv::ui;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// 禁用 agent 口令缓存:本进程及自动拉起的 agent 都不启用,每条命令都需口令。
+    /// 等价于设环境变量 ZKV_NO_AGENT=1。global:可出现在任意子命令之后。
+    #[arg(long, global = true)]
+    no_agent: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -297,6 +301,32 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
     },
+    /// agent 口令缓存守护进程管理(查看状态 / 停止)。
+    Agent {
+        #[command(subcommand)]
+        action: AgentCmd,
+    },
+    /// 清空 agent 缓存的所有密钥(让所有已解锁库立即"忘记"口令,需重新输入)。
+    Lock,
+}
+
+/// `agent` 子命令组(口令缓存守护进程管理)。
+#[derive(Subcommand, Debug)]
+enum AgentCmd {
+    /// 显示 agent 运行状态(pid / socket / 已缓存库 / 剩余空闲)。
+    Status,
+    /// 停止运行中的 agent(清空缓存密钥并退出进程)。
+    Stop,
+    /// 【内部】以前台服务模式运行 agent(由首次需要口令的命令自动拉起,一般无需手动调用)。
+    #[command(hide = true)]
+    Serve {
+        /// socket 路径。
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
+        /// 闲置 TTL(秒);超过即自退出。默认取 ZKV_LOCK_SECS(同 TUI 自动锁)。
+        #[arg(long, default_value_t = zkv::agent::ttl_secs())]
+        ttl: u64,
+    },
 }
 
 /// `cat` 子命令组(分类管理)。
@@ -463,7 +493,14 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(report) => {
-            eprintln!("{report:?}");
+            // 预期内的业务错误(条目不存在、缺参数、口令错误等)只打印一行人话,
+            // 不把内部的 Location / Backtrace 报告吐给最终用户。需要完整调试报告
+            // (调用位置 + backtrace)时设 RUST_BACKTRACE=1,走 color_eyre 的 Debug 格式。
+            if std::env::var_os("RUST_BACKTRACE").is_some() {
+                eprintln!("{report:?}");
+            } else {
+                eprintln!("error: {report}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -514,6 +551,15 @@ fn require_default_exists(path: &Path, was_default: bool) -> color_eyre::Result<
 /// 解析 CLI → 构造 App → 进入 TUI,或分发无头命令。
 fn run() -> color_eyre::Result<()> {
     let cli = Cli::parse();
+    // --no-agent:镜像 ui 模块的 env 模式,使 agent::enabled() 成为唯一 opt-out 闸门,
+    // 无需把 bool 穿透 13 个 Unlocked::unlock 调用点。
+    if cli.no_agent {
+        // 安全性:set_var 在多线程下不安全(Rust 2024 标记为 unsafe)。zkv 的 CLI 主线程
+        // 在解析后、派发命令前单线程执行此变更,且仅设进程内 env,无并发访问,故安全。
+        unsafe {
+            std::env::set_var("ZKV_NO_AGENT", "1");
+        }
+    }
     match cli.command {
         // TUI 路径(行为不变)。
         Command::New { path } => {
@@ -782,6 +828,35 @@ fn run() -> color_eyre::Result<()> {
             require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             zkv::cli::run_import(&u, format, input.as_deref())?;
+        }
+        Command::Agent { action } => match action {
+            AgentCmd::Status => match zkv::agent::status() {
+                Some(s) => {
+                    println!("agent running: pid={} socket={}", s.pid, s.socket);
+                    println!(
+                        "cached vaults ({}): {}",
+                        s.vaults.len(),
+                        if s.vaults.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            s.vaults.join(", ")
+                        }
+                    );
+                    println!("idle: {}/{}s", s.idle_secs, s.ttl_secs);
+                }
+                None => println!("agent not running"),
+            },
+            AgentCmd::Stop => {
+                zkv::agent::stop();
+                println!("agent stop requested");
+            }
+            AgentCmd::Serve { socket, ttl } => {
+                zkv::agent::serve(&socket, std::time::Duration::from_secs(ttl))?;
+            }
+        },
+        Command::Lock => {
+            zkv::agent::lock_all();
+            println!("cleared cached keys");
         }
     }
     Ok(())
