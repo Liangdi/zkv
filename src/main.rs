@@ -31,17 +31,17 @@ struct Cli {
 enum Command {
     /// 创建新的加密库(进入 TUI)。
     New {
-        /// 库文件路径。
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
         path: Option<PathBuf>,
     },
     /// 打开已有加密库(进入 TUI)。
     Open {
-        /// 库文件路径。
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
         path: Option<PathBuf>,
     },
     /// 无头建库(不进入 TUI)。口令取自 ZKV_PASSPHRASE / --passfile / 交互提示;目标已存在则报错。
     Init {
-        /// 库文件路径。
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
         path: Option<PathBuf>,
         /// 口令文件路径(env ZKV_PASSPHRASE 优先,无则交互)。
         #[arg(long, value_name = "PATH")]
@@ -49,7 +49,7 @@ enum Command {
     },
     /// 列出库中的条目(无头,可脚本化)。
     Ls {
-        /// 库文件路径。
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
         path: Option<PathBuf>,
         /// 仅列出该模板 id 的条目(如 password/note/card/wifi/...)。
         #[arg(short, long, value_name = "TEMPLATE")]
@@ -75,10 +75,10 @@ enum Command {
     },
     /// 打印单条条目或某字段原始值(无头)。
     Get {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 条目 id(与 --find 至少给其一)。
         id: Option<i64>,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 仅打印该字段(按字段名,如 username/password/url/totp/notes;特殊:title/type)。
         #[arg(short, long, value_name = "FIELD")]
         field: Option<String>,
@@ -94,10 +94,10 @@ enum Command {
     },
     /// 全文检索条目(无头)。
     Search {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 检索串。
         query: String,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv;多位置参数时 path 在最后)。
+        path: Option<PathBuf>,
         /// 以 JSON 输出。
         #[arg(long)]
         json: bool,
@@ -107,10 +107,10 @@ enum Command {
     },
     /// 打印当前 TOTP 验证码到 stdout(无头,脚本友好)。
     Otp {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 条目 id(须为 password 条目且含 totp_secret;与 --find 至少给其一)。
         id: Option<i64>,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 按标题定位条目(exact 优先,否则唯一前缀匹配)。
         #[arg(long, value_name = "TITLE")]
         find: Option<String>,
@@ -120,10 +120,10 @@ enum Command {
     },
     /// 复制某字段到剪贴板,定时自动清空(无头)。
     Cp {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 条目 id(与 --find 至少给其一)。
         id: Option<i64>,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 要复制的字段(默认 password)。
         #[arg(short, long, value_name = "FIELD")]
         field: Option<String>,
@@ -139,7 +139,7 @@ enum Command {
     },
     /// 新增一条条目(无头)。向 stdout 打印 `added item <id>: <title>`。
     Add {
-        /// 库文件路径。
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
         path: Option<PathBuf>,
         /// 条目标题。
         #[arg(long, value_name = "TITLE")]
@@ -183,10 +183,10 @@ enum Command {
     },
     /// 修改已有条目的字段(无头)。至少提供 --title/--data/--tag/--favorite/--no-favorite/--set/--add-tag/--rm-tag/--otpauth 之一。
     Edit {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 条目 id(与 --find 至少给其一)。
         id: Option<i64>,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 新标题。
         #[arg(long, value_name = "TITLE")]
         title: Option<String>,
@@ -227,10 +227,10 @@ enum Command {
     },
     /// 删除条目(无头)。默认交互确认,`-y` 跳过。
     Rm {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 条目 id(与 --find 至少给其一)。
         id: Option<i64>,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 跳过确认提示。
         #[arg(short = 'y', long)]
         yes: bool,
@@ -258,7 +258,7 @@ enum Command {
     },
     /// 导出全部条目(明文!stdout 或 -o 文件)。json 无损;csv 仅 password。
     Export {
-        /// 库文件路径。
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
         path: Option<PathBuf>,
         /// 导出格式(json 无损;csv 仅 password)。
         #[arg(long, value_enum, default_value_t = zkv::cli::Format::Json)]
@@ -274,7 +274,7 @@ enum Command {
     ///
     /// 总是新建 id(不覆盖);重复导入会创建重复条目。
     Import {
-        /// 库文件路径。
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
         path: Option<PathBuf>,
         /// 输入文件路径(省略则读 stdin)。
         #[arg(short = 'i', long, value_name = "PATH")]
@@ -293,10 +293,10 @@ enum Command {
 enum CatCmd {
     /// 新增分类(`--parent` 指定父分类名,可选)。
     Add {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 分类名。
         name: String,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 父分类名(可选)。
         #[arg(long, value_name = "PARENT")]
         parent: Option<String>,
@@ -306,17 +306,17 @@ enum CatCmd {
     },
     /// 删除分类(by id 或名)。子条目 category_id 置空。
     Rm {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 分类 id(数字)或名称。
         target: String,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
     },
     /// 列出全部分类。
     Ls {
-        /// 库文件路径。
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
         path: Option<PathBuf>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
@@ -329,7 +329,7 @@ enum CatCmd {
 enum TagCmd {
     /// 列出全部标签。
     Ls {
-        /// 库文件路径。
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
         path: Option<PathBuf>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
@@ -337,22 +337,22 @@ enum TagCmd {
     },
     /// 删除标签(by 名)。
     Rm {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 标签名。
         name: String,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
     },
     /// 改标签名。
     Mv {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 原标签名。
         from: String,
         /// 新标签名。
         to: String,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -364,12 +364,12 @@ enum TagCmd {
 enum AttachCmd {
     /// 给条目挂一个文件附件(读取文件 → 加密内嵌)。
     Add {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 条目 id。
         item: i64,
         /// 要挂载的本地文件路径。
         file: PathBuf,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 覆盖 MIME 类型推断(可选)。
         #[arg(long, value_name = "MIME")]
         mime: Option<String>,
@@ -379,22 +379,22 @@ enum AttachCmd {
     },
     /// 列出条目的附件(不输出 blob)。
     Ls {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 条目 id。
         item: i64,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
     },
     /// 导出附件 blob 到文件或 stdout。
     Get {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 条目 id(用于校验附件归属)。
         item: i64,
         /// 附件 id。
         att: i64,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 输出文件路径(缺省则写 stdout,二进制安全)。
         #[arg(short = 'o', long, value_name = "PATH")]
         output: Option<PathBuf>,
@@ -404,12 +404,12 @@ enum AttachCmd {
     },
     /// 删除附件。
     Rm {
-        /// 库文件路径。
-        path: Option<PathBuf>,
         /// 条目 id(用于校验附件归属)。
         item: i64,
         /// 附件 id。
         att: i64,
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,

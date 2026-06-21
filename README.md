@@ -67,24 +67,25 @@ zkv new ~/my.zkv
 与 TUI 平行、**可脚本化、无需 TTY**(口令取自 `ZKV_PASSPHRASE` 环境变量 / `--passfile` / 交互提示):
 
 ```bash
-zkv init   ~/my.zkv                              # 非交互建库(已存在则报错,不覆盖)
+zkv init   [~/my.zkv]                         # 非交互建库(已存在则报错);省略 path → ~/.zkv/default.zkv
 zkv gen    [24] [--no-symbols] [--no-ambiguous]  # 生成强随机密码(无需库)
-# 条目 CRUD(<id> 可换成 --find <标题前缀> 定位):
-zkv ls     ~/my.zkv [-t password] [--tag T] [--cat C] [-q github] [-F|--favorite] [--json]
-zkv get    ~/my.zkv <id> [-f password]           # -f 打印原始字段,便于管道
-zkv search ~/my.zkv <query>
-zkv otp    ~/my.zkv <id>                         # 打印当前 TOTP 6 位码
-zkv cp     ~/my.zkv <id> [-f otp] [--clear 20]   # 复制字段(或实时 TOTP 码)到剪贴板
-zkv add    ~/my.zkv --title T --data '<ItemData JSON>' [--tag T] [--cat C] [--favorite] [--gen-password[=LEN]] [--otpauth 'otpauth://...']
-zkv edit   ~/my.zkv <id> [--title T | --username/--password/--url/--totp/--notes/...] [--add-tag T | --rm-tag T] [--cat C] [--otpauth 'otpauth://...']
-zkv rm     ~/my.zkv <id> [-y]
-# 分类 / 标签 / 附件管理:
-zkv cat  add|rm|ls   ~/my.zkv ...
-zkv tag  ls|rm|mv    ~/my.zkv ...
-zkv attach add|ls|get|rm ~/my.zkv <id> ...       # get 支持 -o 文件或 stdout(二进制安全)
-# 导入 / 导出(JSON 无损;CSV 仅 password):
-zkv export ~/my.zkv --format json|csv [-o file]
-zkv import ~/my.zkv --format json|csv [-i file]
+# <path> 可省略(默认 ~/.zkv/default.zkv);多位置参数命令里 path 总是最后一个:
+zkv ls     [~/my.zkv] [-t password] [--tag T] [--cat C] [-q github] [-F|--favorite] [--json]
+zkv get    <id> [~/my.zkv] [-f password]      # -f 打印原始字段;也可 --find <标题>
+zkv search <query> [~/my.zkv]
+zkv otp    <id> [~/my.zkv]                    # 打印当前 TOTP 6 位码
+zkv cp     <id> [~/my.zkv] [-f otp] [--clear 20]
+zkv add    [~/my.zkv] --title T --template <password|note|card|wifi|...> --set k=v [--set ...] [--tag T] [--gen-password[=LEN]] [--otpauth 'otpauth://...']
+zkv edit   <id> [~/my.zkv] [--title T | --set k=v | --add-tag T | --rm-tag T] [--otpauth 'otpauth://...']
+zkv rm     <id> [-y] [~/my.zkv]
+# 分类 / 标签 / 附件管理(标识符在前,path 最后):
+zkv cat  add <name> [~/my.zkv]  ·  zkv cat ls [~/my.zkv]  ·  zkv cat rm <name> [~/my.zkv]
+zkv tag  ls [~/my.zkv]  ·  zkv tag rm <name> [~/my.zkv]  ·  zkv tag mv <from> <to> [~/my.zkv]
+zkv attach add <id> <file> [~/my.zkv] [--mime M]  ·  zkv attach ls <id> [~/my.zkv]
+zkv attach get <id> <att> [~/my.zkv] [-o file|>file]  ·  zkv attach rm <id> <att> [~/my.zkv]
+# 导入 / 导出(JSON 无损,含附件;CSV 仅 password):
+zkv export [~/my.zkv] --format json|csv [-o file]
+zkv import [~/my.zkv] --format json|csv [-i file]
 ```
 
 例:`ZKV_PASSPHRASE=secret zkv ls vault.zkv --type password --json` · `zkv otp vault.zkv 3` · `code=$(zkv gen 24)`。

@@ -78,6 +78,10 @@ pub fn default_vault_path() -> Result<PathBuf> {
 }
 
 /// 解析可选 path:`None` → [`default_vault_path`]。
+///
+/// 所有命令的 `path` 位置参数均为 `Option<PathBuf>`(可省略)。为避免 clap
+/// 「可选位置参数出现在必填位置参数之前」的 panic,多位置参数命令(id/item/target/...)
+/// 一律把标识符放前、`path` 放后(见各子命令定义)。本函数统一把 `None` 路由到默认库。
 pub fn resolve_vault_path(p: Option<PathBuf>) -> Result<PathBuf> {
     match p {
         Some(x) => Ok(x),

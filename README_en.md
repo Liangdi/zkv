@@ -68,24 +68,25 @@ zkv new ~/my.zkv
 Parallel to the TUI, fully **scriptable and TTY-free** (passphrase from `ZKV_PASSPHRASE` env / `--passfile` / interactive prompt):
 
 ```bash
-zkv init   ~/my.zkv                              # non-interactive create (refuses to overwrite)
+zkv init   [~/my.zkv]                         # non-interactive create (refuses to overwrite); omit path → ~/.zkv/default.zkv
 zkv gen    [24] [--no-symbols] [--no-ambiguous]  # strong random password (no vault needed)
-# Entry CRUD (<id> can be replaced by --find <title-prefix>):
-zkv ls     ~/my.zkv [-t password] [--tag T] [--cat C] [-q github] [-F|--favorite] [--json]
-zkv get    ~/my.zkv <id> [-f password]           # -f prints a raw field for piping
-zkv search ~/my.zkv <query>
-zkv otp    ~/my.zkv <id>                         # print the current TOTP 6-digit code
-zkv cp     ~/my.zkv <id> [-f otp] [--clear 20]   # copy a field (or live TOTP code) to clipboard
-zkv add    ~/my.zkv --title T --data '<ItemData JSON>' [--tag T] [--cat C] [--favorite] [--gen-password[=LEN]] [--otpauth 'otpauth://...']
-zkv edit   ~/my.zkv <id> [--title T | --username/--password/--url/--totp/--notes/...] [--add-tag T | --rm-tag T] [--cat C] [--otpauth 'otpauth://...']
-zkv rm     ~/my.zkv <id> [-y]
-# Category / tag / attachment management:
-zkv cat  add|rm|ls   ~/my.zkv ...
-zkv tag  ls|rm|mv    ~/my.zkv ...
-zkv attach add|ls|get|rm ~/my.zkv <id> ...       # get supports -o file or stdout (binary-safe)
-# Import / export (lossless JSON; CSV is passwords-only):
-zkv export ~/my.zkv --format json|csv [-o file]
-zkv import ~/my.zkv --format json|csv [-i file]
+# <path> is optional (defaults to ~/.zkv/default.zkv); in multi-positional commands path is always last:
+zkv ls     [~/my.zkv] [-t password] [--tag T] [--cat C] [-q github] [-F|--favorite] [--json]
+zkv get    <id> [~/my.zkv] [-f password]      # -f prints a raw field; or --find <title>
+zkv search <query> [~/my.zkv]
+zkv otp    <id> [~/my.zkv]                    # print the current TOTP 6-digit code
+zkv cp     <id> [~/my.zkv] [-f otp] [--clear 20]
+zkv add    [~/my.zkv] --title T --template <password|note|card|wifi|...> --set k=v [--set ...] [--tag T] [--gen-password[=LEN]] [--otpauth 'otpauth://...']
+zkv edit   <id> [~/my.zkv] [--title T | --set k=v | --add-tag T | --rm-tag T] [--otpauth 'otpauth://...']
+zkv rm     <id> [-y] [~/my.zkv]
+# Category / tag / attachment management (identifier first, path last):
+zkv cat  add <name> [~/my.zkv]  ·  zkv cat ls [~/my.zkv]  ·  zkv cat rm <name> [~/my.zkv]
+zkv tag  ls [~/my.zkv]  ·  zkv tag rm <name> [~/my.zkv]  ·  zkv tag mv <from> <to> [~/my.zkv]
+zkv attach add <id> <file> [~/my.zkv] [--mime M]  ·  zkv attach ls <id> [~/my.zkv]
+zkv attach get <id> <att> [~/my.zkv] [-o file|>file]  ·  zkv attach rm <id> <att> [~/my.zkv]
+# Import / export (lossless JSON, includes attachments; CSV is passwords-only):
+zkv export [~/my.zkv] --format json|csv [-o file]
+zkv import [~/my.zkv] --format json|csv [-i file]
 ```
 
 Examples: `ZKV_PASSPHRASE=secret zkv ls vault.zkv --type password --json` · `zkv otp vault.zkv 3` · `code=$(zkv gen 24)`.
