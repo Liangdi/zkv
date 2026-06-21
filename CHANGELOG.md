@@ -1,3 +1,8 @@
+## [0.2.0] - 2026-06-21
+
+### 🚀 Features
+
+- Unify theme source, harden Windows temp files, polish CLI output
 ## [0.1.2] - 2026-06-21
 
 ### 🚀 Features
