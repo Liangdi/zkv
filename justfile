@@ -38,3 +38,6 @@ publish-dry:
 
 publish:
     cargo publish --registry crates-io
+install:
+    cargo install --path .
+
