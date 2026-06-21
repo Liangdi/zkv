@@ -67,6 +67,24 @@ fn strip_trailing_newline(mut s: String) -> String {
     s
 }
 
+/// 默认库路径:`~/.zkv/default.zkv`(`$HOME`,Windows 回退 `%USERPROFILE%`)。
+///
+/// 命令省略 `<path>` 位置参数时使用此路径。仅依赖 `std::env::var_os`,不引入新依赖。
+pub fn default_vault_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE")) // Windows
+        .ok_or_else(|| Error::Other("cannot determine home dir (set $HOME)".into()))?;
+    Ok(PathBuf::from(home).join(".zkv").join("default.zkv"))
+}
+
+/// 解析可选 path:`None` → [`default_vault_path`]。
+pub fn resolve_vault_path(p: Option<PathBuf>) -> Result<PathBuf> {
+    match p {
+        Some(x) => Ok(x),
+        None => default_vault_path(),
+    }
+}
+
 /// 解锁后的库包装:持有 db + 派生 key/kdf/salt,`save` 用已派生 key 落盘。
 ///
 /// `key`/`kdf`/`salt` 设为私有:仅通过 [`Unlocked::save`] 暴露写回能力,
@@ -3307,5 +3325,115 @@ mod tests {
         assert_eq!(id, 1);
         assert!(run_get(&u, id, Some("username"), false).is_ok());
         cleanup(&p);
+    }
+
+    /// `default_vault_path`:`HOME` 决定 → `<home>/.zkv/default.zkv`。
+    #[test]
+    fn default_vault_path_uses_home() {
+        let _g = env_lock();
+        let dir = std::env::temp_dir();
+        let fake_home = dir.join(format!(
+            "zkv_home_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: 持 env_lock,串行 set/remove HOME,无并发竞态。
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+        }
+        let got = default_vault_path();
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        let got = got.unwrap();
+        assert_eq!(got, fake_home.join(".zkv").join("default.zkv"));
+    }
+
+    /// `default_vault_path`:无 HOME/USERPROFILE → 报错。
+    #[test]
+    fn default_vault_path_missing_home_errors() {
+        let _g = env_lock();
+        // SAFETY: 持 env_lock,串行 remove,无并发竞态。
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+        }
+        let got = default_vault_path();
+        assert!(got.is_err(), "expected error when no home dir available");
+    }
+
+    /// `resolve_vault_path`:Some → 原样;None → 默认库。
+    #[test]
+    fn resolve_vault_path_some_and_none() {
+        let _g = env_lock();
+        // Some:直接返回,不看 HOME。
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        let explicit = PathBuf::from("/tmp/explicit.zkv");
+        assert_eq!(resolve_vault_path(Some(explicit.clone())).unwrap(), explicit);
+
+        // None → 默认库(依赖 HOME)。
+        let dir = std::env::temp_dir();
+        let fake_home = dir.join(format!(
+            "zkv_home2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: 持 env_lock,串行。
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+        }
+        let r = resolve_vault_path(None).unwrap();
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(r, fake_home.join(".zkv").join("default.zkv"));
+    }
+
+    /// 集成性往返:把 HOME 指向 temp dir,init(默认路径)→ 解锁 → ls。
+    #[test]
+    fn default_path_init_then_ls_roundtrip() {
+        let _g = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "zkv_rt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: 持 env_lock,串行 set/remove HOME,无并发竞态。
+        unsafe {
+            std::env::set_var("HOME", &root);
+            std::env::set_var("ZKV_PASSPHRASE", "pw");
+        }
+        let res = (|| -> Result<()> {
+            let p = resolve_vault_path(None)?;
+            // 模拟 main.rs 的 ensure_parent_dir:init 前建好 ~/.zkv。
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            run_init(&p, None)?;
+            // 默认库应存在并可走 unlock 路径。
+            assert!(p.exists());
+            let u = Unlocked::unlock(&p, None)?;
+            // 空库无条目。
+            let items = search::search(u.db.conn(), &Filter::default())?;
+            assert!(items.is_empty());
+            Ok(())
+        })();
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("ZKV_PASSPHRASE");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        res.unwrap();
     }
 }

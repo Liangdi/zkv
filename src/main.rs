@@ -3,7 +3,7 @@
 //! panic 恢复:在 color_eyre 默认 panic hook 之前,先恢复终端(关闭 raw mode、
 //! 离开备用屏),避免 panic 时终端卡在 raw mode 导致输出乱码。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -32,17 +32,17 @@ enum Command {
     /// 创建新的加密库(进入 TUI)。
     New {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
     },
     /// 打开已有加密库(进入 TUI)。
     Open {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
     },
     /// 无头建库(不进入 TUI)。口令取自 ZKV_PASSPHRASE / --passfile / 交互提示;目标已存在则报错。
     Init {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 口令文件路径(env ZKV_PASSPHRASE 优先,无则交互)。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -50,7 +50,7 @@ enum Command {
     /// 列出库中的条目(无头,可脚本化)。
     Ls {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 仅列出该模板 id 的条目(如 password/note/card/wifi/...)。
         #[arg(short, long, value_name = "TEMPLATE")]
         r#type: Option<String>,
@@ -76,7 +76,7 @@ enum Command {
     /// 打印单条条目或某字段原始值(无头)。
     Get {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目 id(与 --find 至少给其一)。
         id: Option<i64>,
         /// 仅打印该字段(按字段名,如 username/password/url/totp/notes;特殊:title/type)。
@@ -95,7 +95,7 @@ enum Command {
     /// 全文检索条目(无头)。
     Search {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 检索串。
         query: String,
         /// 以 JSON 输出。
@@ -108,7 +108,7 @@ enum Command {
     /// 打印当前 TOTP 验证码到 stdout(无头,脚本友好)。
     Otp {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目 id(须为 password 条目且含 totp_secret;与 --find 至少给其一)。
         id: Option<i64>,
         /// 按标题定位条目(exact 优先,否则唯一前缀匹配)。
@@ -121,7 +121,7 @@ enum Command {
     /// 复制某字段到剪贴板,定时自动清空(无头)。
     Cp {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目 id(与 --find 至少给其一)。
         id: Option<i64>,
         /// 要复制的字段(默认 password)。
@@ -140,7 +140,7 @@ enum Command {
     /// 新增一条条目(无头)。向 stdout 打印 `added item <id>: <title>`。
     Add {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目标题。
         #[arg(long, value_name = "TITLE")]
         title: String,
@@ -184,7 +184,7 @@ enum Command {
     /// 修改已有条目的字段(无头)。至少提供 --title/--data/--tag/--favorite/--no-favorite/--set/--add-tag/--rm-tag/--otpauth 之一。
     Edit {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目 id(与 --find 至少给其一)。
         id: Option<i64>,
         /// 新标题。
@@ -228,7 +228,7 @@ enum Command {
     /// 删除条目(无头)。默认交互确认,`-y` 跳过。
     Rm {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目 id(与 --find 至少给其一)。
         id: Option<i64>,
         /// 跳过确认提示。
@@ -259,7 +259,7 @@ enum Command {
     /// 导出全部条目(明文!stdout 或 -o 文件)。json 无损;csv 仅 password。
     Export {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 导出格式(json 无损;csv 仅 password)。
         #[arg(long, value_enum, default_value_t = zkv::cli::Format::Json)]
         format: zkv::cli::Format,
@@ -275,7 +275,7 @@ enum Command {
     /// 总是新建 id(不覆盖);重复导入会创建重复条目。
     Import {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 输入文件路径(省略则读 stdin)。
         #[arg(short = 'i', long, value_name = "PATH")]
         input: Option<PathBuf>,
@@ -294,7 +294,7 @@ enum CatCmd {
     /// 新增分类(`--parent` 指定父分类名,可选)。
     Add {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 分类名。
         name: String,
         /// 父分类名(可选)。
@@ -307,7 +307,7 @@ enum CatCmd {
     /// 删除分类(by id 或名)。子条目 category_id 置空。
     Rm {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 分类 id(数字)或名称。
         target: String,
         /// 口令文件路径。
@@ -317,7 +317,7 @@ enum CatCmd {
     /// 列出全部分类。
     Ls {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -330,7 +330,7 @@ enum TagCmd {
     /// 列出全部标签。
     Ls {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -338,7 +338,7 @@ enum TagCmd {
     /// 删除标签(by 名)。
     Rm {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 标签名。
         name: String,
         /// 口令文件路径。
@@ -348,7 +348,7 @@ enum TagCmd {
     /// 改标签名。
     Mv {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 原标签名。
         from: String,
         /// 新标签名。
@@ -365,7 +365,7 @@ enum AttachCmd {
     /// 给条目挂一个文件附件(读取文件 → 加密内嵌)。
     Add {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目 id。
         item: i64,
         /// 要挂载的本地文件路径。
@@ -380,7 +380,7 @@ enum AttachCmd {
     /// 列出条目的附件(不输出 blob)。
     Ls {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目 id。
         item: i64,
         /// 口令文件路径。
@@ -390,7 +390,7 @@ enum AttachCmd {
     /// 导出附件 blob 到文件或 stdout。
     Get {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目 id(用于校验附件归属)。
         item: i64,
         /// 附件 id。
@@ -405,7 +405,7 @@ enum AttachCmd {
     /// 删除附件。
     Rm {
         /// 库文件路径。
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// 条目 id(用于校验附件归属)。
         item: i64,
         /// 附件 id。
@@ -458,21 +458,70 @@ fn main() -> ExitCode {
     }
 }
 
+/// 确保库文件的父目录存在(`init`/`new` 用);并在 Unix 下把新建的 `~/.zkv`
+/// 目录设为 0700(仅对**新建**的目录,已存在不动)。
+fn ensure_parent_dir(path: &Path) -> color_eyre::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 仅在目录原本不存在(本次新建)时收紧到 0700;已存在的不动。
+        let did_not_exist = !parent.exists();
+        std::fs::create_dir_all(parent)
+            .map_err(|e| color_eyre::eyre::eyre!("failed to create {}: {e}", parent.display()))?;
+        if did_not_exist {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| color_eyre::eyre::eyre!("failed to chmod {}: {e}", parent.display()),
+            )?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| color_eyre::eyre::eyre!("failed to create {}: {e}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// 读命令友好检查:若解析出的是默认库(用户未显式给 path)且文件不存在,
+/// 给出带 `zkv init` 提示的友好错误。显式给的 path 不在此拦截(走 unlock 的 IO 错误)。
+fn require_default_exists(path: &Path, was_default: bool) -> color_eyre::Result<()> {
+    if was_default && !path.exists() {
+        return Err(color_eyre::eyre::eyre!(
+            "no vault at {}; run `zkv init` to create it (or `zkv <cmd> <file>`)",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// 解析 CLI → 构造 App → 进入 TUI,或分发无头命令。
 fn run() -> color_eyre::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         // TUI 路径(行为不变)。
         Command::New { path } => {
+            let path = zkv::cli::resolve_vault_path(path)?;
+            ensure_parent_dir(&path)?;
             let app = App::for_create(path);
             ui::run(app)?;
         }
         Command::Open { path } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let app = App::for_open(path);
             ui::run(app)?;
         }
         // 无头建库:不进入 TUI。
         Command::Init { path, passfile } => {
+            let path = zkv::cli::resolve_vault_path(path)?;
+            ensure_parent_dir(&path)?;
             zkv::cli::run_init(&path, passfile.as_deref())?;
         }
         // 无头路径:解锁 → 调对应 cli::run_*。
@@ -487,6 +536,9 @@ fn run() -> color_eyre::Result<()> {
             json,
             passfile,
         } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             let f = zkv::cli::ListFilter {
                 template_id: r#type,
@@ -505,6 +557,9 @@ fn run() -> color_eyre::Result<()> {
             find,
             passfile,
         } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_get(&u, id, field.as_deref(), json)?;
@@ -515,6 +570,9 @@ fn run() -> color_eyre::Result<()> {
             json,
             passfile,
         } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             zkv::cli::run_search(&u, &query, json)?;
         }
@@ -524,6 +582,9 @@ fn run() -> color_eyre::Result<()> {
             find,
             passfile,
         } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_otp(&u, id)?;
@@ -536,6 +597,9 @@ fn run() -> color_eyre::Result<()> {
             find,
             passfile,
         } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_cp(&u, id, field.as_deref(), clear)?;
@@ -552,6 +616,9 @@ fn run() -> color_eyre::Result<()> {
             otpauth,
             passfile,
         } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             let fields = zkv::cli::EditFields {
                 sets: parse_sets(&sets),
@@ -608,6 +675,9 @@ fn run() -> color_eyre::Result<()> {
                 add: add_tags,
                 remove: rm_tags,
             };
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_edit(
@@ -630,6 +700,9 @@ fn run() -> color_eyre::Result<()> {
             find,
             passfile,
         } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
             zkv::cli::run_rm(&u, id, yes)?;
@@ -638,16 +711,25 @@ fn run() -> color_eyre::Result<()> {
         // run_cat/run_tag(已解锁的 &Unlocked + action 引用)。
         Command::Cat { action } => {
             let (path, passfile) = cat_path_passfile(&action);
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             run_cat(&u, &action)?;
         }
         Command::Tag { action } => {
             let (path, passfile) = tag_path_passfile(&action);
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             run_tag(&u, &action)?;
         }
         Command::Attach { action } => {
             let (path, passfile) = attach_path_passfile(&action);
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             run_attach(&u, &action)?;
         }
@@ -657,6 +739,9 @@ fn run() -> color_eyre::Result<()> {
             output,
             passfile,
         } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             zkv::cli::run_export(&u, format, output.as_deref())?;
         }
@@ -666,6 +751,9 @@ fn run() -> color_eyre::Result<()> {
             format,
             passfile,
         } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             zkv::cli::run_import(&u, format, input.as_deref())?;
         }
@@ -674,7 +762,7 @@ fn run() -> color_eyre::Result<()> {
 }
 
 /// 从 `CatCmd` 提取 (path, passfile)。
-fn cat_path_passfile(action: &CatCmd) -> (PathBuf, Option<PathBuf>) {
+fn cat_path_passfile(action: &CatCmd) -> (Option<PathBuf>, Option<PathBuf>) {
     match action {
         CatCmd::Add {
             path, passfile, ..
@@ -707,7 +795,7 @@ fn run_cat(u: &zkv::cli::Unlocked, action: &CatCmd) -> color_eyre::Result<()> {
 }
 
 /// 从 `TagCmd` 提取 (path, passfile)。
-fn tag_path_passfile(action: &TagCmd) -> (PathBuf, Option<PathBuf>) {
+fn tag_path_passfile(action: &TagCmd) -> (Option<PathBuf>, Option<PathBuf>) {
     match action {
         TagCmd::Ls {
             path, passfile, ..
@@ -738,7 +826,7 @@ fn run_tag(u: &zkv::cli::Unlocked, action: &TagCmd) -> color_eyre::Result<()> {
 }
 
 /// 从 `AttachCmd` 提取 (path, passfile)。
-fn attach_path_passfile(action: &AttachCmd) -> (PathBuf, Option<PathBuf>) {
+fn attach_path_passfile(action: &AttachCmd) -> (Option<PathBuf>, Option<PathBuf>) {
     match action {
         AttachCmd::Add {
             path, passfile, ..
