@@ -44,3 +44,13 @@ color-eyre = "0.6"
 hmac = "0.12"
 sha1 = "0.10"
 data-encoding = "2"
+
+# 二维码导入(2FA):图像解码 + QR 识别 + HTTP 取图(可选,仅 --qr-url 触发联网)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rqrr = "0.8"
+# blocking + rustls,无系统 OpenSSL 依赖,保持静态/bundled 构建纯净。
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[dev-dependencies]
+# 测试用:生成二维码 PNG 做往返解码验证。
+qrcode = "0.14"

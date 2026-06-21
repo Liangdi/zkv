@@ -178,8 +178,15 @@ enum Command {
         #[arg(long, value_name = "LEN", num_args = 0..=1, default_missing_value = "20")]
         gen_password: Option<usize>,
         /// otpauth:// URI:解析出 secret,覆盖首个 kind=Totp 字段。与 --gen-password 可共存。
-        #[arg(long, value_name = "URI")]
+        /// 与 --qr / --qr-url 互斥(三者都是 TOTP 来源,只能给一个)。
+        #[arg(long, value_name = "URI", conflicts_with_all = ["qr", "qr_url"])]
         otpauth: Option<String>,
+        /// 二维码图片本地路径:解码出 otpauth:// URI 后写入首个 Totp 字段。
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["otpauth", "qr_url"])]
+        qr: Option<PathBuf>,
+        /// 二维码图片 URL(http/https,或 data:):取图解码出 otpauth:// URI。
+        #[arg(long, value_name = "URL", conflicts_with_all = ["otpauth", "qr"])]
+        qr_url: Option<String>,
         /// 口令文件路径。
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
@@ -231,8 +238,15 @@ enum Command {
         #[arg(long = "rm-tag", value_name = "TAG")]
         rm_tags: Vec<String>,
         /// otpauth:// URI:解析出 secret,覆盖首个 kind=Totp 字段。
-        #[arg(long, value_name = "URI")]
+        /// 与 --qr / --qr-url 互斥(三者都是 TOTP 来源,只能给一个)。
+        #[arg(long, value_name = "URI", conflicts_with_all = ["qr", "qr_url"])]
         otpauth: Option<String>,
+        /// 二维码图片本地路径:解码出 otpauth:// URI 后写入首个 Totp 字段。
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["otpauth", "qr_url"])]
+        qr: Option<PathBuf>,
+        /// 二维码图片 URL(http/https,或 data:):取图解码出 otpauth:// URI。
+        #[arg(long, value_name = "URL", conflicts_with_all = ["otpauth", "qr"])]
+        qr_url: Option<String>,
         /// 按标题定位条目(exact 优先,否则唯一前缀匹配)。
         #[arg(long, value_name = "TITLE")]
         find: Option<String>,
@@ -686,12 +700,20 @@ fn run() -> color_eyre::Result<()> {
             favorite,
             gen_password,
             otpauth,
+            qr,
+            qr_url,
             passfile,
         } => {
             let was_default = path.is_none();
             let path = zkv::cli::resolve_vault_path(path)?;
             require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
+            // 把 --otpauth / --qr / --qr-url 三者(clap 保证互斥)解析成单条 otpauth URI。
+            let otpauth_arg = zkv::cli::resolve_totp_source(
+                otpauth.as_deref(),
+                qr.as_deref(),
+                qr_url.as_deref(),
+            )?;
             let fields = zkv::cli::EditFields {
                 sets: parse_sets(&sets),
             };
@@ -704,7 +726,7 @@ fn run() -> color_eyre::Result<()> {
                 tags,
                 favorite,
                 gen_password,
-                otpauth.as_deref(),
+                otpauth_arg.as_deref(),
             )?;
         }
         // gen:纯生成,不解锁库、不需要口令。
@@ -728,6 +750,8 @@ fn run() -> color_eyre::Result<()> {
             add_tags,
             rm_tags,
             otpauth,
+            qr,
+            qr_url,
             find,
             passfile,
         } => {
@@ -752,6 +776,12 @@ fn run() -> color_eyre::Result<()> {
             require_default_exists(&path, was_default)?;
             let u = zkv::cli::Unlocked::unlock(&path, passfile.as_deref())?;
             let id = zkv::cli::resolve_id(u.db.conn(), id, find.as_deref())?;
+            // 把 --otpauth / --qr / --qr-url 三者(clap 保证互斥)解析成单条 otpauth URI。
+            let otpauth_arg = zkv::cli::resolve_totp_source(
+                otpauth.as_deref(),
+                qr.as_deref(),
+                qr_url.as_deref(),
+            )?;
             zkv::cli::run_edit(
                 &u,
                 id,
@@ -762,7 +792,7 @@ fn run() -> color_eyre::Result<()> {
                 cat.as_deref(),
                 &fields,
                 &tag_delta,
-                otpauth.as_deref(),
+                otpauth_arg.as_deref(),
             )?;
         }
         Command::Rm {

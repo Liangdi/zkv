@@ -18,7 +18,7 @@
 //! 的纯函数实现。每个 `run_*` 接收**已类型化**的参数(非 clap 的 `ArgMatches`),
 //! 便于单测与 `main.rs` 分发。写命令在变更后立即 `save` 落盘。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
@@ -425,6 +425,128 @@ fn hex_digit(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+// ===========================================================================
+// 二维码导入(2FA):从图片(本地文件 / 远程 URL / data: URL)解码出 otpauth:// URI。
+// 复用现有 --otpauth 管线 —— 本节只负责「图像字节 → otpauth 文本」这一段,
+// 产物最终喂给 run_add/run_edit 内现有的 parse_otpauth。
+// ===========================================================================
+
+/// 单次 HTTP 取图的大小上限(8 MiB)。二维码图片远小于此;超限即视为异常并拒绝。
+const QR_FETCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// HTTP 取图超时(秒)。避免 hang 在无响应 / 慢响应的 URL 上。
+const QR_FETCH_TIMEOUT_SECS: u64 = 15;
+
+/// 从图像字节中解码出首个 `otpauth://` 二维码,返回其原始 URI 文本。
+///
+/// 内部:`image::load_from_memory` → 灰度(`GrayImage`)→ `rqrr::PreparedImage` →
+/// `detect_grids` → 逐个 `decode()`,返回首个以 `otpauth://` 开头的 payload。
+///
+/// 错误(均 → [`Error::Other`]):图像解码失败、图中无二维码、二维码内容不是 otpauth。
+/// 由 [`resolve_totp_source`] 在 `--qr` / `--qr-url` 时调用。
+pub fn otpauth_from_qr_bytes(bytes: &[u8]) -> Result<String> {
+    // 1) 解码图像 → 灰度(支持 PNG/JPEG,由 image 的 features 决定)。
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| Error::Other(format!("decode image: {e}")))?;
+    let gray = img.to_luma8();
+
+    // 2) rqrr 找出图中所有二维码网格并逐个解码,取首个 otpauth payload。
+    let mut prepared = rqrr::PreparedImage::prepare(gray);
+    for grid in prepared.detect_grids() {
+        if let Ok((_meta, content)) = grid.decode() {
+            if content.starts_with("otpauth://") {
+                return Ok(content);
+            }
+        }
+    }
+    Err(Error::Other(
+        "no otpauth qr found in image (no qr, or qr payload is not an otpauth uri)".into(),
+    ))
+}
+
+/// 从 URL 取回图像字节。支持 `http`/`https`(经 ureq,blocking)与 `data:`(就地解码,不联网)。
+///
+/// 安全约束:15s 超时、8 MiB 大小上限、跟随重定向;非 http/https/data 的 scheme 一律拒绝
+/// (避免 `file:`/`ftp:` 等被意外拉取本地资源)。
+pub fn fetch_url_bytes(url: &str) -> Result<Vec<u8>> {
+    // data: URL:就地解析,不触发网络。
+    if let Some(rest) = url.strip_prefix("data:") {
+        return decode_data_url(rest);
+    }
+    // 仅允许 http/https。
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(Error::Other(format!(
+            "unsupported url scheme (use http/https/data): {url}"
+        )));
+    }
+
+    let resp = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(QR_FETCH_TIMEOUT_SECS))
+        .call()
+        .map_err(|e| Error::Other(format!("fetch {url}: {e}")))?;
+
+    // 流式读取,截断到 MAX+1 以便判断是否超限。
+    let reader = resp.into_reader();
+    let mut buf = Vec::new();
+    reader
+        .take(QR_FETCH_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| Error::Other(format!("read body {url}: {e}")))?;
+    if buf.len() as u64 > QR_FETCH_MAX_BYTES {
+        return Err(Error::Other(format!(
+            "image too large (>{QR_FETCH_MAX_BYTES} bytes): {url}"
+        )));
+    }
+    Ok(buf)
+}
+
+/// 解析 `data:[<mediatype>][;base64],<data>` 的 payload 部分。
+///
+/// 取首个 `,` 之后的内容;meta 段以 `;base64` 结尾则按 base64 解码,否则按原始字节(URL
+/// 解码后的文本)。base64 解码复用 `data_encoding::BASE64`(与 base32 同 crate,无新依赖),
+/// 并容忍缺失的 `=` 填充。
+fn decode_data_url(rest: &str) -> Result<Vec<u8>> {
+    let (meta, payload) = rest
+        .split_once(',')
+        .ok_or_else(|| Error::Other("data: url missing ',' payload".into()))?;
+    if meta.ends_with(";base64") {
+        let pad = (4 - (payload.len() % 4)) % 4;
+        let padded = format!("{payload}{:=<pad$}", "");
+        data_encoding::BASE64
+            .decode(padded.as_bytes())
+            .map_err(|e| Error::Other(format!("decode data: base64: {e}")))
+    } else {
+        Ok(payload.as_bytes().to_vec())
+    }
+}
+
+/// 把三个互斥的 2FA 来源(`--otpauth` / `--qr` / `--qr-url`)解析成一条 otpauth:// URI(或 None)。
+///
+/// - `--otpauth`:已是文本 URI,原样透传。
+/// - `--qr <path>`:读本地图片字节 → [`otpauth_from_qr_bytes`]。
+/// - `--qr-url <url>`:[`fetch_url_bytes`] 取图字节 → [`otpauth_from_qr_bytes`]。
+///
+/// 三者由 clap `conflicts_with_all` 保证互斥;此处防御性地「至多一个非空」。
+/// 产物(otpauth URI)最终在 [`run_add`]/[`run_edit`] 内走现有 [`parse_otpauth`] 管线。
+pub fn resolve_totp_source(
+    otpauth: Option<&str>,
+    qr_path: Option<&Path>,
+    qr_url: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(uri) = otpauth {
+        return Ok(Some(uri.to_string()));
+    }
+    if let Some(path) = qr_path {
+        let bytes = std::fs::read(path)
+            .map_err(|e| Error::Other(format!("read qr image {}: {e}", path.display())))?;
+        return Ok(Some(otpauth_from_qr_bytes(&bytes)?));
+    }
+    if let Some(url) = qr_url {
+        let bytes = fetch_url_bytes(url)?;
+        return Ok(Some(otpauth_from_qr_bytes(&bytes)?));
+    }
+    Ok(None)
 }
 
 /// `edit`/`add` 的单字段覆盖集合:`--set name=value`(可重复)。
@@ -3371,6 +3493,73 @@ mod tests {
         // %2F = '/',%3D = '=';解码后应还原。
         let uri = "otpauth://totp/X?secret=AB%3DCD";
         assert_eq!(parse_otpauth(uri).unwrap(), "AB=CD");
+    }
+
+    // --- 二维码导入(2FA)---
+
+    /// (仅测试)用 qrcode dev-dep 把 payload 编码成黑模块/白底的二维码,输出 PNG 字节,
+    /// 供 [`otpauth_from_qr_bytes`] / [`fetch_url_bytes`] 做离线往返验证。
+    fn make_qr_png(payload: &str) -> Vec<u8> {
+        let code = qrcode::QrCode::new(payload.as_bytes()).unwrap();
+        let gray: image::GrayImage = code.render::<image::Luma<u8>>().build();
+        let dyn_img = image::DynamicImage::ImageLuma8(gray);
+        let mut buf = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        dyn_img
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn otpauth_from_qr_bytes_roundtrip() {
+        let uri = "otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example";
+        let png = make_qr_png(uri);
+        let got = otpauth_from_qr_bytes(&png).unwrap();
+        assert_eq!(got, uri);
+        // 产物能继续喂给现有 parse_otpauth 管线。
+        assert_eq!(parse_otpauth(&got).unwrap(), "JBSWY3DPEHPK3PXP");
+    }
+
+    #[test]
+    fn otpauth_from_qr_bytes_not_an_image() {
+        // 随机字节不是合法图像 → 图像解码失败。
+        assert!(otpauth_from_qr_bytes(&[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn otpauth_from_qr_bytes_wrong_payload() {
+        // 合法二维码但内容不是 otpauth → 报错。
+        let png = make_qr_png("hello world");
+        assert!(matches!(
+            otpauth_from_qr_bytes(&png),
+            Err(Error::Other(m)) if m.contains("no otpauth qr")
+        ));
+    }
+
+    #[test]
+    fn fetch_url_bytes_rejects_unsupported_scheme() {
+        // file:/ftp: 等非 http/https/data 一律拒绝(顺带防止 file: 读本地文件)。
+        assert!(fetch_url_bytes("file:///etc/passwd").is_err());
+        assert!(fetch_url_bytes("ftp://x/y.png").is_err());
+    }
+
+    #[test]
+    fn fetch_url_bytes_data_url_base64_full_chain() {
+        // 真实二维码 → PNG → base64 → data: URL → 取图 → 解码:全链路(data: 不联网)。
+        let uri = "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP";
+        let png = make_qr_png(uri);
+        let b64 = data_encoding::BASE64.encode(&png);
+        let data_url = format!("data:image/png;base64,{b64}");
+        let bytes = fetch_url_bytes(&data_url).unwrap();
+        assert_eq!(bytes, png);
+        assert_eq!(otpauth_from_qr_bytes(&bytes).unwrap(), uri);
+    }
+
+    #[test]
+    fn fetch_url_bytes_data_url_missing_payload() {
+        // data: URL 缺 `,` payload → 报错。
+        assert!(fetch_url_bytes("data:image/png;base64").is_err());
     }
 
     #[test]

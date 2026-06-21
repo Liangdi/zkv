@@ -21,7 +21,7 @@ A terminal-based manager for passwords / notes / cards with a sci-fi TUI ([ratat
 - 🔎 **Full-text search** — Powered by SQLite FTS5 over titles and content.
 - 🏷️ **Categories & tags** — Hierarchical categories + many-to-many tags + favorites, freely combinable.
 - 🖼️ **Embedded attachments** — Images / documents are stored inside the database and encrypted with it.
-- 🔢 **TOTP codes** — Store 2FA secrets and generate live 6-digit codes (RFC 6238).
+- 🔢 **TOTP codes** — Store 2FA secrets and generate live 6-digit codes (RFC 6238). Import a QR directly: `--qr <local-image>` or `--qr-url <http(s)/data: URL>` auto-decodes the `otpauth://` URI into the entry (no need to scan/extract the text yourself).
 - 🧩 **Field templates** — Generic field/template model with 8 built-in presets (password/note/card/wifi/bank/ssh/identity/email); fields are typed (Text/Secret/Multiline/TOTP) and drive rendering/copying; old vaults auto-migrate.
 - 🎲 **Password generation** — CSPRNG strong passwords (configurable length / symbols / ambiguous chars).
 - 💻 **Headless CLI** — Fully scriptable, no TTY required; passphrase from env var / file / prompt.
@@ -78,8 +78,8 @@ zkv get    <id> [~/my.zkv] [-f password]      # -f prints a raw field; or --find
 zkv search <query> [~/my.zkv]
 zkv otp    <id> [~/my.zkv]                    # print the current TOTP 6-digit code
 zkv cp     <id> [~/my.zkv] [-f otp] [--clear 20]
-zkv add    [~/my.zkv] --title T --template <password|note|card|wifi|...> --set k=v [--set ...] [--tag T] [--gen-password[=LEN]] [--otpauth 'otpauth://...']
-zkv edit   <id> [~/my.zkv] [--title T | --set k=v | --add-tag T | --rm-tag T] [--otpauth 'otpauth://...']
+zkv add    [~/my.zkv] --title T --template <password|note|card|wifi|...> --set k=v [--set ...] [--tag T] [--gen-password[=LEN]] [--otpauth 'otpauth://...' | --qr <img.png> | --qr-url <http(s)/data: URL>]
+zkv edit   <id> [~/my.zkv] [--title T | --set k=v | --add-tag T | --rm-tag T] [--otpauth 'otpauth://...' | --qr <img.png> | --qr-url <http(s)/data: URL>]
 zkv rm     <id> [-y] [~/my.zkv]
 # Category / tag / attachment management (identifier first, path last):
 zkv cat  add <name> [~/my.zkv]  ·  zkv cat ls [~/my.zkv]  ·  zkv cat rm <name> [~/my.zkv]
@@ -164,6 +164,7 @@ zkv cp 2 ~/my.zkv
 - **Database**: [rusqlite](https://crates.io/crates/rusqlite) (bundled SQLite, with FTS5)
 - **Crypto**: [argon2](https://crates.io/crates/argon2) · [chacha20poly1305](https://crates.io/crates/chacha20poly1305) · [zeroize](https://crates.io/crates/zeroize) · [secrecy](https://crates.io/crates/secrecy)
 - **TOTP**: [hmac](https://crates.io/crates/hmac) · [sha1](https://crates.io/crates/sha1) · [data-encoding](https://crates.io/crates/data-encoding)
+- **QR import**: [image](https://crates.io/crates/image) · [rqrr](https://crates.io/crates/rqrr) · [ureq](https://crates.io/crates/ureq) (decode a local image / fetch a remote one; rustls)
 - **Other**: [clap](https://crates.io/crates/clap), [serde](https://crates.io/crates/serde), [thiserror](https://crates.io/crates/thiserror), [color-eyre](https://crates.io/crates/color-eyre), [rpassword](https://crates.io/crates/rpassword), [getrandom](https://crates.io/crates/getrandom)
 
 ## 🏗️ Architecture

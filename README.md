@@ -21,7 +21,7 @@
 - 🔎 **全文搜索** — 基于 SQLite FTS5,按标题与内容检索。
 - 🏷️ **分类与标签** — 树状分类 + 多对多标签 + 收藏,任意组合过滤。
 - 🖼️ **附件内嵌** — 图片 / 电子档直接存入数据库,随库加密。
-- 🔢 **TOTP 验证码** — 存储 2FA 密钥并实时生成 6 位验证码(RFC 6238)。
+- 🔢 **TOTP 验证码** — 存储 2FA 密钥并实时生成 6 位验证码(RFC 6238)。支持直接导入二维码:`--qr <本地图>` 或 `--qr-url <http(s)/data: URL>`,自动解码 `otpauth://` 写入(无需手动扫图取文本)。
 - 🧩 **字段模板** — 通用字段/模板模型,8 内置预设(密码/笔记/卡片/Wi-Fi/银行/SSH/身份/邮箱),字段按类型(Text/Secret/Multiline/TOTP)驱动渲染与复制;老库自动迁移。
 - 🎲 **密码生成** — CSPRNG 强随机密码(可配长度 / 符号 / 易混字符)。
 - 💻 **无头 CLI** — 全功能命令行,可脚本化、无需 TTY,口令取自环境变量 / 文件 / 交互。
@@ -77,8 +77,8 @@ zkv get    <id> [~/my.zkv] [-f password]      # -f 打印原始字段;也可 --f
 zkv search <query> [~/my.zkv]
 zkv otp    <id> [~/my.zkv]                    # 打印当前 TOTP 6 位码
 zkv cp     <id> [~/my.zkv] [-f otp] [--clear 20]
-zkv add    [~/my.zkv] --title T --template <password|note|card|wifi|...> --set k=v [--set ...] [--tag T] [--gen-password[=LEN]] [--otpauth 'otpauth://...']
-zkv edit   <id> [~/my.zkv] [--title T | --set k=v | --add-tag T | --rm-tag T] [--otpauth 'otpauth://...']
+zkv add    [~/my.zkv] --title T --template <password|note|card|wifi|...> --set k=v [--set ...] [--tag T] [--gen-password[=LEN]] [--otpauth 'otpauth://...' | --qr <图.png> | --qr-url <http(s)/data: URL>]
+zkv edit   <id> [~/my.zkv] [--title T | --set k=v | --add-tag T | --rm-tag T] [--otpauth 'otpauth://...' | --qr <图.png> | --qr-url <http(s)/data: URL>]
 zkv rm     <id> [-y] [~/my.zkv]
 # 分类 / 标签 / 附件管理(标识符在前,path 最后):
 zkv cat  add <name> [~/my.zkv]  ·  zkv cat ls [~/my.zkv]  ·  zkv cat rm <name> [~/my.zkv]
@@ -163,6 +163,7 @@ zkv cp 2 ~/my.zkv
 - **数据库**:[rusqlite](https://crates.io/crates/rusqlite)(bundled SQLite,含 FTS5)
 - **加密**:[argon2](https://crates.io/crates/argon2) · [chacha20poly1305](https://crates.io/crates/chacha20poly1305) · [zeroize](https://crates.io/crates/zeroize) · [secrecy](https://crates.io/crates/secrecy)
 - **TOTP**:[hmac](https://crates.io/crates/hmac) · [sha1](https://crates.io/crates/sha1) · [data-encoding](https://crates.io/crates/data-encoding)
+- **二维码导入**:[image](https://crates.io/crates/image) · [rqrr](https://crates.io/crates/rqrr) · [ureq](https://crates.io/crates/ureq)(解码本地图 / 远程取图,rustls)
 - **其他**:[clap](https://crates.io/crates/clap)、[serde](https://crates.io/crates/serde)、[thiserror](https://crates.io/crates/thiserror)、[color-eyre](https://crates.io/crates/color-eyre)、[rpassword](https://crates.io/crates/rpassword)、[getrandom](https://crates.io/crates/getrandom)
 
 ## 🏗️ 架构
