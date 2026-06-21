@@ -745,6 +745,10 @@ pub fn run_add(
     if let Some(pw) = generated {
         eprintln!("generated password for item {id}: {pw}");
     }
+    // 提供了 TOTP 来源(--otpauth / --qr / --qr-url / --set totp=)时,向 stderr 打印实时码确认。
+    if otpauth.is_some() || sets.sets.iter().any(|(n, _)| n == "totp") {
+        eprint_totp_hint(&draft);
+    }
     Ok(id)
 }
 
@@ -916,6 +920,10 @@ pub fn run_edit(
     store::update_item(conn, &item)?;
     u.save()?;
     println!("updated item {id}");
+    // 提供了 TOTP 来源(--otpauth / --qr / --qr-url / --set totp=)时,向 stderr 打印实时码确认。
+    if otpauth.is_some() || fields.sets.iter().any(|(n, _)| n == "totp") {
+        eprint_totp_hint(&item);
+    }
     Ok(())
 }
 
@@ -1790,6 +1798,24 @@ pub fn run_cp(u: &Unlocked, id: i64, field: Option<&str>, clear_secs: u64) -> Re
     clipboard::copy_and_clear_after(&val, clear_secs)?;
     println!("copied {name} (clears in {clear_secs}s)");
     Ok(())
+}
+
+/// 向 stderr 提示条目的实时 TOTP 验证码 + 剩余秒数(导入 / 更换 2FA 后即时确认)。
+///
+/// 仅在条目含**非空** Totp 字段、且能成功生成时打印;失败静默,绝不干扰主流程或污染 stdout
+/// (与 `--gen-password` 把密码打 stderr 的约定一致)。供 `add` / `edit` 在提供 TOTP 来源后调用。
+fn eprint_totp_hint(item: &Item) {
+    let Some(secret) = item.totp_value().filter(|s| !s.trim().is_empty()) else {
+        return;
+    };
+    let Ok(code) = crate::totp::current_totp(secret) else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    eprintln!("totp: {code}  (valid ~{}s)", 30 - secs % 30);
 }
 
 /// 计算单条条目的实时 TOTP 验证码(6 位)。供 `run_otp`/`run_cp` 复用。
