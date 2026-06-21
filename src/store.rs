@@ -414,6 +414,28 @@ pub fn insert_attachment(conn: &Connection, attachment: &mut Attachment) -> Resu
     Ok(id)
 }
 
+/// 列出全库全部附件(含 blob),按 id 升序。用于完整导出/备份。
+pub fn list_all_attachments(conn: &Connection) -> Result<Vec<Attachment>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, item_id, filename, mime_type, size, blob FROM attachments
+         ORDER BY id ASC",
+    )?;
+    let atts: Vec<Attachment> = stmt
+        .query_map([], |r| {
+            Ok(Attachment {
+                id: Some(r.get::<_, i64>(0)?),
+                item_id: r.get::<_, i64>(1)?,
+                filename: r.get::<_, String>(2)?,
+                mime_type: r.get::<_, Option<String>>(3)?,
+                size: r.get::<_, i64>(4)?,
+                blob: r.get::<_, Vec<u8>>(5)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(atts)
+}
+
 /// 读取单个附件(含 blob)。不存在返回 `Ok(None)`。
 pub fn get_attachment(conn: &Connection, id: i64) -> Result<Option<Attachment>> {
     let att = conn

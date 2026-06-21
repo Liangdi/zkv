@@ -1077,25 +1077,49 @@ pub enum Format {
 
 // --- 纯函数(便于单测) ---
 
+/// 备份信封:条目 + 附件(用于完整、含附件的 JSON 导出/导入)。
+///
+/// 用信封包裹而非给 `Item` 加 `attachments` 字段,避免改动核心类型。
+/// 字段顺序固定(`items` 在前),不附加多余字段,保持向前/向后兼容。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BackupEnvelope {
+    items: Vec<Item>,
+    #[serde(default)]
+    attachments: Vec<Attachment>,
+}
+
+/// 把条目 + 附件序列化为紧凑 JSON 信封字符串(含附件,无损往返)。便于单测。
+pub fn build_backup_json(items: &[Item], attachments: &[Attachment]) -> Result<String> {
+    Ok(serde_json::to_string(&BackupEnvelope {
+        items: items.to_vec(),
+        attachments: attachments.to_vec(),
+    })?)
+}
+
 /// 把条目列表序列化为紧凑 JSON 字符串(无损往返)。
 pub fn export_json(items: &[Item]) -> Result<String> {
     Ok(serde_json::to_string(items)?)
 }
 
-/// 解析 JSON 字符串为条目列表。
+/// 解析 JSON 字符串为 (条目列表, 可选附件列表)。
 ///
-/// 兼容:
-/// 1. 新形状 `Vec<Item>`(含 `template_id`+`fields`)→ 直接用。
-/// 2. 旧形状(每条含 `item_type`+`data`):逐条把 `data`(legacy ItemData)经
-///    `legacy_to_fields` 转;`template_id` 取 `item_type` 字符串。
+/// 兼容三种形状(按序尝试):
+/// 1. 备份信封 `{"items":[...], "attachments":[...]}` → items + attachments。
+/// 2. 新形状裸数组 `Vec<Item>`(含 `template_id`+`fields`)→ items,无附件。
+/// 3. 旧形状(每条含 `item_type`+`data`):逐条把 `data`(legacy ItemData)经
+///    `legacy_to_fields` 转;`template_id` 取 `item_type` 字符串 → items,无附件。
 ///
-/// 整体新形状解析失败时,回退尝试旧形状数组;仍失败返回原解析错误。
-pub fn import_json(s: &str) -> Result<Vec<Item>> {
-    // 1. 新形状。
+/// 整体解析全部失败时返回原解析错误。`attachments` 仅在信封形状下为 `Some`。
+pub fn import_json(s: &str) -> Result<(Vec<Item>, Option<Vec<Attachment>>)> {
+    // 1. 备份信封(含附件)。
+    if let Ok(env) = serde_json::from_str::<BackupEnvelope>(s) {
+        return Ok((env.items, Some(env.attachments)));
+    }
+    // 2. 新形状裸数组。
     match serde_json::from_str::<Vec<Item>>(s) {
-        Ok(v) => Ok(v),
+        Ok(v) => Ok((v, None)),
         Err(new_err) => {
-            // 2. 旧形状:逐条容错解析。
+            // 3. 旧形状:逐条容错解析。
             #[derive(serde::Deserialize)]
             struct LegacyItem {
                 id: Option<i64>,
@@ -1141,7 +1165,7 @@ pub fn import_json(s: &str) -> Result<Vec<Item>> {
                         updated_at: li.updated_at,
                     });
                 }
-                Ok(out)
+                Ok((out, None))
             } else {
                 // 都失败:返回新形状的原始错误。
                 Err(new_err.into())
@@ -1330,8 +1354,8 @@ fn csv_split(s: &str) -> Vec<Vec<String>> {
 
 /// `export`:把全库条目按 `format` 导出。
 ///
-/// - JSON:完整 `Vec<Item>`(含 type/data/tags),无损。
-/// - CSV:仅 password 类型,扁平 7 列。
+/// - JSON:完整备份信封 `{items, attachments}`(含附件),无损。
+/// - CSV:仅 password 类型,扁平 7 列(不含附件)。
 ///
 /// `output = Some(p)` → 写文件(0600);`None` → stdout。
 /// **输出为明文**(命令已解锁,用户主动导出)。CSV 模式下非 password 条目被跳过,
@@ -1344,7 +1368,10 @@ pub fn run_export(
     let conn = u.db.conn();
     let items = store::list_items(conn)?;
     let content = match format {
-        Format::Json => export_json(&items)?,
+        Format::Json => {
+            let attachments = store::list_all_attachments(conn)?;
+            build_backup_json(&items, &attachments)?
+        }
         Format::Csv => {
             let (csv, skipped) = export_csv(&items);
             if skipped > 0 {
@@ -1372,8 +1399,9 @@ pub fn run_export(
 /// - `input = Some(p)` → 读文件;`None` → stdin。
 /// - 逐条容错:解析/插入失败计入 failed,不中断其余。
 /// - 每条 `id` 强制置 None(总是新建,从不覆盖;重复导入会创建重复条目)。
+/// - JSON 信封里的附件会按 item id 重映射到新条目后插入(item_id 查不到 → 计 failed 跳过)。
 /// - `created_at/updated_at` 为 0 时由 `insert_item` 填当前时间;否则保留原值。
-/// - 成功后 `save` 落盘。打印 `imported N items` 或 `imported N items (K failed)`。
+/// - 成功后 `save` 落盘。打印 `imported N items (M attachments)` 或含 `K failed`。
 pub fn run_import(u: &Unlocked, format: Format, input: Option<&Path>) -> Result<ImportResult> {
     let raw = match input {
         Some(p) => std::fs::read_to_string(p)?,
@@ -1385,39 +1413,73 @@ pub fn run_import(u: &Unlocked, format: Format, input: Option<&Path>) -> Result<
         }
     };
 
-    // 解析为候选条目列表(JSON 整体解析;CSV 逐行已在内部容错)。
-    let (candidates, parse_fail): (Vec<Item>, usize) = match format {
-        Format::Json => match import_json(&raw) {
-            Ok(v) => (v, 0),
-            Err(_) => (Vec::new(), 1), // 整体 JSON 坏掉:1 次失败。
-        },
-        Format::Csv => {
-            let (items, fail) = import_csv(&raw)?;
-            (items, fail)
-        }
-    };
+    // 解析为候选条目列表 + 可选附件(JSON 信封才有附件;CSV 无)。
+    let (candidates, attachments_opt, parse_fail): (Vec<Item>, Option<Vec<Attachment>>, usize) =
+        match format {
+            Format::Json => match import_json(&raw) {
+                Ok((items, atts)) => (items, atts, 0),
+                Err(_) => (Vec::new(), None, 1), // 整体 JSON 坏掉:1 次失败。
+            },
+            Format::Csv => {
+                let (items, fail) = import_csv(&raw)?;
+                (items, None, fail)
+            }
+        };
 
     let conn = u.db.conn();
     let mut ok = 0usize;
     let mut fail = parse_fail;
+    // 解析出的旧 item id → 插入后分到的新 id(用于附件重映射)。
+    let mut old_to_new: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     for mut item in candidates {
+        let old_id = item.id;
         item.id = None; // 强制新 id。
         // created/updated 为 0 由 insert_item 填当前时间;否则保留原值。
         match store::insert_item(conn, &mut item) {
-            Ok(_) => ok += 1,
+            Ok(new_id) => {
+                if let Some(oid) = old_id {
+                    old_to_new.insert(oid, new_id);
+                }
+                ok += 1;
+            }
             Err(_) => fail += 1,
         }
     }
 
-    if ok > 0 {
+    // 附件:逐条重映射 item_id 后插入(查不到映射 → 计 failed 跳过,不 panic)。
+    let mut att_ok = 0usize;
+    let mut att_fail = 0usize;
+    if let Some(atts) = attachments_opt {
+        for mut att in atts {
+            let new_item_id = match old_to_new.get(&att.item_id).copied() {
+                Some(nid) => nid,
+                None => {
+                    att_fail += 1;
+                    continue;
+                }
+            };
+            att.id = None;
+            att.item_id = new_item_id;
+            // size 由 insert_attachment 用 blob.len() 回填。
+            match store::insert_attachment(conn, &mut att) {
+                Ok(_) => att_ok += 1,
+                Err(_) => att_fail += 1,
+            }
+        }
+    }
+
+    let changed = ok > 0 || att_ok > 0;
+    if changed {
         u.save()?;
     }
 
-    if fail == 0 {
-        println!("imported {ok} items");
+    if att_fail == 0 {
+        println!("imported {ok} items ({att_ok} attachments)");
     } else {
-        println!("imported {ok} items ({fail} failed)");
+        println!("imported {ok} items ({att_ok} attachments, {att_fail} failed)");
     }
+    // 聚合失败:item 失败 + 附件失败 + 整体解析失败。
+    fail += att_fail;
     Ok(ImportResult { ok, fail })
 }
 
@@ -2727,8 +2789,10 @@ mod tests {
     fn json_roundtrip_lossless() {
         let items = sample_items();
         let json = export_json(&items).unwrap();
-        let back = import_json(&json).unwrap();
+        let (back, atts) = import_json(&json).unwrap();
         assert_eq!(back.len(), items.len());
+        // 裸数组形状无附件。
+        assert!(atts.is_none());
         // 字段逐一对比(id 也保留)。
         for (a, b) in items.iter().zip(back.iter()) {
             assert_eq!(a.title, b.title);
@@ -2744,8 +2808,10 @@ mod tests {
         // 非 JSON 数组 → Err。
         assert!(import_json("{ not json").is_err());
         assert!(import_json("not an array").is_err());
-        // 空数组 → Ok 空。
-        assert!(import_json("[]").unwrap().is_empty());
+        // 空数组 → Ok 空 items,无附件。
+        let (items, atts) = import_json("[]").unwrap();
+        assert!(items.is_empty());
+        assert!(atts.is_none());
     }
 
     #[test]
@@ -2927,6 +2993,144 @@ mod tests {
         cleanup(&p);
     }
 
+    // --- 附件导出/导入(信封 + id 重映射)---
+
+    /// build_backup_json 产出 items + attachments 双层结构。
+    #[test]
+    fn build_backup_json_has_envelope_shape() {
+        let items = sample_items();
+        let atts = vec![Attachment {
+            id: Some(99),
+            item_id: 1,
+            filename: "a.bin".into(),
+            mime_type: Some("application/octet-stream".into()),
+            size: 3,
+            blob: vec![0x01, 0x02, 0x03],
+        }];
+        let json = build_backup_json(&items, &atts).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("items").unwrap().is_array());
+        assert_eq!(v["items"].as_array().unwrap().len(), items.len());
+        let a = v.get("attachments").unwrap().as_array().unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0]["filename"], "a.bin");
+        assert_eq!(a[0]["item_id"], 1);
+        // blob 序列化为字节数字数组。
+        assert_eq!(a[0]["blob"].as_array().unwrap().len(), 3);
+    }
+
+    /// 往返核心:建库 → 插 item + 挂附件(已知 blob)→ export json → 新库 import json
+    /// → 断言:item 在、附件在且 blob 字节一致、附件挂到正确的新 item。
+    #[test]
+    fn backup_json_roundtrip_preserves_attachment_blob() {
+        let p = make_vault("backup_rt");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        // make_vault 的 GitHub 是 id=1。挂一个已知 blob 的附件。
+        let known_blob = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        let mut att = Attachment {
+            id: None,
+            item_id: 1, // GitHub
+            filename: "secret.bin".into(),
+            mime_type: Some("application/octet-stream".into()),
+            size: 0,
+            blob: known_blob.clone(),
+        };
+        store::insert_attachment(u.db.conn(), &mut att).unwrap();
+        u.save().unwrap();
+        drop(u);
+
+        // 导出 JSON(信封)。
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let items = store::list_items(u.db.conn()).unwrap();
+        let atts = store::list_all_attachments(u.db.conn()).unwrap();
+        assert_eq!(atts.len(), 1);
+        let json = build_backup_json(&items, &atts).unwrap();
+        drop(u);
+
+        // 新库导入。
+        let p2 = tmp_path("backup_rt_dst");
+        cleanup(&p2);
+        vault::create_with_params(&p2, "pw", &fast_kdf()).unwrap();
+        let pf2 = write_passfile("u2");
+        let u2 = Unlocked::unlock(&p2, Some(&pf2)).unwrap();
+        let inp = tmp_path("backup_rt_in");
+        std::fs::write(&inp, json).unwrap();
+        let res = run_import(&u2, Format::Json, Some(&inp)).unwrap();
+        assert_eq!(res.ok, 2); // make_vault 的 2 条
+        assert_eq!(res.fail, 0);
+        cleanup(&inp);
+
+        // 新库里 GitHub 的新 id。
+        let dst = store::list_items(u2.db.conn()).unwrap();
+        let gh = dst.iter().find(|i| i.title == "GitHub").unwrap();
+        let new_gh_id = gh.id.unwrap();
+
+        // 附件挂到正确的新 item 且 blob 字节一致。
+        let new_atts = store::list_attachments(u2.db.conn(), new_gh_id).unwrap();
+        assert_eq!(new_atts.len(), 1);
+        let na = &new_atts[0];
+        assert_eq!(na.filename, "secret.bin");
+        assert_eq!(na.mime_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(na.size, known_blob.len() as i64);
+        assert_eq!(na.blob, known_blob);
+        // 附件 item_id 必须重映射到新 id(而非旧的 1)。
+        assert_eq!(na.item_id, new_gh_id);
+
+        cleanup(&p);
+        cleanup(&p2);
+    }
+
+    /// 向后兼容:旧裸数组 `[{...}]`(无附件)仍正常导入。
+    #[test]
+    fn import_json_plain_array_backward_compat() {
+        let raw = r#"[{"id":5,"template_id":"password","title":"Legacy","category_id":null,"fields":[{"name":"username","value":"u","kind":"text","protected":false}],"favorite":false,"tags":[],"created_at":0,"updated_at":0}]"#;
+        let (items, atts) = import_json(raw).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Legacy");
+        assert!(atts.is_none(), "裸数组形状应无附件");
+    }
+
+    /// 信封解析:items + attachments 都能取到。
+    #[test]
+    fn import_json_envelope_yields_attachments() {
+        let raw = r#"{"items":[{"id":1,"template_id":"password","title":"X","category_id":null,"fields":[],"favorite":false,"tags":[],"created_at":0,"updated_at":0}],"attachments":[{"id":null,"item_id":1,"filename":"f.txt","mime_type":null,"size":0,"blob":[65,66]}]}"#;
+        let (items, atts) = import_json(raw).unwrap();
+        assert_eq!(items.len(), 1);
+        let atts = atts.expect("信封应有附件");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].filename, "f.txt");
+        assert_eq!(atts[0].blob, vec![0x41, 0x42]);
+    }
+
+    /// 容错:信封里一个坏 attachment(item_id 指向不存在的 item)→ 计 failed,
+    /// 其余成功;item 正常导入。
+    #[test]
+    fn run_import_envelope_bad_attachment_counts_failed() {
+        // 手工构造信封:1 个 item(id=1),2 个附件——其一 item_id=1(命中),
+        // 另一 item_id=999(孤立项 → failed)。
+        let raw = r#"{"items":[{"id":1,"template_id":"password","title":"H","category_id":null,"fields":[],"favorite":false,"tags":[],"created_at":0,"updated_at":0}],"attachments":[{"id":null,"item_id":1,"filename":"ok.bin","mime_type":null,"size":0,"blob":[1,2]},{"id":null,"item_id":999,"filename":"orphan.bin","mime_type":null,"size":0,"blob":[3,4]}]}"#;
+        let p = make_vault("imp_env_bad");
+        let pf = write_passfile("u");
+        let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
+        let inp = tmp_path("imp_env_in");
+        std::fs::write(&inp, raw).unwrap();
+        let res = run_import(&u, Format::Json, Some(&inp)).unwrap();
+        assert_eq!(res.ok, 1); // 1 个 item
+        assert_eq!(res.fail, 1); // 1 个孤儿附件
+        cleanup(&inp);
+
+        // 命中的附件确实挂到了新 item。
+        let dst = store::list_items(u.db.conn()).unwrap();
+        let h = dst.iter().find(|i| i.title == "H").unwrap();
+        let new_id = h.id.unwrap();
+        let atts = store::list_attachments(u.db.conn(), new_id).unwrap();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].filename, "ok.bin");
+        assert_eq!(atts[0].blob, vec![0x01, 0x02]);
+        cleanup(&p);
+    }
+
     /// export -o 写文件;空库导出不报错。
     #[test]
     fn run_export_to_file_empty_vault() {
@@ -2936,10 +3140,10 @@ mod tests {
         let pf = write_passfile("u");
         let u = Unlocked::unlock(&p, Some(&pf)).unwrap();
         let out = tmp_path("exp_empty_out");
-        // JSON 空数组导出。
+        // JSON 信封导出(空 items + 空 attachments)。
         run_export(&u, Format::Json, Some(&out)).unwrap();
         let body = std::fs::read_to_string(&out).unwrap();
-        assert_eq!(body.trim(), "[]");
+        assert_eq!(body.trim(), "{\"items\":[],\"attachments\":[]}");
         cleanup(&out);
         cleanup(&p);
     }
