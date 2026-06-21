@@ -7,7 +7,7 @@ English | [中文](README.md)
 ![Rust](https://img.shields.io/badge/Rust-edition%202024-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-green)
-![Tests](https://img.shields.io/badge/tests-196%20passed-success)
+![Tests](https://img.shields.io/badge/tests-215%20passed-success)
 
 A terminal-based manager for passwords / notes / cards with a sci-fi TUI ([ratatui-sci-fi](https://crates.io/crates/ratatui-sci-fi) Cyberpunk theme). All data is encrypted at rest with **Argon2id + XChaCha20-Poly1305**; ships with a fully **scriptable, TTY-free headless CLI**.
 
@@ -25,6 +25,7 @@ A terminal-based manager for passwords / notes / cards with a sci-fi TUI ([ratat
 - 🧩 **Field templates** — Generic field/template model with 8 built-in presets (password/note/card/wifi/bank/ssh/identity/email); fields are typed (Text/Secret/Multiline/TOTP) and drive rendering/copying; old vaults auto-migrate.
 - 🎲 **Password generation** — CSPRNG strong passwords (configurable length / symbols / ambiguous chars).
 - 💻 **Headless CLI** — Fully scriptable, no TTY required; passphrase from env var / file / prompt.
+- 🔄 **Passphrase-caching agent** — Transparently caches the derived key: type the passphrase once and skip Argon2id across consecutive commands; auto-clears on idle (ssh-agent/sudo style; key **lives in RAM only, never on disk**).
 - 🔁 **Import / export** — Lossless JSON round-trip, or flat CSV (passwords), for migration and backup.
 - 🎨 **Sci-fi TUI** — header status bar + list/detail panes + footer keybar, neon rounded panels, fully keyboard-driven.
 - ⏱️ **Security details** — Clipboard auto-clears 20s after copying; idle auto-lock; atomic writes prevent corruption; files are `0600`.
@@ -88,9 +89,35 @@ zkv attach get <id> <att> [~/my.zkv] [-o file|>file]  ·  zkv attach rm <id> <at
 # Import / export (lossless JSON, includes attachments; CSV is passwords-only):
 zkv export [~/my.zkv] --format json|csv [-o file]
 zkv import [~/my.zkv] --format json|csv [-i file]
+# Passphrase-caching agent (on by default; see "Passphrase-caching agent" below):
+zkv agent status · zkv agent stop · zkv lock     # status / stop / clear cached keys
 ```
 
 Examples: `ZKV_PASSPHRASE=secret zkv ls vault.zkv --type password --json` · `zkv otp vault.zkv 3` · `code=$(zkv gen 24)`.
+
+## 🔄 Passphrase-caching agent
+
+Every command otherwise reads the passphrase and runs a full Argon2id derivation (64MiB/3/4, ~hundreds of ms). The agent is a **transparent** background process that caches the derived master key **in memory only**, so consecutive commands ask for the passphrase just once and skip the KDF:
+
+```bash
+zkv ls ~/my.zkv        # first time: type passphrase → agent auto-spawns in the background, caches the key
+zkv otp 1 ~/my.zkv     # afterwards (within 5 min by default): no passphrase prompt, near-instant
+zkv cp 2 ~/my.zkv
+```
+
+- **Automatic**: self-spawns the first time a passphrase is needed; clears its key and exits after `ZKV_LOCK_SECS` (default 300s — the same variable as the TUI auto-lock) of idleness. Changing the passphrase (`passwd`) invalidates the cache.
+- **Secure**: the derived key lives **only in the agent process's RAM** (`Zeroizing`, cleared on drop) and is **never written to disk**; it reaches same-uid clients over a 0600 local Unix socket (same model as ssh-agent); access is gated by a 0700 private dir (`$XDG_RUNTIME_DIR` preferred). Any failure (unreachable / version mismatch / vault re-encrypted elsewhere) **silently falls back** to the normal passphrase prompt — never hangs or corrupts.
+- **Control / disable**:
+
+  ```bash
+  zkv agent status          # pid / socket / cached vaults / idle remaining
+  zkv agent stop            # stop the agent (clear key, exit)
+  zkv lock                  # clear all cached keys (re-prompt immediately)
+  zkv ls --no-agent ...     # or ZKV_NO_AGENT=1: disable caching for this run
+  ZKV_LOCK_SECS=0           # disable permanently (TTL=0 ≡ global opt-out)
+  ```
+
+> The agent is active on **Unix** only (Linux/macOS/WSL); elsewhere it is a no-op and every command prompts as usual.
 
 ## ⌨️ TUI Keybindings
 
@@ -111,7 +138,7 @@ Examples: `ZKV_PASSPHRASE=secret zkv ls vault.zkv --type password --json` · `zk
 | `Esc` | Cancel / back |
 | `q` | Quit |
 
-> **Auto-lock**: the TUI locks itself after `ZKV_LOCK_SECS` (default 300s, `0` disables) of inactivity; re-enter the passphrase in place to resume.
+> **Auto-lock**: the TUI locks itself after `ZKV_LOCK_SECS` (default 300s, `0` disables) of inactivity; re-enter the passphrase in place to resume. The headless CLI's passphrase-caching agent reuses this same variable as its idle TTL (see "Passphrase-caching agent" above).
 
 ## 🛡️ Security
 
@@ -126,7 +153,7 @@ Examples: `ZKV_PASSPHRASE=secret zkv ls vault.zkv --type password --json` · `zk
 **Granularity**: the entire SQLite database is encrypted as a single blob. On unlock it is decrypted into **memory** (`:memory:`); on exit/lock it is zeroized. On save it is re-encrypted with the cached derived key (a fresh nonce each time, **no Argon2 re-run**) and written back atomically. Plaintext is never persisted.
 
 **Threat model**
-- ✅ Defends against: offline theft of a `.zkv` file (only brute-forceable, made costly by Argon2id); plaintext on disk; temp files are `0600` with CSPRNG names; metadata leakage (entry counts, tag names — all encrypted); clipboard auto-clear; idle auto-lock.
+- ✅ Defends against: offline theft of a `.zkv` file (only brute-forceable, made costly by Argon2id); plaintext on disk; temp files are `0600` with CSPRNG names; metadata leakage (entry counts, tag names — all encrypted); clipboard auto-clear; idle auto-lock; the agent's cached key lives in RAM only, never on disk, and transits a 0600 local socket to same-uid clients.
 - ⚠️ Does **not** defend against: a fully compromised host (keyloggers, memory dumps, cold-boot attacks).
 - ⚠️ **A forgotten passphrase means unrecoverable data** — the price of zero knowledge. Back up your passphrase and `.zkv` file carefully.
 
@@ -145,7 +172,7 @@ Layered design with one-way dependencies (lower layers never reference upper one
 
 ```
 error(L0) → crypto/model/totp(L1) → db/vault(L2) → store/search/clipboard(L3) → app(L4) → ui(L5) → main(L6)
-                                                                      ↘ cli (headless frontend, parallel to ui)
+                                                                      ↘ cli (headless frontend, parallel to ui) · agent (Unix daemon caching the derived key)
 ```
 
 See [docs/PROGRESS.md](docs/PROGRESS.md) and [docs/prd/zkv.md](docs/prd/zkv.md).
@@ -163,9 +190,9 @@ KDF parameters are stored in the file, so they can be tuned in the future while 
 ## 🛠️ Development
 
 ```bash
-cargo test             # unit / integration tests (176 passed)
+cargo test             # unit / integration tests (215 passed)
 cargo clippy --all-targets  # 0 warnings
-just e2e               # PTY end-to-end (drives the real binary, 6 cases)
+just e2e               # PTY end-to-end (drives the real binary, 7 cases)
 cargo build --release  # release build
 ```
 
@@ -175,6 +202,7 @@ cargo build --release  # release build
 - [x] Import / export (JSON / CSV)
 - [x] TOTP codes + headless CLI + idle auto-lock
 - [x] Field templates (8 built-in presets + generic field model; custom-template CRUD is a follow-up)
+- [x] Passphrase-caching agent (transparently cache the derived key, skip Argon2id; ssh-agent/sudo style)
 - [ ] KeePass import / export
 - [ ] Per-page encryption for very large vaults (on demand: ~50–200ms per save under 100MB today; see [PROGRESS.md](docs/PROGRESS.md) 2026-06-21 decision)
 - [x] Windows clipboard backend (PowerShell `Set-Clipboard`, via stdin, UTF-8)

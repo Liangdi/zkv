@@ -5,9 +5,9 @@
 
 ## 当前状态
 
-- **阶段**:✅ **MVP 完成**(SA1–SA6 全部交付,端到端验证通过)+ 无头 CLI / TOTP 扩展
-- **最后更新**:2026-06-20
-- **验证**:`cargo build` / `cargo test`(**196 passed**, +1 ignored)/ `cargo build --release` / `cargo clippy --all-targets` 全绿、0 warning;PTY e2e 套件(`just e2e`,6 用例)通过;完整无头 CLI(22 子命令)+ TOTP + TUI 管理(分类/标签/附件)+ 闲置自动锁定经真二进制端到端冒烟验证。
+- **阶段**:✅ **MVP 完成**(SA1–SA6 全部交付,端到端验证通过)+ 无头 CLI / TOTP / 口令缓存 agent 扩展
+- **最后更新**:2026-06-21
+- **验证**:`cargo build` / `cargo test`(**215 passed**, +1 ignored)/ `cargo build --release` / `cargo clippy --all-targets` 全绿、0 warning;PTY e2e 套件(`just e2e`,7 用例)通过;完整无头 CLI + TOTP + TUI 管理(分类/标签/附件)+ 闲置自动锁定 + 口令缓存 agent 经真二进制端到端冒烟验证。
 
 ## 使用方法
 
@@ -39,6 +39,8 @@ zkv attach add ~/my.zkv <id> <file> [--mime M]  ·  zkv attach ls ~/my.zkv <id>
 zkv attach get ~/my.zkv <id> <att> [-o file|>file]  ·  zkv attach rm ~/my.zkv <id> <att>
 # 导入 / 导出(明文;JSON 无损,CSV 仅 password):
 zkv export ~/my.zkv --format json|csv [-o file]  ·  zkv import ~/my.zkv --format json|csv [-i file]
+# 口令缓存 agent(默认开启,见「关键决策记录」#9;ZKV_LOCK_SECS 为闲置 TTL,ZKV_NO_AGENT=1 关闭):
+zkv agent status  ·  zkv agent stop  ·  zkv lock
 ```
 
 TUI 快捷键:`n` 新建 · `e` 编辑 · `x` 删除 · `/` 搜索 · `y` 复制密码(20s 自动清空) · **`o` 复制 TOTP 验证码** · **`a` 附件管理** · `l` 锁定 · **`c`/`t` 分类/标签管理(增删改)** · `q` 退出。三类条目:密码 / 笔记 / 卡片。**闲置自动锁定**:TUI 无操作超过 `ZKV_LOCK_SECS`(默认 300 秒,`0` 禁用)自动上锁,可原地重输口令恢复。
@@ -53,11 +55,13 @@ TUI 快捷键:`n` 新建 · `e` 编辑 · `x` 删除 · `/` 搜索 · `y` 复制
 6. 安全:忘口令不可恢复;复制密码 20s 清空;`from_bytes` 用 backup 灌入真 `:memory:`(明文不落盘);`.zkv` 与临时文件均 0600,临时文件名取自 CSPRNG(不可预测);`MasterKey` 以 `ZeroizeOnDrop` 缓存于 App,`lock()` 即清零,App 不再驻留明文口令。
 7. **无头 CLI 架构**:新增 `cli.rs` 作为与 TUI 平行的前端,直接调 L2/L3(`vault`/`store`/`search`/`clipboard`),**不复用 `App`**(它和 TUI 的 `Mode`/`handle_key` 强耦合)。`Unlocked` 封装 `unlock_full` + `save_with_key`,读写共用;口令来源 `env ZKV_PASSPHRASE` → `--passfile` → rpassword,全程 `Zeroizing` 包裹。
 8. **TOTP**:新增 `totp.rs`(L1 纯计算,RFC 6238:HMAC-SHA1 + base32,依赖 `hmac`/`sha1`/`data-encoding`)。CLI `otp` 打印实时码、`cp -f otp` 复制码;TUI 详情页 password 条目显示**实时 6 位码 + 倒计时**而非掩码密钥,`o` 键复制。经 RFC 6238 官方测试向量 + Python 独立实现交叉验证。
+9. **口令缓存 agent**(SA13):新增 `agent.rs`(`#[cfg(unix)]`,非 Unix 为 no-op 桩)。后台守护进程**只在内存**缓存按「规范化库路径」索引的 `(MasterKey, KdfParams, salt)`,经本地 Unix socket(serde_json 行协议)供 CLI 复用,跳过每命令的 Argon2id(64MiB/3/4)。**只缓存派生密钥、不缓存 Database**——每命令仍现读 `.zkv` 现解现写,`add/edit/rm` 后缓存照常有效,仅 `passwd` 换 salt 失效(`run_passwd` 后 `agent::forget`)。无感:`put_key` 首次自动 self-spawn `zkv agent serve`(新进程组,detached),闲置超 `ZKV_LOCK_SECS`(与 TUI 自动锁同变量)看门狗清密钥 `process::exit`。安全:密钥 `Zeroizing` 不落盘、经 0600 socket 传同 uid 客户端、0700 私有目录(`XDG_RUNTIME_DIR` 优先)做访问控制、**零新增依赖**(标准库 socket + 直接 FFI `getuid`)、`--no-agent`/`ZKV_NO_AGENT=1` opt-out、全程 fail-closed 回退。集成点单一:改 `cli::Unlocked::unlock` 一处(13 命令全受益)+ 新增 `vault::unlock_with_key`(跳过 `derive_key`,共享 `decrypt_body`)。
 
 ## 模块架构与分层依赖
 
 ```
 error(L0✅) → crypto/model/totp(L1✅) → db/vault(L2✅) → store/search/clipboard(L3✅) → app(L4✅) → ui(L5✅) → main(L6✅)
+                                                                  ↘ cli(无头前端,与 ui 平行) · agent(Unix 守护进程,缓存 L1 派生密钥供 cli 复用)
 ```
 
 ```
@@ -74,7 +78,8 @@ src/
 ├── clipboard.rs L3 ✅ 系统命令后端(pbcopy/wl-copy/xclip/xsel)+ 定时清空
 ├── app.rs     L4 ✅  App/Mode/EditorState/handle_key 全状态机
 ├── ui/        L5 ✅  mod(主循环+TerminalGuard)/theme(sci-fi)/list/detail/input
-└── cli.rs     · ✅  无头 CLI 前端(不依赖 App):init/ls/get/search/cp/otp/add/edit/rm + cat/tag/attach 管理 + gen + export/import
+├── cli.rs     · ✅  无头 CLI 前端(不依赖 App):init/ls/get/search/cp/otp/add/edit/rm + cat/tag/attach 管理 + gen + export/import
+└── agent.rs   · ✅  口令缓存 agent(Unix):KeyCache + Unix socket 协议 + 自启/空闲 TTL,缓存派生密钥;非 Unix no-op
 ```
 
 ## 里程碑与任务进度(全部完成)
@@ -92,6 +97,7 @@ src/
 - ✅ **SA10 TUI 管理补全** — CategoryMgr/TagMgr 增删改面板 · Mode::Attachments 附件管理 · detail 附件摘要
 - ✅ **SA11 闲置自动锁定** — `ZKV_LOCK_SECS`(默认 300s,0 禁用)无操作自动锁;锁定后回口令态可原地重解锁(手动 `l` 同样受益)
 - ✅ **SA12 通用字段/模板模型** — 固定 ItemData 枚举 → `template_id + Vec<Field>`;8 内置预设(password/note/card/wifi/bank/ssh/identity/email);编辑器/详情/CLI 数据驱动;TOTP 解耦为字段属性;老库自动迁移
+- ✅ **SA13 口令缓存 agent** — `agent.rs`(Unix)后台守护进程缓存派生密钥(仅内存、不落盘),经本地 socket 供 CLI 跳过 Argon2id;自启 + 闲置 TTL(`ZKV_LOCK_SECS`)+ fail-closed + opt-out;零新增依赖
 
 ## 最终端到端验证(2026-06-20)
 
@@ -167,3 +173,8 @@ src/
   - **导出/导入纳入附件**:JSON export 原只序列化 `Vec<Item>`(无附件)→ export→import 丢全部附件 blob。改为 `BackupEnvelope { items, attachments }` 信封;`store::list_all_attachments`;import 按 old→new item id 重映射附件。裸数组向后兼容;CSV 不变。
   - **`zkv passwd` 改主口令**:`vault::change_passphrase`(验旧口令 → 新随机 salt + 新口令派生新 key → 重加密整库,KDF 强度不变);新口令取自 `ZKV_NEW_PASSPHRASE`/`--new-passfile`/交互输两次(不一致报错)。改后旧口令无法解锁。
   - 验证:clippy 0、test 209、e2e 6/6;真二进制冒烟(附件往返 blob 一致;passwd 后 new 成功/old 失败/数据完整)。
+- **2026-06-21** 口令缓存 agent(SA13;`cargo test` 215 passed;e2e 7/7):
+  - **动机**:每条命令都要读口令 + 跑一次 Argon2id(64MiB/3/4,百毫秒级)。新增 `agent.rs`(`#[cfg(unix)]`,非 Unix 为 no-op 桩,保证 `cli`/`main` 调用点零 cfg 门控)——后台守护进程**只在内存**缓存按「规范化库路径」索引的 `(MasterKey, KdfParams, salt)`,经本地 Unix socket(serde_json 行协议:`Handshake/Get/Put/Forget/Status/Stop/Lock`)供 CLI 复用,**跳过 Argon2id**。**只缓存派生密钥、不缓存 Database**:每命令仍现读 `.zkv` 现解现写,`add/edit/rm` 后缓存照常有效(仅 `passwd` 换 salt 失效 → `run_passwd` 后 `agent::forget`)。
+  - **无感 + 安全**:`put_key` 首次自动 self-spawn `zkv agent serve`(新进程组 `process_group(0)`、detached stdio);闲置看门狗线程超 `ZKV_LOCK_SECS`(与 TUI 自动锁同变量;默认 300s,`0` 禁用)清密钥(`Zeroizing` drop)+ 删 socket + `process::exit`。密钥**绝不落盘**,经 0600 socket 传同 uid 客户端(同 ssh-agent);访问控制 = 0700 私有目录(`$XDG_RUNTIME_DIR` 优先,否则 `temp_dir/zkv-agent-$uid/`,FFI `getuid` 免 `libc` 依赖);**零新增依赖**;autostart 竞态用「bind 失败方干净退出」处理,无需 lockfile;**全程 fail-closed**(连不上/版本不符/AEAD 解密失败 → 静默回退正常派生)。
+  - **集成点单一**:改 `cli::Unlocked::unlock` 一处(agent 命中 → `vault::unlock_with_key` 跳过 `derive_key`;miss/失败 → 正常 `read_passphrase`+`unlock_full`+`put_key` 种入),13 个解锁命令全受益;新增 `vault::unlock_with_key` + 共享私有 `decrypt_body`(`unlock_full` 复用)。`main.rs`:`--no-agent`(global,镜像 env 模式设 `ZKV_NO_AGENT`)、`Command::Agent{Status/Stop/Serve(hide)}`、`Command::Lock`。
+  - 验证:`cargo build` / `cargo clippy --all-targets` 0 warning;`cargo test` **215 passed**(+6 agent 单测:协议往返 / canonical 归一 / `ttl_secs`+`enabled` env / client↔server 缓存 get-put-forget / 版本不符回退);`just e2e` **7/7**(新增无缝回归:1st 带口令 seed → 2nd **不带口令**仍成功 + `agent status` + `ZKV_NO_AGENT` opt-out);真二进制冒烟(二次命令瞬时、`lock` 后回退、`--no-agent` 生效)。
