@@ -68,6 +68,7 @@ zkv new ~/my.zkv
 
 ```bash
 zkv init   [~/my.zkv]                         # 非交互建库(已存在则报错);省略 path → ~/.zkv/default.zkv
+zkv passwd [~/my.zkv]                         # 改主口令(验旧→新 salt+新 key 重加密;新口令输两次)
 zkv gen    [24] [--no-symbols] [--no-ambiguous]  # 生成强随机密码(无需库)
 # <path> 可省略(默认 ~/.zkv/default.zkv);多位置参数命令里 path 总是最后一个:
 zkv ls     [~/my.zkv] [-t password] [--tag T] [--cat C] [-q github] [-F|--favorite] [--json]

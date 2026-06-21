@@ -163,3 +163,7 @@ src/
   - 验证:`cargo build` / `cargo clippy --all-targets` 0 warning;`cargo test` 196 passed;`just e2e` 6/6;真二进制冒烟(wifi 模板 add/get、旧形状 JSON 迁移、export 新形状)。**自定义模板建/改/删为后续增量**。
 - **2026-06-21** 默认库路径(`cargo test` 200 passed):所有带 `<path>` 的命令(含 TUI new/open、无头全部、cat/tag/attach 子命令、export/import)path 改 `Option<PathBuf>`,省略时默认 `~/.zkv/default.zkv`(`$HOME`/`%USERPROFILE%`,零新依赖)。`init`/`new` 默认时先 `mkdir -p ~/.zkv`(Unix 0700);读命令默认库不存在 → 友好报错提示 `zkv init`(显式 path 行为不变)。验证:clippy 0 warning、test 200、e2e 6/6;真二进制冒烟(临时 HOME:init→ls→add→ls、缺失友好提示)。
 - **2026-06-21** 修默认路径 clap 回归 + 确立位置参数约定:`path: Option<PathBuf>` 导致 attach/cat rm/tag rm/tag mv/search(必填位置参数在可选 path 后)**clap panic**,以及 get/edit/rm/cp/otp 的 `id` 被**当成 path 错位**(单测/e2e 未覆盖,真二进制才暴露)。clap 不允许「可选位置参数在必填之前」,也无法用 `default_value=""` 兜底。**约定:多位置参数命令里标识符(id/item/name/query)在前、`path` 作为最后一个可选位置参数**(单位置命令 path 即唯一位置)。用法从 `zkv get <path> <id>` 变为 `zkv get <id> [path]`、`zkv attach add <path> <id> <file>` 变为 `zkv attach add <id> <file> [path]` 等(0.1.0 破坏性变更)。全命令 + 全 `--help` 真二进制冒烟通过(含默认库路由)。clippy 0、test 205、e2e 6/6。
+- **2026-06-21** 两项补强(`cargo test` 209 passed):
+  - **导出/导入纳入附件**:JSON export 原只序列化 `Vec<Item>`(无附件)→ export→import 丢全部附件 blob。改为 `BackupEnvelope { items, attachments }` 信封;`store::list_all_attachments`;import 按 old→new item id 重映射附件。裸数组向后兼容;CSV 不变。
+  - **`zkv passwd` 改主口令**:`vault::change_passphrase`(验旧口令 → 新随机 salt + 新口令派生新 key → 重加密整库,KDF 强度不变);新口令取自 `ZKV_NEW_PASSPHRASE`/`--new-passfile`/交互输两次(不一致报错)。改后旧口令无法解锁。
+  - 验证:clippy 0、test 209、e2e 6/6;真二进制冒烟(附件往返 blob 一致;passwd 后 new 成功/old 失败/数据完整)。

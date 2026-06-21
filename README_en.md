@@ -69,6 +69,7 @@ Parallel to the TUI, fully **scriptable and TTY-free** (passphrase from `ZKV_PAS
 
 ```bash
 zkv init   [~/my.zkv]                         # non-interactive create (refuses to overwrite); omit path → ~/.zkv/default.zkv
+zkv passwd [~/my.zkv]                         # change the master passphrase (verify old; new salt + key)
 zkv gen    [24] [--no-symbols] [--no-ambiguous]  # strong random password (no vault needed)
 # <path> is optional (defaults to ~/.zkv/default.zkv); in multi-positional commands path is always last:
 zkv ls     [~/my.zkv] [-t password] [--tag T] [--cat C] [-q github] [-F|--favorite] [--json]
