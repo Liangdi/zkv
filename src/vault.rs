@@ -206,6 +206,25 @@ pub fn save_with_key(
     encrypt_and_write(path, key, kdf, salt, plaintext)
 }
 
+/// 修改主口令:验旧口令 → 用新口令 + 新随机 salt 重新加密整库。
+///
+/// 流程:
+/// 1. 用旧口令解锁(`unlock_full`,错则 [`Error::BadPassphrase`]),取 db 与 kdf。
+/// 2. 生成新随机 salt,用新口令 + 原 KDF 参数(不改强度)派生新 key。
+/// 3. dump 明文 → 用新 key 加密(新 nonce)→ 原子写(新 salt 进文件头)。
+///
+/// KDF 参数沿用原库的;新 salt 保证换口令后密钥彻底变化,旧口令再无法解锁。
+pub fn change_passphrase(path: &Path, old_pass: &str, new_pass: &str) -> Result<()> {
+    // 1. 验旧口令 + 取 db 与 kdf。
+    let (db, _old_key, kdf, _old_salt) = unlock_full(path, old_pass)?;
+    // 2. 新随机 salt + 用新口令派生新 key(沿用原库 kdf 参数)。
+    let new_salt = crypto::gen_salt();
+    let new_key = crypto::derive_key(new_pass.as_bytes(), &new_salt, &kdf)?;
+    // 3. dump 明文 → 用新 key 加密 + 原子写(新 salt 进文件头)。
+    let plaintext = db.dump_bytes()?;
+    encrypt_and_write(path, &new_key, &kdf, new_salt, plaintext)
+}
+
 /// 内部:用**已派生**的 key 加密(新 nonce 由 encrypt 生成,但需要它进文件头)→ 原子写。
 /// 不再做任何 Argon2id 派生。
 fn encrypt_and_write(
@@ -473,6 +492,75 @@ mod tests {
         assert_ne!(h1.nonce, h2.nonce, "每次保存应生成新 nonce");
         // salt 保持不变
         assert_eq!(h1.salt, h2.salt);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn change_passphrase_roundtrip() {
+        // create(old) → 插条 item → change(old,new) →
+        // unlock(old) Err(BadPassphrase)、unlock(new) Ok 且数据仍在、salt 变。
+        let p = tmp_path("change");
+        cleanup(&p);
+        let kdf = fast_kdf();
+        create_with_params(&p, "old", &kdf).unwrap();
+
+        // 插一条 item。
+        {
+            let db = unlock(&p, "old").unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO items(type,title,data,search_text,created_at,updated_at)
+                     VALUES ('password','GitHub','{\"password\":\"s3cret\"}','s3cret',1,1)",
+                    [],
+                )
+                .unwrap();
+            save_with_params(&p, "old", &db, &kdf).unwrap();
+        }
+        let before = std::fs::read(&p).unwrap();
+        let h_before = VaultHeader::parse(&before).unwrap();
+
+        // 改口令。
+        change_passphrase(&p, "old", "new").unwrap();
+
+        // 旧口令失败。
+        assert!(
+            matches!(unlock(&p, "old"), Err(Error::BadPassphrase)),
+            "old passphrase must no longer unlock after change"
+        );
+        // 新口令成功且数据仍在。
+        let db = unlock(&p, "new").unwrap();
+        let cnt: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(cnt, 1, "data should survive passphrase change");
+        let title: String = db
+            .conn()
+            .query_row("SELECT title FROM items", [], |r| r.get::<_, String>(0))
+            .unwrap();
+        assert_eq!(title, "GitHub");
+
+        // salt 变了。
+        let after = std::fs::read(&p).unwrap();
+        let h_after = VaultHeader::parse(&after).unwrap();
+        assert_ne!(h_before.salt, h_after.salt, "salt must rotate on change");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn change_passphrase_wrong_old_yields_bad_passphrase() {
+        let p = tmp_path("change_wrong");
+        cleanup(&p);
+        let kdf = fast_kdf();
+        create_with_params(&p, "correct", &kdf).unwrap();
+        let res = change_passphrase(&p, "incorrect", "whatever");
+        assert!(
+            matches!(res, Err(Error::BadPassphrase)),
+            "wrong old passphrase must yield BadPassphrase, got {:?}",
+            res
+        );
+        // 库未被改写(原口令仍可用)。
+        assert!(unlock(&p, "correct").is_ok());
         cleanup(&p);
     }
 }

@@ -47,6 +47,17 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         passfile: Option<PathBuf>,
     },
+    /// 修改主口令(验旧口令 → 用新口令 + 新 salt 重新加密整库)。
+    Passwd {
+        /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
+        path: Option<PathBuf>,
+        /// 旧口令文件(默认 ZKV_PASSPHRASE / 交互)。
+        #[arg(long, value_name = "PATH")]
+        passfile: Option<PathBuf>,
+        /// 新口令文件(默认 ZKV_NEW_PASSPHRASE / 交互输两次)。
+        #[arg(long = "new-passfile", value_name = "PATH")]
+        new_passfile: Option<PathBuf>,
+    },
     /// 列出库中的条目(无头,可脚本化)。
     Ls {
         /// 库文件路径(省略则用默认库 ~/.zkv/default.zkv)。
@@ -523,6 +534,21 @@ fn run() -> color_eyre::Result<()> {
             let path = zkv::cli::resolve_vault_path(path)?;
             ensure_parent_dir(&path)?;
             zkv::cli::run_init(&path, passfile.as_deref())?;
+        }
+        Command::Passwd {
+            path,
+            passfile,
+            new_passfile,
+        } => {
+            let was_default = path.is_none();
+            let path = zkv::cli::resolve_vault_path(path)?;
+            if was_default && !path.exists() {
+                return Err(color_eyre::eyre::eyre!(
+                    "no vault at {}; run `zkv init` to create it",
+                    path.display()
+                ));
+            }
+            zkv::cli::run_passwd(&path, passfile.as_deref(), new_passfile.as_deref())?;
         }
         // 无头路径:解锁 → 调对应 cli::run_*。
         // crate::error::Error: std::error::Error,`?` 自动转 color_eyre::Report。

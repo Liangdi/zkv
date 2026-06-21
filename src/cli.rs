@@ -67,6 +67,53 @@ fn strip_trailing_newline(mut s: String) -> String {
     s
 }
 
+/// 读取**新**口令(`passwd` 用),按优先级:
+/// 1. 环境变量 `ZKV_NEW_PASSPHRASE`
+/// 2. `--new-passfile <path>` 指定的文件(去掉末尾单个 `\n` / `\r\n`)
+/// 3. TTY 交互式提示两次(`new passphrase:` / `confirm new passphrase:`),
+///    两次不一致返回 [`Error::Other("passphrases do not match")`]
+///
+/// 返回 [`Zeroizing<String>`],避免明文口令在堆上长期残留。
+pub fn read_new_passphrase(new_passfile: Option<&Path>) -> Result<Zeroizing<String>> {
+    // 1. 环境变量。
+    if let Some(val) = std::env::var_os("ZKV_NEW_PASSPHRASE") {
+        let s = val
+            .into_string()
+            .map_err(|_| Error::Other("ZKV_NEW_PASSPHRASE is not valid UTF-8".into()))?;
+        return Ok(Zeroizing::new(s));
+    }
+
+    // 2. --new-passfile。
+    if let Some(p) = new_passfile {
+        let raw = std::fs::read_to_string(p).map_err(|e| {
+            Error::Other(format!("failed to read new-passfile {}: {e}", p.display()))
+        })?;
+        return Ok(Zeroizing::new(strip_trailing_newline(raw)));
+    }
+
+    // 3. TTY 交互式:输两次并比对。
+    let a = rpassword::prompt_password("new passphrase: ")?;
+    let b = rpassword::prompt_password("confirm new passphrase: ")?;
+    if a != b {
+        return Err(Error::Other("passphrases do not match".into()));
+    }
+    Ok(Zeroizing::new(a))
+}
+
+/// `passwd`:修改主口令。验旧口令 → 用新口令 + 新 salt 重新加密整库。
+///
+/// 旧口令来源:`ZKV_PASSPHRASE` / `--passfile` / 交互(同 [`read_passphrase`])。
+/// 新口令来源:`ZKV_NEW_PASSPHRASE` / `--new-passfile` / 交互输两次。
+/// 允许新旧口令相同(不强制区分)。旧口令错 → `change_passphrase` 返回
+/// [`Error::BadPassphrase`],经 `?` 上抛,退出非 0。成功打印 `passphrase changed`。
+pub fn run_passwd(path: &Path, old_pf: Option<&Path>, new_pf: Option<&Path>) -> Result<()> {
+    let old = read_passphrase(old_pf)?;
+    let new = read_new_passphrase(new_pf)?;
+    vault::change_passphrase(path, old.as_str(), new.as_str())?;
+    println!("passphrase changed");
+    Ok(())
+}
+
 /// 默认库路径:`~/.zkv/default.zkv`(`$HOME`,Windows 回退 `%USERPROFILE%`)。
 ///
 /// 命令省略 `<path>` 位置参数时使用此路径。仅依赖 `std::env::var_os`,不引入新依赖。
@@ -2146,6 +2193,88 @@ mod tests {
         let p = tmp_path("nope_passfile");
         cleanup(&p);
         assert!(read_passphrase(Some(&p)).is_err());
+    }
+
+    #[test]
+    fn read_new_passphrase_env_paths() {
+        // 串行:涉及 ZKV_NEW_PASSPHRASE 环境变量。
+        let _g = env_lock();
+        // 1. 环境变量优先级最高。
+        // SAFETY: 持 env_lock,本函数内串行 set/remove。
+        unsafe {
+            std::env::set_var("ZKV_NEW_PASSPHRASE", "new-env-secret");
+        }
+        let got = read_new_passphrase(None).unwrap();
+        assert_eq!(got.as_str(), "new-env-secret");
+
+        // 2. 环境变量优先级高于 --new-passfile。
+        let pf = tmp_path("new_pf_prec");
+        std::fs::write(&pf, "file-loses\n").unwrap();
+        let got = read_new_passphrase(Some(&pf)).unwrap();
+        assert_eq!(got.as_str(), "new-env-secret");
+        cleanup(&pf);
+
+        // SAFETY: 同上。
+        unsafe {
+            std::env::remove_var("ZKV_NEW_PASSPHRASE");
+        }
+
+        // 3. --new-passfile 路径(去末尾换行)。
+        let p = tmp_path("new_pf");
+        std::fs::write(&p, "new-file-secret\n").unwrap();
+        let got = read_new_passphrase(Some(&p)).unwrap();
+        assert_eq!(got.as_str(), "new-file-secret");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn run_passwd_roundtrip_and_old_fails() {
+        // fast KDF 库 → passwd → 新口令解锁 Ok、旧口令 Err(BadPassphrase)。
+        // 串行:read_passphrase/read_new_passphrase 读 ZKV_PASSPHRASE/
+        // ZKV_NEW_PASSPHRASE 环境变量,须防止与其他 env 测试并发竞态。
+        let _g = env_lock();
+        // 兜底:确保开始时两个 env 均未设置。
+        // SAFETY: 持 env_lock,无并发访问。
+        unsafe {
+            std::env::remove_var("ZKV_PASSPHRASE");
+            std::env::remove_var("ZKV_NEW_PASSPHRASE");
+        }
+        let p = tmp_path("passwd_cli");
+        cleanup(&p);
+        let kdf = fast_kdf();
+        vault::create_with_params(&p, "pw", &kdf).unwrap();
+
+        // 旧口令错 → BadPassphrase,且库未变(原口令仍可用)。
+        // 注:run_passwd 先读旧/新口令再调 change_passphrase,故此处也需提供
+        // new-passfile,否则会落到无 TTY 的 rpassword 提示。
+        let pf_old = tmp_path("pf_old_bad");
+        std::fs::write(&pf_old, "wrong\n").unwrap();
+        let pf_new_dummy = tmp_path("pf_new_dummy");
+        std::fs::write(&pf_new_dummy, "whatever\n").unwrap();
+        assert!(matches!(
+            run_passwd(&p, Some(&pf_old), Some(&pf_new_dummy)),
+            Err(Error::BadPassphrase)
+        ));
+        assert!(vault::unlock(&p, "pw").is_ok());
+        cleanup(&pf_old);
+        cleanup(&pf_new_dummy);
+
+        // 改口令:旧用 passfile、新用 passfile。
+        let pf_old_ok = tmp_path("pf_old_ok");
+        std::fs::write(&pf_old_ok, "pw\n").unwrap();
+        let pf_new = tmp_path("pf_new");
+        std::fs::write(&pf_new, "newpw\n").unwrap();
+        run_passwd(&p, Some(&pf_old_ok), Some(&pf_new)).unwrap();
+
+        // 旧口令失败、新口令成功。
+        assert!(matches!(
+            vault::unlock(&p, "pw"),
+            Err(Error::BadPassphrase)
+        ));
+        assert!(vault::unlock(&p, "newpw").is_ok());
+        cleanup(&pf_old_ok);
+        cleanup(&pf_new);
+        cleanup(&p);
     }
 
     #[test]
