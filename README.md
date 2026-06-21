@@ -53,6 +53,8 @@ cargo run --release -- new  ~/my.zkv     # 创建新库(进入 TUI 设口令)
 cargo run --release -- open ~/my.zkv     # 打开已有库(进入 TUI 输口令)
 ```
 
+> 💡 `<path>` 可省略 —— 默认 `~/.zkv/default.zkv`。如:`zkv init`(建默认库)、`zkv ls`、`zkv open`、`zkv get 1`。
+
 或安装到 `$CARGO_HOME/bin`:
 
 ```bash

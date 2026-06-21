@@ -54,6 +54,8 @@ cargo run --release -- new  ~/my.zkv     # create a new vault (set passphrase in
 cargo run --release -- open ~/my.zkv     # open an existing vault
 ```
 
+> 💡 `<path>` is optional — it defaults to `~/.zkv/default.zkv`. e.g. `zkv init`, `zkv ls`, `zkv open`, `zkv get 1`.
+
 Or install to `$CARGO_HOME/bin`:
 
 ```bash
