@@ -1,8 +1,9 @@
 //! 输入组件:文本输入框、口令模态、通用确认模态。对应 PRD §8。
 
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::layout::Rect;
+use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
+use ratatui_sci_fi::widgets::{TextInput, TextInputState};
 
 use super::theme;
 
@@ -46,51 +47,31 @@ impl InputField {
     }
 }
 
-/// 渲染单行输入框(label + 值)。
-pub fn render_input(frame: &mut Frame, area: Rect, field: &InputField, label: &str) {
+/// 渲染单行输入框:外层圆角边框(legend label) + sci-fi `TextInput`(闪烁 `█`
+/// 光标,口令自动 `•` 掩码)。`tick` 是 UI 层动画时钟,驱动光标闪烁节奏。
+///
+/// 输入是 `App` 集中持有的 append-only 缓冲(`app.input`),这里每帧临时构造
+/// `TextInputState`:光标恒在末尾(无左右移动),`blink_tick` 取动画时钟。
+/// 不持久化 state,避免与 `app.input` 双状态漂移。
+pub fn render_input(frame: &mut Frame, area: Rect, field: &InputField, label: &str, tick: u64) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::border())
         .title(label)
         .title_style(theme::title_style());
-    let text = if field.value.is_empty() {
-        // 占位提示
-        Paragraph::new("")
-            .style(theme::muted())
-            .block(block)
-    } else {
-        Paragraph::new(field.rendered()).style(theme::fg()).block(block)
-    };
-    frame.render_widget(text, area);
-}
-
-/// 渲染一个居中模态:用 `Clear` 清底,带标题与多行正文。
-pub fn render_modal(frame: &mut Frame, area: Rect, title: &str, body_lines: &[&str]) {
-    // 清底
-    frame.render_widget(Clear, area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme::accent2())
-        .title(format!(" {title} "))
-        .title_style(theme::title_style())
-        .style(theme::fg());
-
-    let inner = {
-        let chunks = Layout::vertical([Constraint::Min(1)]).split(area);
-        block.inner(chunks[0])
-    };
+    let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines: Vec<ratatui::text::Line> = body_lines
-        .iter()
-        .map(|s| ratatui::text::Line::from(*s).style(theme::fg()))
-        .collect();
-    let para = Paragraph::new(lines)
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
-    frame.render_widget(para, inner);
+    let mut state = TextInputState {
+        value: field.value.clone(),
+        cursor: field.value.chars().count(),
+        blink_tick: tick,
+    };
+    let mut input = TextInput::new().theme(ratatui_sci_fi::Theme::Cyberpunk);
+    if field.mask {
+        input = input.password(true);
+    }
+    frame.render_stateful_widget(input, inner, &mut state);
 }
 
 #[cfg(test)]

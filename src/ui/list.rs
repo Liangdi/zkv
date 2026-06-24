@@ -13,7 +13,7 @@ use crate::app::App;
 use crate::model::{FieldKind, Item};
 
 /// 渲染条目列表(Search 模式时顶部叠搜索框)。
-pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
+pub fn render_list(frame: &mut Frame, area: Rect, app: &App, tick: u64) {
     // Search 模式:顶部一行搜索输入框。
     let (list_area, search_widget) = if app.mode == crate::app::Mode::Search {
         let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
@@ -27,7 +27,7 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     if let Some((sarea, field)) = search_widget {
-        input::render_input(frame, sarea, &field, " / search ");
+        input::render_input(frame, sarea, &field, " / search ", tick);
     }
 
     let inner = theme::panel_frame(frame, list_area, Some("Items"));
@@ -62,7 +62,7 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
 
     let list = List::new(items)
         .highlight_style(theme::selected_bar())
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▶ ");
 
     let mut state = ListState::default();
     if app.selected < app.items.len() {

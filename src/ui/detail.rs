@@ -103,7 +103,7 @@ fn attachment_summary(app: &App, item_id: i64) -> Vec<(String, i64)> {
 fn view_lines(item: &Item) -> Vec<ratatui::text::Line<'static>> {
     let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
     lines.push(field_view("Type", &template_display_name(&item.template_id)));
-    lines.push(blank());
+    lines.push(divider_line());
     for f in &item.fields {
         match f.kind {
             FieldKind::Totp => lines.push(totp_code_line_labeled(&f.name, &f.value)),
@@ -184,6 +184,12 @@ fn blank() -> ratatui::text::Line<'static> {
     ratatui::text::Line::from("")
 }
 
+/// sci-fi 弱分隔线(虚线),用于 Type 行与字段之间的视觉分组。
+fn divider_line() -> ratatui::text::Line<'static> {
+    ratatui::text::Line::from("  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌")
+        .style(theme::muted())
+}
+
 /// 普通字段:空值显示 `—`(弱化)。
 fn field_view(label: &str, value: &str) -> ratatui::text::Line<'static> {
     let (text, style) = if value.is_empty() {
@@ -248,12 +254,20 @@ fn totp_code_line_labeled(label: &str, secret: &str) -> ratatui::text::Line<'sta
     match crate::totp::totp_at(secret, now) {
         Ok(code) => {
             let remaining = 30 - (now % 30);
-            ratatui::text::Line::from(vec![
+            // code 后留一格空格隔开 gauge,保证 6 位码仍是一个独立 token
+            // (现有测试用 split_whitespace 提取码)。
+            let mut spans = vec![
                 label,
                 sep,
                 ratatui::text::Span::styled(code, theme::accent()),
-                ratatui::text::Span::styled(format!("  (~{remaining}s)"), theme::muted()),
-            ])
+                ratatui::text::Span::raw(" "),
+            ];
+            spans.extend(totp_gauge_spans(remaining));
+            spans.push(ratatui::text::Span::styled(
+                format!("  (~{remaining}s)"),
+                theme::muted(),
+            ));
+            ratatui::text::Line::from(spans)
         }
         Err(_) => ratatui::text::Line::from(vec![
             label,
@@ -264,6 +278,28 @@ fn totp_code_line_labeled(label: &str, secret: &str) -> ratatui::text::Line<'sta
 }
 
 // ---- 小工具 ----
+
+/// TOTP 倒计时反应堆条:把剩余秒数画成 `▰`(filled) / `▱`(empty) 段,视觉等价
+/// sci-fi `EnergyGauge`,随剩余时间变色(绿 → 青 → 红)。因 detail 用单个
+/// `Paragraph` 渲染所有行,这里以 `Span` 拼接而非独立 widget,避免拆分布局。
+fn totp_gauge_spans(remaining: u64) -> Vec<ratatui::text::Span<'static>> {
+    const SEG: usize = 20;
+    let filled = ((remaining as usize) * SEG / 30).min(SEG);
+    let bar_color = if remaining >= 18 {
+        theme::colors::accent()
+    } else if remaining >= 9 {
+        theme::colors::accent2()
+    } else {
+        theme::colors::alert()
+    };
+    vec![
+        ratatui::text::Span::styled(
+            "▰".repeat(filled),
+            ratatui::style::Style::default().fg(bar_color),
+        ),
+        ratatui::text::Span::styled("▱".repeat(SEG - filled), theme::muted()),
+    ]
+}
 
 fn mask(s: &str) -> String {
     if s.is_empty() {

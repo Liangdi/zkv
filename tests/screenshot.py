@@ -156,6 +156,8 @@ def capture(p: Pty, name: str, xvfb: Xvfb) -> None:
 # --------------------------------------------------------------------------- #
 def add_password(p: Pty, title: str, username: str) -> None:
     p.send(b"n")
+    p.expect("Pick Template", 5)  # n → 模板选择(Password 默认选中)
+    p.send(b"\r")                 # Enter 确认模板 → 进入编辑器
     p.expect("Editor", 5)
     p.send(title.encode("utf-8"))
     p.send(b"\t")
@@ -203,7 +205,7 @@ def main():
             with Pty([str(BIN), "new", vault], cwd=str(REPO)) as p:
                 p.expect("Create New Vault", 8)
                 p.send(PASSPHRASE.encode() + b"\r")
-                p.expect("vault created", 25)
+                p.expect("press n to create", 30)
                 add_password(p, "Gmail", "bob@gmail.com")
                 add_password(p, "AWS Console", "root")
                 add_password(p, "GitHub", "bob")
@@ -212,6 +214,8 @@ def main():
                 capture(p, "04-list.png", xvfb)
 
                 p.send(b"n")
+                p.expect("Pick Template", 5)  # n → 模板选择
+                p.send(b"\r")                 # Enter 确认 → 编辑器
                 p.expect("Editor", 5)
                 p.drain(0.3)
                 capture(p, "05-new-item-editor.png", xvfb)

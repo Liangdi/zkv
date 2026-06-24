@@ -264,7 +264,10 @@ def make_vault(path: str, passphrase: str = PASSPHRASE) -> None:
     with spawn(["new", path]) as p:
         p.expect("Create New Vault", 10)
         p.send(passphrase.encode() + b"\r")
-        p.expect("vault created", 25)  # create+unlock run the (slow) default KDF.
+        # create+unlock run the (slow) default KDF twice;成功后进入空库浏览态,
+        # 列表渲染 "(no items)\npress n to create"(list.rs)——稳定的就绪 sentinel。
+        # (旧版等 "vault created" 字样,但 TUI 成功消息是 "unlocked",已不再出现。)
+        p.expect("press n to create", 30)
         p.send(b"q")
         code = p.wait_exit(10)
     assert code == 0, f"fixture vault creation exited {code}"
@@ -389,7 +392,7 @@ class E2E(unittest.TestCase):
         with spawn(["new", path]) as p:
             p.expect("Create New Vault", 10)
             p.send(PASSPHRASE.encode() + b"\r")
-            p.expect("vault created", 25)  # create+unlock done (message in header)
+            p.expect("press n to create", 25)  # create+unlock done → 空库浏览态
 
             p.send(b"n")  # open template picker
             p.expect("Password", 5)  # picker lists templates; Password first (default)

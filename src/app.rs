@@ -14,6 +14,7 @@
 //! 与外部 crate,**不得** `use crate::ui`。
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -74,7 +75,14 @@ pub enum Mode {
     TagMgr,
     /// 附件管理(锁定进入时选中的 item)。
     Attachments,
+    /// 后台解锁中:口令已提交,后台线程跑 Argon2id 派生 + 解密,前台播 boot 动画。
+    /// `main_loop` 每帧 `pump_boot` 取结果,成功切 Normal / 失败回口令态。
+    Booting,
 }
+
+/// 后台解锁线程回传的结果:成功装 `(Database, MasterKey, KdfParams, salt)`,
+/// 失败转 `String`(错误类型非 `Send`,统一序列化跨线程)。
+pub type BootResult = std::result::Result<(Database, MasterKey, KdfParams, [u8; 16]), String>;
 
 /// 管理模式(CategoryMgr/TagMgr)中,当前是否处于文本输入态及语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +190,8 @@ pub struct App {
     pub tpl_selected: usize,
     /// 是否请求退出。
     pub quit: bool,
+    /// 后台解锁结果通道(仅 `Booting` 态非 `None`);`main_loop` 每帧 `pump_boot` drain。
+    pub boot_rx: Option<mpsc::Receiver<BootResult>>,
 }
 
 impl App {
@@ -216,6 +226,7 @@ impl App {
             att_edit: None,
             tpl_selected: 0,
             quit: false,
+            boot_rx: None,
         }
     }
 
@@ -246,6 +257,7 @@ impl App {
             att_edit: None,
             tpl_selected: 0,
             quit: false,
+            boot_rx: None,
         }
     }
 
@@ -290,6 +302,7 @@ impl App {
             att_edit: None,
             tpl_selected: 0,
             quit: false,
+            boot_rx: None,
         };
         app.reload()?;
         Ok(app)
@@ -438,6 +451,8 @@ impl App {
             Mode::CategoryMgr => self.handle_category_mgr(key),
             Mode::TagMgr => self.handle_tag_mgr(key),
             Mode::Attachments => self.handle_attachments(key),
+            // Booting 期间忽略按键(动画 ~1s,派生完成由 pump_boot 推进)。
+            Mode::Booting => Ok(Action::Continue),
         }
     }
 
@@ -493,48 +508,20 @@ impl App {
                         return Ok(Action::Continue);
                     }
                 };
-                match kind {
-                    PassKind::Create => {
-                        match vault::create(&path, &pass) {
-                            Ok(()) => {
-                                match vault::unlock_full(&path, &pass) {
-                                    Ok((db, key, kdf, salt)) => {
-                                        self.master_key = Some(key);
-                                        self.salt = Some(salt);
-                                        self.kdf = Some(kdf);
-                                        self.db = Some(db);
-                                        self.mode = Mode::Normal;
-                                        self.reload()?;
-                                        self.message = Some("vault created".into());
-                                    }
-                                    Err(e) => {
-                                        self.message =
-                                            Some(format!("unlock after create failed: {e}"));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                self.message =
-                                    Some(format!("create failed: {e}"));
-                            }
+                // 异步解锁:后台线程跑 Argon2id 派生 + 解密(0.5–2s),前台播 boot 动画。
+                // 结果经 channel 回传,main_loop 每帧 pump_boot 装载;pass/key move 进出线程。
+                let (tx, rx) = mpsc::channel::<BootResult>();
+                std::thread::spawn(move || {
+                    let r = match kind {
+                        PassKind::Create => {
+                            vault::create(&path, &pass).and_then(|()| vault::unlock_full(&path, &pass))
                         }
-                    }
-                    PassKind::Open => match vault::unlock_full(&path, &pass) {
-                        Ok((db, key, kdf, salt)) => {
-                            self.master_key = Some(key);
-                            self.salt = Some(salt);
-                            self.kdf = Some(kdf);
-                            self.db = Some(db);
-                            self.mode = Mode::Normal;
-                            self.reload()?;
-                            self.message = Some("unlocked".into());
-                        }
-                        Err(e) => {
-                            // 错误口令 / 损坏:停留口令态,清空 input(已 take)。
-                            self.message = Some(format!("unlock failed: {e}"));
-                        }
-                    },
-                }
+                        PassKind::Open => vault::unlock_full(&path, &pass),
+                    };
+                    let _ = tx.send(r.map_err(|e| e.to_string()));
+                });
+                self.boot_rx = Some(rx);
+                self.mode = Mode::Booting;
             }
             KeyCode::Esc => {
                 self.quit = true;
@@ -543,6 +530,43 @@ impl App {
             _ => {}
         }
         Ok(Action::Continue)
+    }
+
+    /// drain 后台解锁结果(`Booting` 态每帧调一次)。用 `take()` 取出 receiver,避免与
+    /// 后续 `self` 赋值的借用冲突;未就绪(`Empty`)时放回,下一帧再 pump。
+    pub fn pump_boot(&mut self) -> Result<()> {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.boot_rx.take() else {
+            return Ok(());
+        };
+        match rx.try_recv() {
+            Ok(Ok((db, key, kdf, salt))) => {
+                self.master_key = Some(key);
+                self.salt = Some(salt);
+                self.kdf = Some(kdf);
+                self.db = Some(db);
+                self.mode = Mode::Normal;
+                self.reload()?;
+                self.message = Some("unlocked".into());
+            }
+            Ok(Err(e)) => {
+                // 错误口令 / 损坏:回口令态重试。
+                self.mode = Mode::PromptPassphrase(PassKind::Open);
+                self.input_mask = true;
+                self.message = Some(format!("unlock failed: {e}"));
+            }
+            Err(TryRecvError::Empty) => {
+                // 派生未完成:放回 receiver,继续 boot 动画。
+                self.boot_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                // worker 线程 panic:回口令态。
+                self.mode = Mode::PromptPassphrase(PassKind::Open);
+                self.input_mask = true;
+                self.message = Some("unlock failed: worker panic".into());
+            }
+        }
+        Ok(())
     }
 
     // ---- Normal ----
@@ -1680,6 +1704,51 @@ mod tests {
     }
 
     #[test]
+    fn boot_async_unlock_completes() {
+        let path = tmp_path("boot_async_unlock");
+        cleanup(&path);
+        let kdf = KdfParams { m_kib: 4096, t_cost: 1, p_cost: 1 };
+        crate::vault::create_with_params(&path, "pw", &kdf).unwrap();
+        let mut app = App::for_open(path.clone());
+        app.input = "pw".into();
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.mode, Mode::Booting), "Enter should enter Booting");
+        // pump 直到完成(fast KDF 很快);最多等 ~2s 防死循环。
+        for _ in 0..2000 {
+            app.pump_boot().unwrap();
+            if matches!(app.mode, Mode::Normal) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.db.is_some());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn boot_async_wrong_pass_returns_to_prompt() {
+        let path = tmp_path("boot_async_wrong");
+        cleanup(&path);
+        let kdf = KdfParams { m_kib: 4096, t_cost: 1, p_cost: 1 };
+        crate::vault::create_with_params(&path, "pw", &kdf).unwrap();
+        let mut app = App::for_open(path.clone());
+        app.input = "wrong".into();
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.mode, Mode::Booting));
+        for _ in 0..2000 {
+            app.pump_boot().unwrap();
+            if !matches!(app.mode, Mode::Booting) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(matches!(app.mode, Mode::PromptPassphrase(PassKind::Open)));
+        assert!(app.message.is_some());
+        cleanup(&path);
+    }
+
+    #[test]
     fn normal_y_does_not_panic_without_clipboard() {
         let mut app = app_with_items(1);
         app.selected = 0;
@@ -1992,6 +2061,15 @@ mod tests {
         }
         let act = app.handle_key(key_code(KeyCode::Enter)).unwrap();
         assert_eq!(act, Action::Continue);
+        assert!(matches!(app.mode, Mode::Booting));
+        // 异步解锁:pump 直到离开 Booting(错误口令 → 回口令态)。
+        for _ in 0..2000 {
+            app.pump_boot().unwrap();
+            if !matches!(app.mode, Mode::Booting) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(matches!(app.mode, Mode::PromptPassphrase(PassKind::Open)));
         assert!(app.db.is_none());
         assert!(app.message.is_some());
@@ -2010,6 +2088,15 @@ mod tests {
             app.handle_key(key(c)).unwrap();
         }
         app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.mode, Mode::Booting));
+        // 异步解锁:pump 直到完成(正确口令 → Normal)。
+        for _ in 0..2000 {
+            app.pump_boot().unwrap();
+            if matches!(app.mode, Mode::Normal) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(matches!(app.mode, Mode::Normal));
         assert!(app.db.is_some());
         cleanup(&path);
