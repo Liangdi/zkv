@@ -1,8 +1,17 @@
+## [0.2.1] - 2026-06-24
+
+### ⚙️ Miscellaneous Tasks
+
+- Tui 增加 totp 配置
 ## [0.2.0] - 2026-06-21
 
 ### 🚀 Features
 
 - Unify theme source, harden Windows temp files, polish CLI output
+
+### ⚙️ Miscellaneous Tasks
+
+- Release zkv version 0.2.0
 ## [0.1.2] - 2026-06-21
 
 ### 🚀 Features
