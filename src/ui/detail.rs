@@ -126,7 +126,7 @@ fn view_lines(item: &Item) -> Vec<ratatui::text::Line<'static>> {
 
 /// 编辑器视图:把 draft 渲染为表单,当前字段用高亮 + `▍` 光标标记。
 fn render_editor(frame: &mut Frame, area: Rect, draft: &Item, field: &Cursor) {
-    let inner = theme::panel_frame(frame, area, Some("Editor · Tab/Enter/Esc"));
+    let inner = theme::panel_frame(frame, area, Some("Editor · Tab/^T totp/Enter/Esc"));
 
     let rows = editor_rows(draft, field);
     let p = Paragraph::new(rows).wrap(Wrap { trim: false });

@@ -65,6 +65,9 @@ pub enum Mode {
     EditItem,
     /// 确认删除。
     ConfirmDelete,
+    /// 导入/配置 TOTP 弹窗(otpauth:// URI、本地二维码图片、或 http(s)/data: URL)。
+    /// `self.editor` 仍持有草稿;完成后按 [`self.totp_return`] 返回编辑器。
+    ImportTotp,
     /// 分类管理。
     CategoryMgr,
     /// 标签管理。
@@ -96,6 +99,14 @@ pub struct AttMeta {
 pub enum AttEdit {
     Add,
     Export,
+}
+
+/// ImportTotp 弹窗关闭后应恢复的编辑器来源(NewItem / EditItem)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TotpReturn {
+    #[default]
+    EditItem,
+    NewItem,
 }
 
 /// 管理模式所操作的实体种类(供 `mgr_handle` 复用分发)。
@@ -149,6 +160,8 @@ pub struct App {
     pub message: Option<String>,
     /// 编辑器状态(NewItem/EditItem 模式)。
     pub editor: Option<EditorState>,
+    /// ImportTotp 完成后恢复的编辑器来源(NewItem/EditItem)。
+    pub totp_return: TotpReturn,
     /// 文本输入缓冲(搜索/口令/编辑器字段共用)。
     pub input: String,
     /// 是否掩码输入(口令=true,搜索/编辑器字段=false)。
@@ -192,6 +205,7 @@ impl App {
             tags: Vec::new(),
             message: None,
             editor: None,
+            totp_return: TotpReturn::default(),
             input: String::new(),
             input_mask: true,
             mgr_selected: 0,
@@ -221,6 +235,7 @@ impl App {
             tags: Vec::new(),
             message: None,
             editor: None,
+            totp_return: TotpReturn::default(),
             input: String::new(),
             input_mask: true,
             mgr_selected: 0,
@@ -264,6 +279,7 @@ impl App {
             tags: Vec::new(),
             message: None,
             editor: None,
+            totp_return: TotpReturn::default(),
             input: String::new(),
             input_mask: false,
             mgr_selected: 0,
@@ -417,6 +433,7 @@ impl App {
             Mode::PickTemplate => self.handle_pick_template(key),
             Mode::NewItem(tpl) => self.handle_editor(key, true, tpl),
             Mode::EditItem => self.handle_editor(key, false, String::new()),
+            Mode::ImportTotp => self.handle_import_totp(key),
             Mode::ConfirmDelete => self.handle_confirm_delete(key),
             Mode::CategoryMgr => self.handle_category_mgr(key),
             Mode::TagMgr => self.handle_tag_mgr(key),
@@ -626,6 +643,14 @@ impl App {
         is_new: bool,
         _tpl: String,
     ) -> Result<Action> {
+        // Ctrl+T:打开 TOTP 导入弹窗(otpauth:// URI / 本地二维码图片 / http(s)/data: URL)。
+        // 用 Ctrl 组合而非裸字母,避免抢占字段输入字符。在借用 self.editor 之前处理。
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+        {
+            self.enter_import_totp(is_new);
+            return Ok(Action::Continue);
+        }
         let Some(ref mut ed) = self.editor else {
             self.mode = Mode::Normal;
             return Ok(Action::Continue);
@@ -1230,6 +1255,127 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // ImportTotp(2FA 配置弹窗)
+    // -----------------------------------------------------------------------
+
+    /// 进入 TOTP 导入弹窗:记下来源(NewItem/EditItem)以便完成后恢复,清空输入缓冲。
+    fn enter_import_totp(&mut self, is_new: bool) {
+        self.totp_return = if is_new {
+            TotpReturn::NewItem
+        } else {
+            TotpReturn::EditItem
+        };
+        self.input.clear();
+        self.input_mask = false;
+        self.mode = Mode::ImportTotp;
+        self.message =
+            Some("paste otpauth:// · local image path · or http(s)/data: url".into());
+    }
+
+    /// ImportTotp 按键:字符 / 退格 / Enter 提交 / Esc 取消。
+    fn handle_import_totp(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(Action::Continue);
+                }
+                self.input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Enter => self.submit_import_totp()?,
+            KeyCode::Esc => {
+                self.input.clear();
+                self.restore_editor_mode();
+                self.message = Some("totp import canceled".into());
+            }
+            _ => {}
+        }
+        Ok(Action::Continue)
+    }
+
+    /// 提交 ImportTotp:自动识别来源 → 解析成 otpauth URI → 写入草稿首个 Totp 字段。
+    ///
+    /// 远程 URL 取图走阻塞式 `crate::cli::fetch_url_bytes`(15s 超时),期间界面会
+    /// 短暂冻结;成功才返回编辑器,失败则留在弹窗内允许修正输入。
+    fn submit_import_totp(&mut self) -> Result<()> {
+        let input = self.input.clone();
+        let res = (|| -> Result<()> {
+            let uri = Self::resolve_totp_input(&input)?
+                .ok_or_else(|| Error::Other("totp: empty input".into()))?;
+            let ed = self
+                .editor
+                .as_mut()
+                .ok_or_else(|| Error::Other("totp: no editor draft".into()))?;
+            Self::apply_totp_to_draft(&mut ed.draft, &uri)?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                self.input.clear();
+                self.restore_editor_mode();
+                self.message = Some("totp secret set · Enter to save".into());
+            }
+            Err(e) => {
+                self.message = Some(format!("totp import failed: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 按 [`totp_return`](Self::totp_return) 恢复编辑器模式(NewItem 需回填 template_id)。
+    fn restore_editor_mode(&mut self) {
+        let tpl = self
+            .editor
+            .as_ref()
+            .map(|e| e.draft.template_id.clone())
+            .unwrap_or_default();
+        self.mode = match self.totp_return {
+            TotpReturn::NewItem => Mode::NewItem(tpl),
+            TotpReturn::EditItem => Mode::EditItem,
+        };
+    }
+
+    /// 自动识别单条输入是哪种 TOTP 来源,复用 [`crate::cli::resolve_totp_source`]:
+    /// - `otpauth://` → 直接当 URI;
+    /// - `http(s)://` 或 `data:` → 当远程/data 图像 URL;
+    /// - 其余 → 当本地二维码图片路径(`fs::read` 失败会给出友好错误)。
+    fn resolve_totp_input(input: &str) -> Result<Option<String>> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if trimmed.starts_with("otpauth://") {
+            return crate::cli::resolve_totp_source(Some(trimmed), None, None);
+        }
+        if trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("data:")
+        {
+            return crate::cli::resolve_totp_source(None, None, Some(trimmed));
+        }
+        crate::cli::resolve_totp_source(None, Some(std::path::Path::new(trimmed)), None)
+    }
+
+    /// 把 otpauth URI 的 secret 写入草稿首个 `kind=Totp` 字段;无则补一个。
+    /// (CLI 的 run_add/run_edit 在缺失时报错;TUI 选择自动补字段,对 note 等模板更友好。)
+    fn apply_totp_to_draft(draft: &mut Item, uri: &str) -> Result<()> {
+        let secret = crate::cli::parse_otpauth(uri)?;
+        if let Some(f) = draft.fields.iter_mut().find(|f| f.kind == FieldKind::Totp) {
+            f.value = secret;
+        } else {
+            draft.fields.push(crate::model::Field {
+                name: "totp".into(),
+                value: secret,
+                kind: FieldKind::Totp,
+                protected: true,
+            });
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // 编辑器辅助
     // -----------------------------------------------------------------------
 
@@ -1713,6 +1859,124 @@ mod tests {
         // 越界光标不 panic
         App::write_field(&mut draft, &Cursor::Field(99), 'z');
         App::backspace_field(&mut draft, &Cursor::Field(99));
+    }
+
+    // ---- ImportTotp(2FA 配置弹窗)----
+
+    #[test]
+    fn resolve_totp_input_routes_otpauth_uri() {
+        let uri = "otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example";
+        // otpauth:// 原样透传。
+        let got = App::resolve_totp_input(uri).unwrap();
+        assert_eq!(got.as_deref(), Some(uri));
+    }
+
+    #[test]
+    fn resolve_totp_input_empty_is_none() {
+        assert_eq!(App::resolve_totp_input("").unwrap(), None);
+        assert_eq!(App::resolve_totp_input("   ").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_totp_input_local_path_missing_errors() {
+        // 非 otpauth / 非 url → 当本地路径;文件不存在应报错(而非静默 None)。
+        let res = App::resolve_totp_input("/definitely/not/a/real/path/12345.png");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn apply_totp_to_draft_overwrites_totp_field() {
+        let mut draft = mk_item(
+            "password",
+            "",
+            &[
+                ("username", "", FieldKind::Text),
+                ("password", "", FieldKind::Secret),
+                ("totp", "OLDFIELD", FieldKind::Totp),
+            ],
+        );
+        // 首个 Totp 字段被覆盖,字段数不变。
+        App::apply_totp_to_draft(&mut draft, "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP").unwrap();
+        let totp = draft
+            .fields
+            .iter()
+            .find(|f| f.kind == FieldKind::Totp)
+            .unwrap();
+        assert_eq!(totp.value, "JBSWY3DPEHPK3PXP");
+        assert_eq!(draft.fields.len(), 3);
+    }
+
+    #[test]
+    fn apply_totp_to_draft_adds_field_when_absent() {
+        // note 模板无 Totp 字段 → 自动补一个。
+        let mut draft = mk_item("note", "", &[("content", "", FieldKind::Multiline)]);
+        let before = draft.fields.len();
+        App::apply_totp_to_draft(&mut draft, "otpauth://totp/X?secret=GEZDGNBVGY3TQOJQ").unwrap();
+        assert_eq!(draft.fields.len(), before + 1);
+        let totp = draft
+            .fields
+            .iter()
+            .find(|f| f.kind == FieldKind::Totp)
+            .unwrap();
+        assert_eq!(totp.value, "GEZDGNBVGY3TQOJQ");
+        assert!(totp.protected);
+    }
+
+    #[test]
+    fn editor_ctrl_t_import_totp_sets_secret() {
+        let mut app = app_with_items(1);
+        // e -> EditItem(选中 item 含空 totp 字段)。
+        app.handle_key(key('e')).unwrap();
+        assert!(matches!(app.mode, Mode::EditItem));
+        // Ctrl+T -> ImportTotp 弹窗。
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_t).unwrap();
+        assert!(matches!(app.mode, Mode::ImportTotp));
+        // 粘贴 otpauth URI 并提交。
+        let uri = "otpauth://totp/Example:alice?secret=JBSWY3DPEHPK3PXP";
+        for c in uri.chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        // 返回编辑器;草稿首个 Totp 字段已写入 secret。
+        assert!(matches!(app.mode, Mode::EditItem));
+        let ed = app.editor.as_ref().unwrap();
+        let totp = ed
+            .draft
+            .fields
+            .iter()
+            .find(|f| f.kind == FieldKind::Totp)
+            .unwrap();
+        assert_eq!(totp.value, "JBSWY3DPEHPK3PXP");
+    }
+
+    #[test]
+    fn import_totp_esc_cancels_back_to_editor() {
+        let mut app = app_with_items(1);
+        app.handle_key(key('e')).unwrap();
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_t).unwrap();
+        assert!(matches!(app.mode, Mode::ImportTotp));
+        app.handle_key(key_code(KeyCode::Esc)).unwrap();
+        // 取消返回编辑器;totp 字段保持原值(空)。
+        assert!(matches!(app.mode, Mode::EditItem));
+        let ed = app.editor.as_ref().unwrap();
+        assert!(ed.draft.totp_value().unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn import_totp_bad_input_stays_in_modal() {
+        let mut app = app_with_items(1);
+        app.handle_key(key('e')).unwrap();
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_t).unwrap();
+        // 不是 otpauth/也不是存在的文件 → 解析失败,留在弹窗。
+        for c in "garbage input".chars() {
+            app.handle_key(key(c)).unwrap();
+        }
+        app.handle_key(key_code(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.mode, Mode::ImportTotp));
+        assert!(app.message.as_deref().unwrap_or("").contains("failed"));
     }
 
     #[test]

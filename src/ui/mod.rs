@@ -172,6 +172,7 @@ fn draw(frame: &mut Frame, app: &App) {
     // 叠加模态
     match app.mode {
         Mode::ConfirmDelete => draw_confirm_delete(frame, app),
+        Mode::ImportTotp => draw_import_totp(frame, app),
         Mode::PickTemplate => draw_pick_template(frame, app),
         Mode::CategoryMgr => draw_category_mgr(frame, app),
         Mode::TagMgr => draw_tag_mgr(frame, app),
@@ -229,6 +230,45 @@ fn draw_confirm_delete(frame: &mut Frame, app: &App) {
     let l3: std::borrow::Cow<str> = std::borrow::Cow::Borrowed("press y to confirm · n/Esc to cancel");
     let lines: [&str; 3] = [l1.as_ref(), l2.as_ref(), l3.as_ref()];
     input::render_modal(frame, area, " Confirm Delete ", &lines);
+}
+
+/// TOTP/2FA 配置弹窗:说明 + 单行输入框(otpauth:// URI / 本地图片路径 / http(s)/data: URL)。
+fn draw_import_totp(frame: &mut Frame, app: &App) {
+    let area = centered_rect(64, 60, frame.area());
+    frame.render_widget(Clear, area);
+    let inner = theme::panel_frame(frame, area, Some(" Set TOTP / 2FA "));
+
+    // info(4 行说明) + input(3 行) + hint/msg(Min)。
+    let chunks = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(3),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+
+    let info = ratatui::widgets::Paragraph::new(vec![
+        ratatui::text::Line::from("paste one of:").style(theme::muted()),
+        ratatui::text::Line::from("  • otpauth://totp/...?secret=...").style(theme::muted()),
+        ratatui::text::Line::from("  • local QR image path").style(theme::muted()),
+        ratatui::text::Line::from("  • http(s)/data: image url").style(theme::muted()),
+    ]);
+    frame.render_widget(info, chunks[0]);
+
+    let field = input::InputField {
+        value: app.input.clone(),
+        mask: false,
+    };
+    input::render_input(frame, chunks[1], &field, " totp source ");
+
+    // 提示行;有瞬态消息(成功/失败)时优先显示消息。
+    let msg = app.message.as_deref().unwrap_or("");
+    let bottom = if msg.is_empty() {
+        "Enter:confirm  Esc:cancel  (url fetch may pause briefly)".to_string()
+    } else {
+        msg.to_string()
+    };
+    let hint_p = ratatui::widgets::Paragraph::new(bottom).style(theme::muted());
+    frame.render_widget(hint_p, chunks[2]);
 }
 
 /// 分类管理面板。
