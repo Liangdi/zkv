@@ -1,8 +1,14 @@
+## [0.3.0] - 2026-06-24
+
+### 🚀 Features
+
+- 科幻 TUI 视觉增强 — 异步解锁 loading、登录界面重设计、详情页 TOTP 条
 ## [0.2.1] - 2026-06-24
 
 ### ⚙️ Miscellaneous Tasks
 
 - Tui 增加 totp 配置
+- Release zkv version 0.2.1
 ## [0.2.0] - 2026-06-21
 
 ### 🚀 Features
